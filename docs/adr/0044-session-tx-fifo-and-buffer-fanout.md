@@ -1,12 +1,14 @@
-# ADR-0044: Session TX FIFO、Buffer 链与输出扇出
+# ADR-0044: Session TX FIFO、Buffer 链、输出扇出与 TCP RX OOO
 
 - 日期：2026-09-28
 - 状态：Proposed；仅设计，未修改实现
 - 前置：ADR-0037、ADR-0038、ADR-0039、ADR-0042、ADR-0043
 - 取代：上述 ADR 中关于 `TxMode`/`TransportTxMode`、单包 TX、TX 参数快照、
-  `SessionTxPacket` 和 TX output next 的设计；其非 TX 部分不变
-- 范围：service 的 Session TX 与 queue 调度、plugin-session 的 IP Session 类型和
-  output 注册、具体 transport 的 `Transport` trait 实现
+  `SessionTxPacket` 和 TX output next 的设计；并更正 TCP RX 对 FIFO OOO segment
+  的使用；其他非 TX 部分不变
+- 范围：service 的 Session FIFO 与 queue 调度、plugin-session 的 IP Session 类型和
+  output 注册、具体 transport 的 `Transport` trait 实现，以及 TCP 接收对 Session RX FIFO
+  OOO segment 的使用
 
 ## 源码依据与事实
 
@@ -32,6 +34,10 @@
 | `src/vnet/session/session.h:917-975`；`src/vnet/tcp/tcp.c:1372-1401` | TCP flush 从 Session TX FIFO 的 consumer 可读量确定 `psh_seq`；App RX 只在曾发送零窗口时检查 RX FIFO 空间，阈值为 `clamp(size >> 3, 4 KiB, 128 KiB)`，不足时请求 dequeue 通知，否则发送 ACK。 |
 | `src/vnet/tcp/tcp_output.c:917-930,1037-1058`；`src/vnet/tcp/tcp_types.h:115-125,490-499` | PSH 仅写入覆盖 `psh_seq` 的 TCP 段；独立 ACK 使用 Session 的 pending buffer/next，不构造应用通知或新的 Session TX event。ACK buffer 分配失败时 VPP 更新接收窗口并计 TCP worker `no_buffer`，不是 Session Queue node error。 |
 | `src/vnet/tcp/tcp_input.c:494-545,885-895,1407-1412,2365-2370`；`src/vnet/session/session.c:738-749` | ACK 不逐包直接 drop Session TX FIFO：TCP worker 先合并 `burst_acked` 到 `pending_deq_acked`，输入 burst 结束后每 connection 只 drop 一次，触发应用 dequeue 通知，再重排、更新重传 timer 和 pacer。 |
+| `src/vnet/tcp/tcp_input.c:977-1101,1147-1210,1361-1412` | TCP RX 先按 `rcv_nxt` 区分旧包、重叠、未来和按序数据。未来字节按相对 `rcv_nxt` 的 offset 写入 **Session RX FIFO 自身的 OOO segment**，不推进 `rcv_nxt`、不发应用 RX event；按序写入时 FIFO 收集相邻 OOO segment，返回值含补洞后连续可读字节。乱序发 DUPACK；FIN 仅在 `seq_end == rcv_nxt` 时接受。 |
+| `src/vnet/session/session.h:685-829`；`src/vnet/session/session.c:690-715` | `session_enqueue_stream_connection` 的 `queue_event=1` 仅用于按序路径，Session worker 合并同一 burst 的 RX 通知并在 TCP input node 末尾 flush；OOO 路径以 `queue_event=0` 返回。多 Buffer 链按同一逻辑 offset 继续写入 FIFO。 |
+| `src/svm/svm_fifo.c:171-340,593-726,833-930`；`src/svm/fifo_types.h:105-106`；`src/vnet/session/transport.c:1205-1210` | FIFO 的 `ooo_segment_add` 负责相邻/重叠区间合并，`svm_fifo_enqueue` 补洞并收集 OOO segment。TCP 创建 Session FIFO 后初始化 RX 的 OOO enqueue **chunk lookup**、TX 的 OOO dequeue **chunk lookup**；两者不是 segment 索引。TCP SACK 查询 FIFO **合并后的 newest OOO segment**，不是刚收到的 packet 区间。 |
+| `src/vnet/tcp/tcp_error.def:22-26,51`；`src/vnet/tcp/tcp_input.c:1001-1101,1160-1210` | `ENQUEUED`、`ENQUEUED_OOO`、`FIFO_FULL`、`PARTIALLY_ENQUEUED`、`SEGMENT_OLD`、`ZERO_RWND` 是 TCP input node 的逐包分类/计数，不是 service `SessionError` 或数值 retval。 |
 | `src/vnet/session/session_types.h:495-517`；`src/vnet/session/session_node.c:1316-1383` | datagram 前缀为长度和偏移，其后是具体连接 metadata 与 GSO 大小；`ip46_address_t` 是 IP 实例，不属于通用 service。 |
 | `src/svm/svm_fifo.h:70-108,467-475,690-718` | consumer 自己的 head 可 relaxed 读，producer 的 tail 必须 acquire 读；`set_event` 是 release 交换，`unset_event` 是 acquire 交换，随后必须重检 FIFO 再决定重排。 |
 
@@ -46,13 +52,26 @@ buffer，预留 `60` 字节，按一个 MSS 拷贝并直接返回；没有 VPP �
 当前 service 还把 `Session.session_type` 直接当 transport protocol，并由每次
 `register_transport_type` 分配一个新 protocol id；若直接按 IPv4/IPv6 调用两次，
 同一个 TCP 会变成两个 protocol，RX/control/time 与 TX 注册无法对应。
+RX 并非完全没有 OOO：现有 `established.rs` 会以 offset 调用
+`SessionWorker::enqueue_rx`，`hammer-infra::svm::Fifo` 也已有 `OooSegment`、
+`enqueue_ooo` 和 `OooResult`。但目前 `enqueue_ooo` 把**本次写入**的 offset/length
+放进 `OooResult`，且 `collect_ooo_segments`/`replace_ooo_segments` 每次用临时
+`Vec` 重建 OOO pool/tree；service 又把链上各 chunk 的最小起点和最大终点当作一个
+newest 区间；两者都不是 VPP FIFO 合并后的 newest OOO segment。
+`rcv_process.rs`、`syn_sent.rs` 的 payload 分支还把 `enqueue_rx` 的 offset 固定为零，
+未共同使用 established 路径的序号裁剪/OOO 判定；
+`connection.rs::receive_open_reply` 对带 data 的 SYN-ACK 甚至在 RX FIFO 入队前
+按 packet 长度推进 `rcv_nxt`，可能确认尚未收进 FIFO 的字节。
 以上均是迁移清单，**本 ADR 不改代码**。
 
 ## 分层决定
 
 `hammer-service::session` 拥有 queue 的 128 packet 预算、Session state、FIFO、TX context、
 buffer 链、pending/next 向量、FIFO event 重排与 dequeue 通知。它不定义 IP endpoint、TCP
-sequence、TCP header 或具体 transport connection。`hammer-service::transport::Transport`
+sequence、TCP header、SACK 或具体 transport connection。FIFO OOO 区间由
+`hammer-infra::svm::Fifo` 管理；service 只按 transport 给的相对 offset 将 Buffer 链
+写入 RX FIFO，并将**实际 FIFO 结果**交还 transport，不建立第二份乱序重组表。
+`hammer-service::transport::Transport`
 仍是 trait；`send_params`、`flush_data`、`custom_tx` 和批量 `push_header` 由具体插件实现。
 
 `hammer-plugin-session` 为 TCP 的 IPv4/IPv6 等具体 Session 类型配置 output edge，并把每种
@@ -66,6 +85,35 @@ TCP/UDP 依赖 plugin-session，TCP 以 peek 入口接到它实现的 `Transport
 datagram 入口接入。两者的 `push_header`、`custom_tx` 仍由各自插件拥有。现有获批的按
 protocol 单态化函数入口仅是 service 跨插件分发的边界，不是 transport VFT，也不在
 每个 packet 上查找 `dyn` 对象。
+
+### TCP 与 Session 接线偏差清单
+
+下表只核对 TCP 数据收发及其直接依赖的 Session 生命周期/通知；IP lookup、
+TCP options codec 和应用协议本身不在本 ADR 重做。路径均为本仓库现有源码，
+VPP 路径均以 `third_party/vpp/src/` 为根。
+
+| 当前路径与偏差 | VPP 依据 | 本 ADR 的目标 |
+|---|---|---|
+| `service/session/core.rs::SessionFlags` 无 custom-TX 位；`enqueue_ready` 直接加 TX event | `vnet/session/session.c:172-200`、`session_node.c:1496-1532` | Session 持有 custom-TX 标志和 FIFO event 去重；ACK/重传使用同一队列，优先级分别入 new/old，不造第二套发送队列 |
+| `tcp/established.rs` 即时构造 ACK，`tcp/connection.rs::ready_segment` 自行选控制包 | `vnet/tcp/tcp_output.c:1058-1089,2070-2186` | RX 仅 program ACK/dupACK；TCP custom TX 在 Session queue 预算下生成实际 ACK Buffer |
+| `tcp/established.rs` 的 OOO SACK 取 `OooResult` 原 packet 区间 | `vnet/tcp/tcp_input.c:1051-1101`、`svm/svm_fifo.c:171-299` | SACK 只读取 FIFO 合并后的 newest OOO segment；无新 segment 不虚构范围 |
+| `tcp/rcv_process.rs`、`tcp/syn_sent.rs` 固定 offset 零；`receive_open_reply` 在 enqueue 前推进 `rcv_nxt` | `vnet/tcp/tcp_input.c:1147-1210,1897-1907,2260-2271` | 三个 data-bearing input 分支复用旧/重叠/未来/按序判断，仅按 FIFO 实际可读推进 `rcv_nxt` |
+| `infra/svm/fifo.rs` 用临时 `Vec` 重建 OOO 区间、把 segment 索引误写进 chunk lookup、返回未合并写入范围；共享引用下通过非 `UnsafeCell` 字段写 head/newest | `svm/svm_fifo.c:171-340,593-726,833-930`、`svm/fifo_types.h:105-106` | 原位更新已有 `Pool<OooSegment>`/list，无 packet-path `Vec`；chunk lookup 仅定位 FIFO chunk；两个可变 list 索引纳入 producer-owned `UnsafeCell`，返回 newest 合并区间 |
+| `service/session/core.rs::enqueue_rx` 把链 chunk 的 min/max 拼作一个 segment | `vnet/session/session.h:685-829`、`vnet/tcp/tcp_input.c:1081-1096` | 同一 packet 的链偏移连续推进，以最后一次 FIFO OOO 插入的 newest 标记为准；仅按序排应用 RX event |
+| `tcp/established.rs`、`rcv_process.rs`、`syn_sent.rs` 每个 ACK 直接 `drop_dequeue`/`enqueue_ready` | `vnet/tcp/tcp_input.c:494-545,1407-1412,2365-2370`、`vnet/session/session.c:738-749` | worker 在 burst 内合并 ACK；末尾一次 Session TX FIFO drop、应用 dequeue 通知、reschedule/timer/pacer 更新 |
+| `service/session/core.rs::tx_fifo_peek_and_send` 一次只发送一个 Buffer，预留 60 字节 | `vnet/session/session_node.c:976-1677` | 一个 event 按 frame 预算生成多个 MSS/Buffer chain，首 Buffer 预留 140 字节，一次批量 `push_header` |
+| `service/session/core.rs::SessionIoDispatch` 合并 RX/TX 并返回 `(usize,bool)`；Session 类型等于 protocol | `vnet/session/session.c:1819-1921`、`session_node.c:1858-1910` | protocol 只注册 RX/control/time；IPv4/IPv6 Session type 各注册 TX/next，保留真实 TX outcome |
+| `tcp/lib.rs::send_params` 调用旧 `tx_payload_budget`，混入 pacing/Nagle/intent；缺 VPP Limited Transmit 和真实 `snd_mss` | `vnet/tcp/tcp.c:1100-1196`、`vnet/session/session_node.c:1530-1588` | TCP 给出即时 MSS/CC/peer window/offset；dupACK/SACK 尚未进入 recovery 时按 VPP 限额 Limited Transmit，通用 pacer 仅由 Session TX 扣账 |
+| `tcp/lib.rs::flush_data` 空、`connection.rs::tx_segment` 默认 PSH | `vnet/tcp/tcp.c:1372-1380`、`tcp_output.c:300-329,917-930` | TX_FLUSH 保存最后待 push 字节；仅覆盖该序号的 payload segment 置 PSH |
+| `tcp/lib.rs::custom_tx` 恒返回零，timer/ACK 绕到即时控制包 | `vnet/tcp/tcp_output.c:1123-1270,1672-1708,1804-2186` | recovery 重传和受 PRR 允许的新数据从 Session TX FIFO 读取；ACK/dupACK 按剩余 burst 预算生成 |
+| `tcp/lib.rs::push_header` 忽略 `available_bytes`，逐 Buffer 写并用 `BufferMain::global` | `vnet/tcp/tcp_output.c:884-1035` | 使用当前 runtime 对整批首 Buffer 写 header、按链长度推进序号、更新 cwnd-limited/RTT/timer；无全局第二借用 |
+| `tcp/lib.rs::tcp_session_io` 的 RX 在检查 zero-window 前就改 `rcv_wnd`，还 clone 整个连接 | `vnet/tcp/tcp.c:1382-1401`、`tcp_output.c:1037-1058` | 无零窗口历史直接返回；不足阈值请求 FIFO dequeue 通知；满足时原位构造 ACK 并加入 Session pending 列 |
+| `tcp/output.rs` 注册两个 output 后手动禁用 `session-queue`；`tcp/lib.rs::bind_worker_graph` 再按名称找 next | `vnet/tcp/tcp.c:1590-1630,1743-1749`、`vnet/session/session.c:2196-2270` | output init 编译 next 并发布两种 Session type；TCP worker 缓存已有 next；queue enable/disable 只归 Session 生命周期 |
+| `tcp/worker.rs` 的 pending disconnect/reset 队列未被 input 消费，只有部分路径直接通知 service | `vnet/tcp/tcp_input.c:932-975,1407-1413`、`vnet/session/session.c:965-980,1131-1185` | input burst 末尾按 VPP 顺序排空：先 RX flush/dequeue，再 closing/reset/closed 通知；`Accepting` 延迟由 service 处理 |
+| `tcp/lib.rs::update_time` 只推进 wheel，`tcp_session_update_time` 另处理 pending timer；`pending_cleanups` 未被消费 | `vnet/tcp/tcp.c:1293-1369`、`vnet/session/session_node.c:2033-2050` | 保持已有 `Transport::update_time(now,worker)` 签名和一次订阅：trait 更新 clock/收集 wheel token，同一 subscriber 再排空到期 cleanup、最后 bounded 派发 timer；cleanup 取消的 token 在派发时跳过，不在 service 执行 TCP 决策或二次推进 wheel |
+
+这里的“全部”是上述 TCP↔Session 数据路径接点，不把纯 TCP 校验、IP routing 或
+application callbacks 拉进 service。实际发送由 `Transport` 和 Session queue 完成。
 
 现有 `SessionIoDispatch` 对 TX/RX 合并返回 `(packets, pending)`，不足以表示 VPP 的
 head-old、tail-old、deschedule 和 no-buffer 四种处置。目标把 TX 入口与既有 RX 入口
@@ -390,6 +438,9 @@ index；TCP 经 `runtime` 修改实际 Buffer，不能借口 VPP 指针可写而
 `transport.h:210-224,307-369` 与 `session_node.c:1530-1588`。当前
 `Transport::connection` 只给不可变引用，不能用它假装完成这些写入；直接的
 trait 方法由 transport owner 在本 worker 执行，不引入新的 flags snapshot 或锁。
+现有 `TransportConnection::clear_descheduled(now)` 的 `now` 参数在目标中移除：
+VPP 清标志只重置 pacer bucket，pacer 时间由本轮 transport time subscriber 更新，
+不能在 ACK 收尾凭一个局部时间戳额外推进 pacer。
 
 ```rust
 // VPP tcp_types.h:115-125,460-465,490-499;
@@ -402,18 +453,28 @@ pub struct TcpConnectionCacheline0 {
     // ... existing sequence, window, timer, and flag fields unchanged
     pub(crate) psh_pending: bool,
     pub(crate) psh_sequence: TcpSeq,
+    pub(crate) send_mss: u32,
+    pub(crate) limited_transmit: TcpSeq,
+    pub(crate) cwnd_limited_sequence: TcpSeq,
     pub(crate) deq_pending: bool,
     pub(crate) burst_acked: u32,
     pub(crate) retransmit_pending: bool,
     pub(crate) send_ack_pending: bool,
     pub(crate) pending_dupacks: u32,
+    pub(crate) disconnect_pending: bool,
+    pub(crate) reset_state: TcpState,
+    pub(crate) delivered_time: f64,
 }
 ```
 
 这是**已有** `TcpConnectionCacheline0` 的字段增量，不另建 cacheline 类型、状态类型或锁。
 连接构造时 `psh_pending=false`、`psh_sequence=TcpSeq::from(0)`、
+`send_mss` 在首次有效 TCP options/MSS 计算后设定、
+`limited_transmit=snd_nxt`、`cwnd_limited_sequence=snd_una`、
 `deq_pending=false`、`burst_acked=0`、`retransmit_pending=false`、
-`send_ack_pending=false`、`pending_dupacks=0`；只有 owner worker
+`send_ack_pending=false`、`pending_dupacks=0`、`disconnect_pending=false`、
+`reset_state=TcpState::Closed`、
+`delivered_time=0.0`；只有 owner worker
 写入，`CacheLineAlignMark` 保持原位置。第一次 TX_FLUSH
 设置 pending，并以 `snd_una + tx_fifo.max_dequeue() - 1` 的 TCP 序号回绕运算保存
 最后待 push 字节；已有 pending 时直接返回，不能每次 flush 重置边界。取 FIFO
@@ -459,7 +520,8 @@ pub struct TcpWorker {
 
 impl TcpConnection {
     // VPP tcp.c:1100-1164. Recovery/Closed returns zero for *ordinary*
-    // Session FIFO TX; round the available CC space by current snd_mss.
+    // Session FIFO TX. Before recovery, dupACK/SACK permits VPP's bounded
+    // Limited Transmit; the result is rounded by current effective send_mss.
     #[inline]
     pub(crate) fn send_space(&self) -> u32;
 
@@ -479,12 +541,55 @@ impl TcpConnection {
         self.psh_sequence = self.snd_una.advance((tx_fifo.max_dequeue() as u32).wrapping_sub(1));
     }
 
-    // VPP tcp_output.c:884-978. Set PSH only if psh_sequence lies in this
-    // payload interval; write TCP header/options into the existing first
-    // Buffer headroom, never copy its FIFO-sourced payload. Advance snd_nxt
-    // and recovery bookkeeping once; a retransmit never advances snd_nxt.
+    // VPP tcp_output.c:884-978. tx_segment's ordinary data branch chooses
+    // PSH only when this sequence interval covers psh_sequence. The existing
+    // TcpSegment writes directly into the first Buffer's reserved headroom.
+    // commit_payload_tx is called exactly once for this new-data segment.
     #[inline(always)]
-    pub(crate) fn push_one_header(&mut self, buffer: &mut Buffer, cached_opts: &[u8; 40]);
+    pub(crate) fn push_one_header(&mut self, buffer: &mut Buffer, now: Instant) {
+        let payload_len = buffer.current_len() + buffer.total_len_not_including_first();
+        let capabilities = self.output_capabilities();
+        let segment = self.tx_segment(payload_len, capabilities)
+            .expect("Session queue supplies a sendable TCP connection");
+        segment.write_to_buffer(buffer)
+            .expect("Session queue reserved transport header headroom");
+        self.commit_payload_tx(payload_len, now)
+            .expect("new-data sequence/recovery state commits once");
+    }
+
+    // VPP tcp_cc.h:107-135; tcp_output.c:980-1035. This connection-local
+    // marker is not a Session statistic or a second congestion controller.
+    #[inline(always)]
+    fn update_cwnd_limited(&mut self, max_dequeue: u32) {
+        if self.cwnd_limited_sequence < self.snd_una {
+            self.cwnd_limited_sequence = self.snd_una;
+        }
+        let cwnd = self.congestion.congestion_window();
+        if cwnd > self.snd_wnd {
+            return;
+        }
+        let outstanding = self.snd_nxt.raw().wrapping_sub(self.snd_una.raw());
+        if max_dequeue >= cwnd || outstanding >= cwnd
+            || (self.congestion.in_slow_start() && outstanding > cwnd / 2)
+            || (cwnd.saturating_sub(outstanding) < self.send_mss
+                && max_dequeue > outstanding)
+        {
+            self.cwnd_limited_sequence = self.snd_nxt;
+        }
+    }
+
+    // VPP tcp_timer.h:108-125. At burst end, reset RTO when flight drains;
+    // arm persist for a zero peer window, otherwise update the exact RTO
+    // timer (with RACK adjustment when selected). Existing timer wheel
+    // interval failures remain TcpNodeError::TimerUpdateFailed.
+    #[inline(always)]
+    fn retransmit_timer_update(
+        &mut self, index: u32, wheel: &mut TimerWheel1t2w2048sl<u32>,
+    ) -> RuntimeResult<()>;
+
+    // VPP tcp.c:1434-1445. If pacing is enabled, refresh the existing
+    // TransportConnection.pacer from BBR's current rate and measured RTT.
+    fn tx_pacer_update(&mut self);
 }
 
 impl TcpWorker {
@@ -495,7 +600,39 @@ impl TcpWorker {
     pub(super) fn send_ack(
         &mut self, runtime: &mut DataPlaneMain, sessions: &mut SessionWorker,
         connection_index: u32,
-    );
+    ) {
+        let connection = self.connections.get(connection_index)
+            .expect("ACK retains its TCP connection");
+        let rx_available = sessions.session_from_handle(connection.base.session)
+            .and_then(Session::rx_fifo)
+            .expect("ACK retains Session RX FIFO").max_enqueue();
+        let mut buffers = [0u32; 1];
+        if runtime.buffer_alloc(&mut buffers) == 0 {
+            self.connections.get_mut(connection_index)
+                .expect("ACK retains its TCP connection")
+                .set_rcv_wnd(rx_available);
+            return; // TCP worker no_buffer; no Session Queue NoBuffer event.
+        }
+        let connection = self.connections.get_mut(connection_index)
+            .expect("ACK retains its TCP connection");
+        connection.set_rcv_wnd(rx_available);
+        let local = connection.local().expect("established TCP has a local endpoint");
+        let remote = connection.remote();
+        let capabilities = connection.output_capabilities();
+        let segment = connection.control_segment(
+            local, remote, TcpSegmentFlags::ACK, None, capabilities,
+        );
+        segment.write_to_buffer(runtime.buffer_mut(buffers[0]))
+            .expect("fresh control Buffer has TCP header space");
+        let egress = hammer_core::buffer_opaque!(
+            mut runtime.buffer_mut(buffers[0]) => TcpSecondaryOpaque
+        ).egress_mut();
+        egress.connection_index = connection_index;
+        egress.worker_index = sessions.worker_index();
+        egress.fib_index = connection.base.endpoint.fib_index();
+        let next = self.tco_next_node[usize::from(!connection.remote().is_ipv4())];
+        sessions.add_pending_tx_buffer(runtime, buffers[0], next);
+    }
 
     // VPP tcp_output.c:1123-1270,1672-1708. Peek the *same Session TX FIFO*
     // at snd_nxt - snd_una; copy directly into final allocated Buffer(s),
@@ -556,9 +693,7 @@ impl TcpWorker {
             return packets;
         }
         if packets >= params.max_burst_size as usize {
-            self.connections.get_mut(connection_index)
-                .expect("custom TX connection remains live")
-                .send_ack_pending = true;
+            self.program_ack(runtime, sessions, connection_index, false);
             return packets;
         }
         packets + self.send_acks(runtime, sessions, connection_index,
@@ -569,6 +704,16 @@ impl TcpWorker {
 
 `TcpConnection::send_space` 不是旧 `tx_payload_budget` 的别名：它不调用
 `pacing_ready`、`next_send_delay` 或 Nagle；Session 统一应用通用 pacer。
+它必须先在 recovery/Closed 返回零；否则取拥塞可用空间。收到 dupACK 或已有
+SACK 字节但尚未进入 recovery 时，用 VPP `tcp_snd_space_inline` 的
+`n_pkts = (SACK ? reorder - 1 : 2)` 限额和 `limited_transmit` 序号约束覆盖该空间，
+再按 `send_mss` 舍入；对端窗口在 `send_params` 以
+`snd_wnd - (snd_nxt - snd_una)` 独立截断。当前 recovery 没有暴露 dupACK/SACK
+字节与 reorder 事实，迁移时由 TCP recovery owner 提供这些**连接私有事实**，
+不在 service 添加 TCP flag 或基于 `tx_payload_budget` 猜值。正常非 TSO 发送将
+`send_mss` 写进参数；若将来启用 TCP TSO，才按 VPP `tcp_session_cal_goal_size`
+把 GSO goal size 写进参数，不把普通 MSS 默认为 GSO size。来源：VPP
+`tcp.c:1100-1196`、`tcp_cc.h:107-135`。
 `update_burst_send_vars` 和 `push_one_header` 操作 TCP 已有字段及 cached options，
 不是在 service 增加 TCP 状态。`transmit_unsent`/`retransmit` 的 Buffer 只保留 index
 到 `TcpWorker.tx_buffers` 或 Session pending，payload 均从 Session FIFO 读取。
@@ -583,6 +728,27 @@ Session 已放入的 payload/chain 保持原位；`commit_payload_tx` 每段只�
 不能由 Session 和 TCP 各推进一次 `snd_nxt` 或重复记录 recovery/timer。
 来源：`tcp_output.c:884-1035`；Hammer `connection.rs:1487-1588`、
 `segment.rs:104-129`。
+
+```rust
+// VPP tcp_output.c:890-930. Replace the existing unconditional ACK | PSH
+// selection inside TcpConnection::tx_segment's established-data branch.
+let start = self.tx_payload_sequence();
+let end = start.advance(payload_len as u32);
+let mut flags = TcpSegmentFlags::ACK;
+if self.psh_pending && self.psh_sequence >= start && self.psh_sequence < end {
+    flags.insert(TcpSegmentFlags::PSH);
+}
+let flags = self.output_flags(flags);
+// The existing TcpSegment::new still constructs the data output intent.
+// Its write_to_buffer writes directly into the final Buffer headroom.
+```
+
+VPP 的 `cached_opts[40]` 是 worker 的 burst option scratch；Hammer 仍保留该字段和
+有效 MSS 的计算，但不能为了使用它先把完整 header 复制到临时 Buffer 再 copy-back。
+现有 `TcpSegment`/`TcpSegmentHeader` 已能直接向最终 Buffer 写 options；普通数据
+路径先复用这一能力。若后续要求缓存 options 字节，可在**同一**最终 Buffer 的
+options 区写缓存，不新增 header owner 或第二次 payload copy。来源：
+`tcp_output.c:300-329,890-930`；Hammer `tcp/src/segment.rs:82-129`。
 
 TCP 的 `pending_deq_acked: Vec<u32>` **已经**在 `TcpWorker`，目标直接使用它。
 在已有 `TcpConnectionCacheline0` 保存本 burst 的 `burst_acked: u32` 与
@@ -653,7 +819,7 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
             .expect("TCP data Session retains its TX FIFO");
         connection.update_burst_send_vars(fifo, cached_opts);
         let outstanding = connection.snd_nxt().wrapping_sub(connection.snd_una());
-        params.send_mss = connection.send_goal_size() as u16;
+        params.send_mss = connection.send_mss as u16;
         params.send_space = connection.send_space()
             .min(connection.snd_wnd().saturating_sub(outstanding));
         params.tx_offset = outstanding;
@@ -704,7 +870,38 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         &self, runtime: &mut DataPlaneMain, worker: &SessionWorker,
         connection_index: u32,
         buffers: &[u32], available_bytes: u32,
-    );
+    ) {
+        let mut tcp = self.worker(runtime.thread_index())
+            .expect("Session TX runs on the TCP owner worker");
+        let now = tcp.last_timer_update;
+        let TcpWorker { connections, timer_wheel, .. } = &mut *tcp;
+        let connection = connections.get_mut(connection_index)
+            .expect("Session TX retains its TCP connection");
+        let outstanding = connection.snd_nxt.raw().wrapping_sub(connection.snd_una.raw());
+        let max_dequeue = outstanding.checked_add(available_bytes)
+            .expect("TCP outstanding and available FIFO bytes fit u32");
+        for &index in buffers {
+            let buffer = runtime.buffer_mut(index);
+            connection.push_one_header(buffer, now);
+            let egress = hammer_core::buffer_opaque!(mut buffer => TcpSecondaryOpaque)
+                .egress_mut();
+            egress.connection_index = connection_index;
+            egress.worker_index = worker.worker_index();
+            egress.fib_index = connection.base.endpoint.fib_index();
+        }
+        if buffers.is_empty() {
+            return;
+        }
+        let fifo = worker.session(connection.base.session.session_index)
+            .and_then(Session::tx_fifo)
+            .expect("TCP data Session retains TX FIFO");
+        assert!(fifo.max_dequeue() >= connection.snd_nxt.raw()
+            .wrapping_sub(connection.snd_una.raw()) as usize,
+            "TCP sent bytes remain in Session TX FIFO until ACK");
+        connection.update_cwnd_limited(max_dequeue);
+        connection.sync_payload_tx_timers(connection_index, timer_wheel, now)
+            .expect("validated TCP timer interval remains representable");
+    }
 
     // VPP tcp_output.c:1804-2065,2154-2186. Accept Connection only;
     // recovery may send unsent FIFO bytes too, followed by pending ACKs.
@@ -745,6 +942,929 @@ output next 都不移到 service。现有 `tcp_session_io` 内自行实现的 RX
 构造 `&self` 与 `&mut self.tx_context.send_params` 的别名。
 `push_header` 借 context 中首 Buffer index 的不可变切片及 `&SessionWorker`，
 两者均为共享借用；TCP 独占修改的是另一个 owner 的 Buffer。
+
+### TCP 时间与输出注册
+
+VPP `session_queue_node_fn` 每轮先更新 Session 时间并调用 transport 的 time
+subscriber；TCP 的顺序是处理到期 cleanup、推进 timer wheel、按
+`max_timers_per_loop` 消费原样 timer token。Hammer 保留现有
+`Transport::update_time(now, worker_index)` 签名：它只推进 TCP owner worker 的
+clock/wheel 并把到期 token 放进已有 `pending_timers`。已有注册的
+`tcp_session_update_time` 先调用 trait 更新 clock/收集到期 token，再以同一轮
+`TcpWorker.time_origin` 转换出的同一单调 `Instant` 执行到期 cleanup，最后借当前
+`runtime`/`SessionWorker` 派发 token；cleanup
+取消的旧 token 必须由派发处按现有 pending/armed 位跳过。这样实际 cleanup 副作用
+仍在 timer handler 之前，同时保留不可修改的 trait 签名；不得在 trait 与
+subscriber 各推进一次 wheel，也不得遍历所有 timer 种类猜测到期项。VPP 的 cleanup 请求是按
+`free_time` 排序的 FIFO，因而仅检查队头。Hammer 继续用现有
+`TcpCleanupRequest.free_time: Instant`，与 TCP wheel 已有的单调时间基准一致，
+不把 VPP 的 `f64` 表示机械搬进 Rust，也不增加第二个 cleanup 队列。
+`session_queue_run_on_main_thread` 只针对 VPP 的 thread 0 数据面；Hammer 主线程不
+跑数据面，不照搬该分支。来源：VPP `session_node.c:2033-2050`、
+`tcp.c:1293-1369`；Hammer `tcp/src/lib.rs:543-562,856-911`、`tcp/src/worker.rs:36-40`。
+
+```rust
+// VPP tcp.c:1293-1369; session_node.c:2033-2050.
+impl TcpWorker {
+    // VPP tcp.c:1337-1359. Pop only due requests from the ordered FIFO;
+    // no Session backlink means TCP-only cleanup, otherwise request the
+    // service-owned Session deletion before TCP connection cleanup.
+    fn handle_cleanups(
+        &mut self, runtime: &DataPlaneMain, sessions: &mut SessionWorker, now: Instant,
+    );
+
+    // VPP tcp.c:1293-1335. Consume at most max_timers_per_loop exact
+    // TcpTimerToken values, skip a reset/rearmed token, and keep the rest
+    // in pending_timers for the next Session queue dispatch.
+    fn dispatch_pending_timers(
+        &mut self, runtime: &mut DataPlaneMain, sessions: &mut SessionWorker,
+    ) -> Result<(), SessionError>;
+}
+
+// VPP tcp.c:1361-1369; session_node.c:2033-2050. Existing time subscriber.
+fn tcp_session_update_time(
+    runtime: &mut DataPlaneMain, sessions: &mut SessionWorker, now: f64,
+) -> Result<(), SessionError> {
+    let tcp = TCP_MAIN.get().expect("registered TCP time subscriber retains TCP Main");
+    let worker_index = sessions.worker_index();
+    <TcpMain as Transport<IpTransportEndpointConfig>>::update_time(
+        tcp, now, worker_index,
+    );
+    {
+        let mut worker = tcp.worker(runtime.thread_index())
+            .expect("subscriber executes on the TCP owner worker");
+        let origin_seconds = worker.time_origin_seconds
+            .expect("update_time establishes the TCP worker time origin");
+        let now = worker.time_origin
+            .checked_add(Duration::from_secs_f64((now - origin_seconds).max(0.0)))
+            .expect("TCP worker monotonic time remains representable");
+        worker.handle_cleanups(runtime, sessions, now);
+    }
+    tcp.worker(runtime.thread_index())
+        .expect("subscriber executes on the TCP owner worker")
+        .dispatch_pending_timers(runtime, sessions)
+}
+```
+
+TCP4/TCP6 output 各自编译 `session-queue -> tcp*-output` next，随后让
+plugin-session 以**同一个** TCP protocol id 和各自 IP family 注册 Session type/TX
+入口。`tco_next_node[0/1]` 是 TCP worker 的同一对 next；独立 ACK、重传、timer
+control packet 和普通 FIFO TX 最终都走 service 的 pending buffer/next 列。
+`session-queue` 初始 Disabled 且只由 Session enable 生命周期切换，TCP output
+初始化不得在编译 next 后再次把它 Disabled。现有按 node name 查找 graph 的
+注册阶段可保留一次，`bind_worker_graph` 不应每个 worker 再按名称发现同一个 edge。
+来源：VPP `tcp.c:1590-1630,1743-1749`、`session.c:1819-1847,2196-2270`；
+Hammer `tcp/src/output.rs:43-74`、`tcp/src/lib.rs:984-1026`、
+`service/session/node.rs:91-103,138-153`。
+
+```rust
+// VPP tcp.c:1590-1630,1743-1749; session.c:1827-1847.
+// These statements belong in each existing tcp4/tcp6 output init after
+// registering that output node; no new graph init hook or bind helper.
+let queue = runtime.nodes().node_by_name("session-queue")
+    .expect("Session queue registers before TCP output graph init");
+let next = SessionQueueNode::compile_output_next(runtime, queue, node)?;
+IpSessionMain::global()?.register_transport(
+    TCP_MAIN.get().expect("TCP Main initialized").protocol(),
+    IpSessionFamily::Ip4, // Ip6 in tcp6 output init
+    next,
+    tcp_session_tx,
+)?;
+// Existing tcp_worker_init stores these two compiled next slots in
+// tco_next_node; neither output init calls set_node_state(queue, Disabled).
+```
+
+## TCP 接收与 FIFO OOO segment
+
+这部分更正 TCP 接收路径，不把 TX FIFO 的 peek/recovery 规则套到 RX。
+TCP connection 持有 `rcv_nxt`、接收窗口和 SACK **公告状态**；Session 持有 RX FIFO，
+`hammer-infra::svm::Fifo` 的 `OooSegment` pool/list 才持有未来字节的重组区间。
+`ooo_enq_lookup`/`ooo_deq_lookup` 在 VPP 是 FIFO **chunk** 定位树，不能拿来索引
+OOO segment；当前 Hammer `replace_ooo_segments` 对它们的插入/清空也要删除。
+TCP 不再额外保存一份乱序 payload、`Vec` 重组队列或用 SACK block 代替 FIFO OOO segment。
+SACK list 与 FIFO OOO list 可以同时存在：前者是发送给对端的 TCP 选项状态，
+后者决定哪些字节何时对应用连续可读。来源：VPP
+`tcp_input.c:1000-1101`、`svm_fifo.c:171-340,833-930`。
+
+TCP 建立/接受的 Session 已关联 RX/TX FIFO 后、处理首个 data packet 前，按 VPP
+`transport_fifos_init_ooo` 的时机确保 RX OOO enqueue chunk lookup 和 TX OOO dequeue
+chunk lookup 可用。Hammer 的 `Fifo` 构造时已有 `ooo_segments` 和 chunk lookup，不复制一个 TCP
+私有实例，也不在每包重建 lookup；现有 `enable_ooo` 只设置未被 OOO 入队读取的
+`ooo_base`，**不等价于** VPP 的 lookup 初始化，不能把调用它当作完成接线。
+目前 `write_at_without_tail_store` 仍从 tail chunk 线性扫描，现有 RbTree 还未
+随 chunk 附着/回收维护。迁移时在 infra 的现有 chunk 操作中维护
+`start_byte -> chunk offset`，OOO 写入按 producer-owned `ooo_enq_lookup` 定位；
+不能把 segment 索引塞进去充当初始化。若构造期已完成这些映射，就无需另造
+enable 调用。来源：`transport.c:1205-1210`、`svm_fifo.c:593-726,892-930`、
+`tcp_input.c:1858,1883,2622`；Hammer `svm/fifo.rs:594-599,714-719,1257-1309,1597-1605`。
+
+目标继续使用现有 `Fifo::enqueue_ooo`、`OooResult`、
+`SessionWorker::enqueue_rx`、`RxDelivery`、`TcpConnection::accept_payload` 和
+`TcpConnection::receive_payload`，不新增重组 owner。现有结果字段必须改为
+FIFO 的真实结果：`OooResult.start/len` 表示本次插入/合并后 **newest OOO segment**
+相对当前 producer tail 的起点和长度，而不是本次 Buffer 写入区间；完全被已有
+OOO segment 覆盖、没有改变区间时 `start=None`。因此 `RxDelivery::OutOfOrder`
+必须允许 `newest=None`，不能将没有新 SACK 区间的成功写入伪造成错误。跨 Buffer
+链使用每段的 `offset + 已处理长度`；以**最后一次 FIFO OOO 插入**留下的 newest
+标记为结果，不用 `min(start)..max(end)` 合成一个可能不存在的区间，也不保留
+较早 chunk 的 stale newest。来源：
+`svm_fifo.c:171-299,892-930`、`svm_fifo.h:630-662`、
+`tcp_input.c:1051-1101`、`session.h:685-754,778-829`。
+
+`ooos_list_head`/`ooos_newest` 当前是普通 `u32`，却在 `&Fifo` 下经 raw cast
+改写；目标与 `ooo_segments` 一样用 `UnsafeCell<u32>` 表达同一 producer 独占写入
+契约。`UnsafeCell` 不改变字段布局。`first_ooo_segment` 现返回池内 `&OooSegment`，
+会把可被下一次 producer 插入/合并释放的引用暴露出去；目标仅返回 `Copy` 的
+区间事实，或者由同一个 producer 操作的 `OooResult` 直接给 TCP，不跨调用保留
+池元素借用。FIFO tail 仍只在按序补洞成功时 release 发布；OOO 数据和区间在
+tail 前不能被 consumer 观察。来源：`svm_fifo.c:171-340,833-930`、
+`svm_fifo.h:630-662`；Hammer `svm/fifo.rs:594-600,1569-1572,1604-1755`。
+
+```rust
+// VPP svm_fifo.c:171-299,892-930; svm_fifo.h:635-662.
+// Existing infra result: only start/len semantics change; no new carrier.
+pub struct OooResult {
+    pub accepted: u32,
+    pub delivered: u32,
+    pub start: Option<u32>, // newest merged OOO segment, relative to producer tail
+    pub len: u32,            // zero when start is None
+}
+
+impl Fifo {
+    // OOO insert is all-or-nothing for this slice. It copies directly into
+    // FIFO future storage, merges adjacent/overlapping OooSegment records,
+    // leaves tail unchanged, and returns the merged segment just affected.
+    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError>;
+}
+
+// VPP session.h:778-829; tcp_input.c:1000-1101.
+// Existing service outcome; change the existing variant, not add a second one.
+pub enum RxDelivery {
+    NotAccepted { rx_available: u32 },
+    InOrder { accepted: NonZeroU32, promoted: u32, rx_available: u32 },
+    OutOfOrder {
+        accepted: NonZeroU32,
+        newest: Option<(u32, NonZeroU32)>,
+        rx_available: u32,
+    },
+}
+
+impl SessionWorker {
+    // In-order: enqueue at tail, include FIFO-promoted OOO bytes in
+    // delivered count and queue one RX notification for this Session, even
+    // when this enqueue writes zero bytes, as VPP queue_event does.
+    // OOO: enqueue at offset, return last FIFO newest, queue no RX event.
+    #[inline(always)]
+    pub fn enqueue_rx(
+        &mut self, runtime: &DataPlaneMain, handle: SessionHandle,
+        buffer_index: u32, offset: u32,
+    ) -> RxDelivery {
+        let session = self.session_from_handle(handle)
+            .expect("TCP input retains its owner-worker Session");
+        let fifo = session.rx_fifo().expect("data Session retains RX FIFO");
+        let mut accepted = 0u32;
+        let mut promoted = 0u32;
+        let mut processed = 0u32;
+        let mut skip_promoted = 0usize;
+        let mut newest = None;
+        for buffer in runtime.chain(buffer_index) {
+            let bytes = buffer.current();
+            if offset == 0 {
+                let skip = skip_promoted.min(bytes.len());
+                skip_promoted -= skip;
+                let bytes = &bytes[skip..];
+                if !bytes.is_empty() {
+                    let result = fifo.enqueue_ooo(0, bytes)
+                        .expect("offset-zero FIFO enqueue cannot fail");
+                    accepted = accepted.checked_add(result.accepted)
+                        .expect("RX packet chain fits the FIFO length");
+                    promoted = promoted.checked_add(result.delivered)
+                        .expect("promoted OOO bytes fit the FIFO length");
+                    skip_promoted += result.delivered as usize;
+                    if result.accepted as usize != bytes.len() {
+                        break; // FIFO full: keep any already accepted prefix.
+                    }
+                }
+            } else if !bytes.is_empty() {
+                let chunk_offset = offset.checked_add(processed)
+                    .expect("validated TCP receive window bounds OOO offset");
+                match fifo.enqueue_ooo(chunk_offset, bytes) {
+                    Ok(result) => {
+                        accepted = accepted.checked_add(result.accepted)
+                            .expect("RX packet chain fits the FIFO length");
+                        newest = result.start.and_then(|start| {
+                            NonZeroU32::new(result.len).map(|length| (start, length))
+                        }); // last insertion's newest, including None
+                    }
+                    Err(FifoError::OutOfOrderCapacityExceeded { .. }
+                        | FifoError::SegmentExhausted) => break,
+                    Err(FifoError::OutOfOrderLengthOutOfRange { .. }) => {
+                        panic!("TCP packet chain length fits the FIFO offset")
+                    }
+                }
+            }
+            processed += u32::try_from(bytes.len())
+                .expect("packet chain length fits FIFO offset");
+        }
+        let rx_available = u32::try_from(fifo.max_enqueue()).unwrap_or(u32::MAX);
+        if offset == 0 {
+            let session = self.session_mut(handle.session_index)
+                .expect("RX Session remains live while TCP enqueues");
+            if !session.flags.rx_event {
+                session.flags.rx_event = true;
+                self.sessions_to_enqueue.push(handle);
+            }
+        }
+        let Some(accepted) = NonZeroU32::new(accepted) else {
+            return RxDelivery::NotAccepted { rx_available };
+        };
+        if offset == 0 {
+            RxDelivery::InOrder { accepted, promoted, rx_available }
+        } else {
+            RxDelivery::OutOfOrder { accepted, newest, rx_available }
+        }
+    }
+}
+```
+
+下面是 `enqueue_ooo` 的核心替换代码。它只更新当前 FIFO 的 segment pool/list，
+删除现有 `collect_ooo_segments`/`replace_ooo_segments` 及临时区间 `Vec`；
+chunk lookup 保持独立，不随 segment 合并清空。`add_ooo_segment` 是 VPP
+`ooo_segment_add` 对应的**私有** FIFO 原语，
+不是 TCP/Session 的新容器。写 future bytes 失败时还没有发布 OOO 元数据；
+成功时合并并返回真实 newest，`tail` 保持不变。
+
+```rust
+// VPP svm_fifo.c:171-340,892-930; svm/fifo_types.h:105-106.
+// Existing Fifo fields change from u32 to UnsafeCell<u32>; repr stays u32.
+// ooos_list_head: UnsafeCell<u32>, ooos_newest: UnsafeCell<u32>.
+impl Fifo {
+    fn add_ooo_segment(&self, tail: u32, offset: u32, length: u32)
+        -> Option<(u32, u32)>
+    {
+        let start = tail.wrapping_add(offset);
+        let mut end = start.wrapping_add(length);
+        // SAFETY: only the FIFO producer mutates OOO metadata; the consumer
+        // observes data only after a release store to tail.
+        let segments = unsafe { &mut *self.ooo_segments.get() };
+        let head = unsafe { &mut *self.ooos_list_head.get() };
+        let newest = unsafe { &mut *self.ooos_newest.get() };
+
+        let mut previous = OOO_SEGMENT_INVALID_INDEX;
+        let mut current = *head;
+        while current != OOO_SEGMENT_INVALID_INDEX
+            && f_pos_lt(segments.get(current).expect("OOO link remains live").start, start)
+        {
+            previous = current;
+            current = segments.get(current).expect("OOO link remains live").next;
+        }
+        // VPP ooo_segment_add: use the predecessor if the new bytes touch it;
+        // otherwise use the first following segment if the bytes touch it.
+        let target = if previous != OOO_SEGMENT_INVALID_INDEX
+            && f_pos_leq(start, segments.get(previous).unwrap().start
+                .wrapping_add(segments.get(previous).unwrap().length))
+        {
+            Some(previous)
+        } else if current != OOO_SEGMENT_INVALID_INDEX
+            && f_pos_leq(segments.get(current).unwrap().start, end)
+        {
+            Some(current)
+        } else {
+            None
+        };
+        let Some(index) = target else {
+            let index = segments.insert(OooSegment {
+                start, length, prev: previous, next: current,
+            });
+            if previous == OOO_SEGMENT_INVALID_INDEX {
+                *head = index;
+            } else {
+                segments.get_mut(previous).unwrap().next = index;
+            }
+            if current != OOO_SEGMENT_INVALID_INDEX {
+                segments.get_mut(current).unwrap().prev = index;
+            }
+            *newest = index;
+            return Some((offset, length));
+        };
+
+        let old_start = segments.get(index).unwrap().start;
+        let old_end = old_start.wrapping_add(segments.get(index).unwrap().length);
+        if f_pos_lt(start, old_start) {
+            segments.get_mut(index).unwrap().start = start;
+        }
+        if f_pos_lt(end, old_end) {
+            end = old_end;
+        }
+        let mut changed = f_pos_lt(start, old_start) || f_pos_gt(end, old_end);
+        loop {
+            let next = segments.get(index).unwrap().next;
+            if next == OOO_SEGMENT_INVALID_INDEX
+                || !f_pos_leq(segments.get(next).unwrap().start, end)
+            {
+                break;
+            }
+            let segment = segments.remove(next).expect("OOO link remains live");
+            let segment_end = segment.start.wrapping_add(segment.length);
+            if f_pos_gt(segment_end, end) {
+                end = segment_end;
+            }
+            segments.get_mut(index).unwrap().next = segment.next;
+            if segment.next != OOO_SEGMENT_INVALID_INDEX {
+                segments.get_mut(segment.next).unwrap().prev = index;
+            }
+            changed = true;
+        }
+        let merged_start = segments.get(index).unwrap().start;
+        segments.get_mut(index).unwrap().length = end.wrapping_sub(merged_start);
+        if !changed {
+            return None; // VPP leaves ooos_newest invalid for a covered write.
+        }
+        *newest = index;
+        Some((merged_start.wrapping_sub(tail), end.wrapping_sub(merged_start)))
+    }
+
+    pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError> {
+        unsafe { *self.ooos_newest.get() = OOO_SEGMENT_INVALID_INDEX };
+        if src.is_empty() {
+            return Ok(OooResult { accepted: 0, delivered: 0, start: None, len: 0 });
+        }
+        if offset == 0 {
+            let hdr = self.hdr;
+            let head = unsafe { (*hdr).head.load(Ordering::Acquire) };
+            let tail = unsafe { (*hdr).tail.load(Ordering::Relaxed) };
+            if head == tail {
+                self.prepare_empty_tail_chunk(tail);
+            }
+            let free = unsafe { (*hdr).size.saturating_sub(tail.wrapping_sub(head)) };
+            let to_write = src.len().min(free as usize);
+            let accepted = self.append_at_tail_without_tail_store(tail, &src[..to_write]) as u32;
+            let delivered = if accepted == 0 {
+                0
+            } else {
+                let next_tail = tail.wrapping_add(accepted);
+                let promoted = self.promote_contiguous_from(next_tail);
+                unsafe { (*hdr).tail.store(next_tail.wrapping_add(promoted), Ordering::Release) };
+                promoted
+            };
+            return Ok(OooResult {
+                accepted, delivered, start: None, len: 0,
+            });
+        }
+        let length = u32::try_from(src.len()).map_err(|_| FifoError::OutOfOrderLengthOutOfRange {
+            length: src.len(),
+        })?;
+        let available = self.max_enqueue();
+        if offset as usize > available || src.len() > available - offset as usize {
+            return Err(FifoError::OutOfOrderCapacityExceeded {
+                end_offset: offset.wrapping_add(length), available,
+            });
+        }
+        let tail = unsafe { (*self.hdr).tail.load(Ordering::Relaxed) };
+        let start = tail.wrapping_add(offset);
+        if self.write_at_without_tail_store(start, src) != src.len() {
+            return Err(FifoError::SegmentExhausted);
+        }
+        let newest = self.add_ooo_segment(tail, offset, length);
+        Ok(OooResult {
+            accepted: length,
+            delivered: 0,
+            start: newest.map(|(start, _)| start),
+            len: newest.map_or(0, |(_, len)| len),
+        })
+    }
+}
+```
+
+`Fifo::enqueue` 现有实现先 release 发布中间 tail，再以临时 `Vec` 重建区间并第二次
+发布 tail；目标让 offset-zero 的现有 `enqueue_ooo` 完成按序拷入与原位 OOO
+收集，只 release 发布一次最终 tail。普通 `enqueue` 直接取其总交付量，service
+接收路径则读取同一个 `OooResult` 中**准确的** `accepted/delivered`，不能用总量
+`min(src.len())` 猜本次拷入量。`newest` 在每次按序 enqueue 的空间检查之前清空；
+已交付的
+OOO segment 从 pool/list 一起删除，chunk lookup 不变。下列代码替换现有
+`promote_contiguous_from`、`collect_ooo_segments`、`replace_ooo_segments` 的热路径，
+不增加另一种 FIFO 或分配中间 payload。来源：VPP `svm_fifo.c:308-340,833-877`。
+
+```rust
+// VPP svm_fifo.c:308-340,833-877. Producer alone mutates the OOO pool.
+impl Fifo {
+    fn promote_contiguous_from(&self, base: u32) -> u32 {
+        let segments = unsafe { &mut *self.ooo_segments.get() };
+        let head = unsafe { &mut *self.ooos_list_head.get() };
+        let mut tail = base;
+        while *head != OOO_SEGMENT_INVALID_INDEX {
+            let index = *head;
+            let segment = *segments.get(index).expect("OOO list index remains live");
+            if f_pos_gt(segment.start, tail) {
+                break;
+            }
+            *head = segment.next;
+            if segment.next != OOO_SEGMENT_INVALID_INDEX {
+                segments.get_mut(segment.next)
+                    .expect("OOO next index remains live").prev = OOO_SEGMENT_INVALID_INDEX;
+            }
+            segments.remove(index).expect("OOO head remains live");
+            let end = segment.start.wrapping_add(segment.length);
+            if f_pos_gt(end, tail) {
+                tail = end;
+            }
+        }
+        tail.wrapping_sub(base)
+    }
+}
+```
+
+现有 `Fifo::enqueue` 复用 offset-zero 入口，不再保留第二份拷入/补洞循环：
+
+```rust
+// VPP svm_fifo.c:833-877. Existing public method, same return contract.
+impl Fifo {
+    pub fn enqueue(&self, src: &[u8]) -> usize {
+        let result = self.enqueue_ooo(0, src)
+            .expect("offset-zero FIFO enqueue cannot fail");
+        result.accepted as usize + result.delivered as usize
+    }
+}
+```
+
+TCP input 顺序与 VPP `tcp46_established_inline` 一致：验证窗口/PAWS 和 ACK 之后，
+才处理 payload，之后再判断 FIN；RX 的 `runtime`/`SessionWorker` 借用只在节点已有
+owner 间传递，不重新从 global Main 借第二个 worker。`TcpConnection::accept_payload`
+使用 TCP 序号判断：`seq_end <= rcv_nxt` 是旧包，DUPACK 而不 enqueue；
+`seq < rcv_nxt < seq_end` 先从 **原 Buffer chain** 裁去旧前缀，剩余字节按序写；
+`seq == rcv_nxt` 直接按序写；`seq > rcv_nxt` 则以 `seq - rcv_nxt` 为 offset
+写入 Session RX FIFO OOO segment，并发送 DUPACK。裁剪不能把整段 payload 复制
+到临时 `Vec`，Session FIFO 仍是唯一的 app/session 字节拷贝边界。来源：
+`tcp_input.c:1147-1210,1361-1405`、`session.h:778-829`。
+
+```rust
+// VPP tcp_input.c:1000-1101,1149-1211; session.h:778-829.
+impl TcpConnection {
+    // Existing decision: return old-prefix trim and relative FIFO offset;
+    // a fully old segment stays outside the Session enqueue path.
+    #[inline]
+    fn accept_payload(&self, packet: &TcpPacket) -> Option<(usize, u32)> {
+        if packet.payload_len == 0 {
+            return None;
+        }
+        let end = packet.sequence.advance(packet.payload_len as u32);
+        if end <= self.rcv_nxt {
+            return None;
+        }
+        if packet.sequence < self.rcv_nxt {
+            return Some((packet.sequence.distance_to(self.rcv_nxt) as usize, 0));
+        }
+        Some((0, self.rcv_nxt.distance_to(packet.sequence)))
+    }
+
+    // Existing update: in-order accepted + FIFO-promoted bytes advance
+    // rcv_nxt. OOO leaves rcv_nxt unchanged and updates SACK from FIFO's
+    // newest merged interval; no new statistics field is required.
+    #[inline]
+    fn receive_payload(
+        &mut self, sequence: TcpSeq, trim: u32, delivery: RxDelivery,
+    ) {
+        let sack_enabled = self.negotiated_options().sack;
+        if trim != 0 {
+            self.sack.set_duplicate(sack_enabled, sequence, self.rcv_nxt);
+        }
+        match delivery {
+            RxDelivery::NotAccepted { .. } => {}
+            RxDelivery::InOrder { accepted, promoted, .. } => {
+                self.rcv_nxt = self.rcv_nxt.advance(accepted.get().wrapping_add(promoted));
+                self.sack.update_range(sack_enabled,
+                    self.rcv_nxt, self.rcv_nxt, self.rcv_nxt);
+            }
+            RxDelivery::OutOfOrder { newest: Some((start, length)), .. } => {
+                let left = self.rcv_nxt.advance(start);
+                let right = left.advance(length.get());
+                self.sack.update_range(sack_enabled,
+                    self.rcv_nxt, left, right);
+            }
+            RxDelivery::OutOfOrder { newest: None, .. } => {}
+        }
+    }
+}
+```
+
+三个 data-bearing TCP input 分支使用同一段目标流程；下面保留原 Buffer 链，
+只在每个 Buffer 上移动 `current_data/current_length`，不创建 payload `Vec` 或
+第二份 OOO 存储。`packet.payload_len` 是解析出的总 data 长度，不能让尾随
+非 payload 字节进入 FIFO；input frame 仍拥有整条链并在末尾释放。来源：VPP
+`tcp_input.c:1000-1101,1149-1211,1394-1413,1897-1907,2260-2271`、
+`session.h:685-829`。
+
+```rust
+// VPP tcp_input.c:1149-1211. Same branch in established/rcv_process/syn_sent.
+assert_ne!(packet.payload_len, 0, "payload branch follows ACK processing");
+let decision = tcp.connections.get(connection_index)
+    .expect("input lookup retained TCP connection")
+    .accept_payload(&packet);
+let error = if let Some((trim, offset)) = decision {
+    let mut prefix_left = packet.payload_offset + trim;
+    let payload_len = packet.payload_len - trim;
+    let mut payload_left = payload_len;
+    let mut next = Some(buffer_index);
+    while let Some(index) = next {
+        let buffer = runtime.buffer_mut(index);
+        let skip = prefix_left.min(buffer.current_len());
+        buffer.advance(skip as isize);
+        prefix_left -= skip;
+        let keep = payload_left.min(buffer.current_len());
+        buffer.truncate(keep).expect("TCP parser bounds payload within the chain");
+        payload_left -= keep;
+        next = buffer.next_buffer_slot();
+    }
+    assert_eq!(prefix_left, 0, "parsed TCP header remains inside the Buffer chain");
+    assert_eq!(payload_left, 0, "parsed TCP payload remains inside the Buffer chain");
+
+    let delivery = sessions.enqueue_rx(runtime, handle, buffer_index, offset);
+    let received = match delivery {
+        RxDelivery::NotAccepted { .. } => 0,
+        RxDelivery::InOrder { accepted, .. }
+        | RxDelivery::OutOfOrder { accepted, .. } => accepted.get() as usize,
+    };
+    tcp.connections.get_mut(connection_index)
+        .expect("input retains TCP connection")
+        .receive_payload(packet.sequence, trim as u32, delivery);
+    tcp.program_ack(runtime, sessions, connection_index, offset != 0);
+    if received == 0 {
+        let connection = tcp.connections.get(connection_index)
+            .expect("input retains TCP connection");
+        if offset == 0 && connection.rcv_wnd < connection.send_mss {
+            TcpNodeError::ZeroReceiveWindow
+        } else {
+            TcpNodeError::FifoFull
+        }
+    } else if received != payload_len {
+        if offset == 0 {
+            TcpNodeError::PartiallyEnqueued
+        } else {
+            TcpNodeError::FifoFull
+        }
+    } else if offset == 0 {
+        TcpNodeError::Enqueued
+    } else {
+        TcpNodeError::EnqueuedOoo
+    }
+} else {
+    tcp.program_ack(runtime, sessions, connection_index, true);
+    TcpNodeError::SegmentOld
+};
+runtime.record_current_node_error(error)?;
+// FIN follows payload processing; only seq_end == current rcv_nxt is accepted.
+```
+
+按序 enqueue 返回的 `accepted + promoted` 才是 `rcv_nxt` 增量。VPP
+`tcp_input.c:1013-1029,1075-1076` 的 `bytes_in` 是独立统计：按序计本包实际写入量，
+成功的 OOO 入队计本包 data_len，即使与已有 OOO segment 重叠；本 ADR 不为此
+新增 Hammer stats。补洞使 FIFO tail 连续跨过 OOO segment 时，
+应用只得到一次合并后的 RX 通知，并清理已送达的 SACK block。乱序 enqueue
+不推进 `rcv_nxt`、不通知应用；SACK 启用时将 FIFO newest segment 的
+`[rcv_nxt + start, rcv_nxt + start + len)` 加到 TCP SACK list，随后消费该
+newest 标记；`newest=None` 表示不重复插入 SACK。VPP `tcp_rcv_fin` 拒绝
+out-of-order FIN，因此不能将 FIN 作为 FIFO OOO payload 缓存。来源：
+`tcp_input.c:977-1048,1051-1101,1203-1210`、`session.c:690-715`。
+
+`established.rs`、`rcv_process.rs` 和 `syn_sent.rs` 的 data-bearing 分支共用上述
+序号判定/FIFO 结果语义；目前后两者固定 offset 为零且绕过 `receive_payload`，
+迁移时必须删除这种特例。`receive_open_reply` 对 SYN-ACK data 不能预先按
+packet 长度推进 `rcv_nxt`，应先建立基于 SYN 消耗的接收序号，再按 FIFO 的
+实际入队/补洞结果推进。现有 `TcpSackState` 保留为 TCP 选项状态，但不得据
+packet 原始范围推断 FIFO 已合并的 OOO 范围；现有 `RxDelivery` 字段替换而不并存
+两套协议。TCP input node 的 batch 尾部调用已有 `flush_enqueue_events`，
+与 `session_main_flush_enqueue_events` 对齐；不能在每个 OOO packet 后通知 app。
+来源：`tcp_input.c:1394-1412,1897-1907`、`session.c:690-715`。
+
+这些 RX 分类落在 TCP input node 的 enum counter，而非 `SessionError`：
+`Enqueued`/`EnqueuedOoo` 为已写入的观察计数，`PartiallyEnqueued` 为按序部分写入，
+`FifoFull` 为 FIFO 空间/增长失败，`SegmentOld` 为全旧重传，
+`ZeroReceiveWindow` 为接收窗口低于 MSS 且本次未写入。`OutOfOrderCapacityExceeded`
+等 FIFO 容量结果在 packet 边界映射 `FifoFull`；TCP node 须比较
+`accepted` 与本包 payload 长度，跨链部分入队不能误报完整入队，也不能把每包拥塞作为
+`SessionError::RxOutOfOrderEnqueue` 向控制面返回；无效的 Session/worker 关联是
+owner 不变量，窗口外 segment 由 TCP validation 自己分类。保留已有 node error
+enum，仅为缺失的 VPP 类别补具体变体；实施前按仓库规则取得公开 enum 变更批准。
+来源：`tcp_error.def:22-26,48,51`、`tcp_input.c:211-326,1000-1101,1149-1211`。
+
+```rust
+// VPP tcp_error.def:22-26,51; tcp_input.c:1000-1101,1149-1211.
+// Target additions to existing TcpNodeError; its other variants remain.
+pub enum TcpNodeError {
+    Enqueued,
+    EnqueuedOoo,
+    FifoFull,
+    PartiallyEnqueued,
+    SegmentOld,
+    ZeroReceiveWindow,
+}
+```
+
+同步与 inline：TCP connection、SessionWorker 和 FIFO OOO metadata 都由当前
+Data Worker 独占更新，FIFO consumer 只按 FIFO 自身的 release/acquire tail
+发布/读取连续字节；OOO 未来字节不提前发布 tail，不另加锁、原子指针或
+`volatile`。`session_enqueue_stream_connection` 在 VPP 是 `always_inline`，故
+service 的短 `enqueue_rx` 分支可按现有热路径 `#[inline(always)]`；VPP
+`tcp_segment_rcv`、`tcp_session_enqueue_data`/`ooo` 是普通 `static` 函数，
+节点级 receive 分支不强制 inline。现有 `accept_payload`/`receive_payload`
+是短连接局部操作，保留 `#[inline]`，不传播 `always_inline` 到整个 TCP node。
+来源：`session.h:778`、`tcp_input.c:999-1003,1052-1055,1149-1152`、
+`svm_fifo.c:833-930`。
+
+### ACK、重传与 Session custom TX 接线代码
+
+VPP `session_add_self_custom_tx_evt` 不只是“再排一个 TX”：它先设 Session 的
+`CUSTOM_TX` flag，再利用 TX FIFO event bit 去重；已有 event bit 时由已排队
+的 TX event 消费 custom 工作。ACK/dupACK 以 new list 优先投递，重传以 old
+list 投递；transport 被 deschedule 时即使 event bit 已置仍须入队并清
+descheduled。当前 `enqueue_ready` 没有这层语义，不能靠反复调用它代替。
+service 不知道 TCP ACK 类型，只接收 priority 和 transport 已 deschedule 的事实。
+来源：`session.c:172-200`、`tcp_output.c:1058-1089`、
+`session_node.c:1496-1532`。
+
+```rust
+// VPP session_types.h:210-225; session.c:172-200.
+// Uses the existing SessionFlags::custom_tx addition declared above.
+impl SessionWorker {
+    // New service operation required by the VPP Session event contract.
+    // It does not accept a TCP connection or a callback.
+    pub fn add_self_custom_tx_event(
+        &mut self, runtime: &DataPlaneMain, handle: SessionHandle,
+        priority: bool, descheduled: bool,
+    ) {
+        let enqueue = {
+            let session = self.session_mut(handle.session_index)
+                .expect("custom TX retains its Session on the owner worker");
+            assert_ne!(session.load_state(), SessionState::TransportDeleted);
+            if session.flags.custom_tx {
+                return;
+            }
+            session.flags.custom_tx = true;
+            session.tx_fifo().expect("custom TX retains TX FIFO").set_event()
+                || descheduled
+        };
+        if !enqueue {
+            return; // the existing TX event will observe custom_tx
+        }
+        let event = SessionEvent::from((SessionEventType::Tx, handle.session_index));
+        if priority {
+            self.allocate_new_event(event);
+        } else {
+            self.allocate_old_event(event);
+        }
+        if self.state() == SessionWorkerState::Interrupt {
+            runtime.set_node_interrupt_pending(
+                self.queue_node.expect("Session queue is installed"),
+            ).expect("installed Session queue can be interrupted");
+        }
+    }
+
+    // VPP session.c:204-221; transport.c:1112-1126. No FIFO event-bit
+    // test here: the transport has already cleared DESCHED and checked
+    // available bytes (or unset/rechecked the bit when there were none).
+    pub fn reschedule_tx(&mut self, runtime: &DataPlaneMain, handle: SessionHandle) {
+        assert_eq!(handle.worker_index, self.worker_index());
+        self.allocate_new_event(SessionEvent::from((
+            SessionEventType::Tx, handle.session_index,
+        )));
+        if self.state() == SessionWorkerState::Interrupt {
+            runtime.set_node_interrupt_pending(
+                self.queue_node.expect("Session queue is installed"),
+            ).expect("installed Session queue can be interrupted");
+        }
+    }
+}
+
+// VPP tcp_output.c:1058-1089; tcp_input.c:1194-1208.
+impl TcpWorker {
+    fn program_ack(
+        &mut self, runtime: &DataPlaneMain, sessions: &mut SessionWorker,
+        connection_index: u32, duplicate: bool,
+    ) {
+        let connection = self.connections.get_mut(connection_index)
+            .expect("input retains the TCP connection");
+        if !connection.send_ack_pending {
+            sessions.add_self_custom_tx_event(runtime, connection.base.session,
+                true, connection.base.is_descheduled());
+            connection.send_ack_pending = true;
+            connection.base.flags.descheduled = false;
+        }
+        if duplicate {
+            connection.pending_dupacks = connection.pending_dupacks.saturating_add(1).min(255);
+        }
+    }
+
+    // VPP tcp_output.c:1080-1089: retransmit uses the old Session event list.
+    fn program_retransmit(
+        &mut self, runtime: &DataPlaneMain, sessions: &mut SessionWorker,
+        connection_index: u32,
+    ) {
+        let connection = self.connections.get_mut(connection_index)
+            .expect("timer retains the TCP connection");
+        if connection.retransmit_pending {
+            return;
+        }
+        sessions.add_self_custom_tx_event(runtime, connection.base.session,
+            false, connection.base.is_descheduled());
+        connection.retransmit_pending = true;
+        connection.base.flags.descheduled = false;
+    }
+}
+```
+
+`TcpWorker::custom_tx` 的既有 ADR 代码块消费这些 flag；它按 VPP
+`tcp_session_custom_tx` 先完成 recovery 重传，再在余下 burst 内发 ACK/dupACK。
+`tcp_send_acks` 必须保留“尝试 ACK 数量”与实际 pending Buffer 数的区别。
+普通 Session TX 在 recovery/Closed 仍由 `send_params` 报零空间，不能绕开
+custom TX 从旧 `tx_payload_budget` 单独发送。`SessionTxContext.send_params.max_burst_size`
+由 Session queue 设定，TCP 不重置它。来源：`tcp.c:1128-1196`、
+`tcp_output.c:2070-2186`、`session_node.c:1496-1553`。
+
+```rust
+// VPP tcp_input.c:494-545,932-975,1407-1413; session.c:738-749.
+// In each TCP input branch, release the connection borrow before touching
+// TcpWorker.pending_deq_acked; ACK/window/CC classification stays per packet.
+let bytes_acked = {
+    let TcpWorker { connections, timer_wheel, .. } = &mut *tcp;
+    let connection = connections.get_mut(connection_index)
+        .expect("input retains its TCP connection");
+    let snd_una_before = connection.snd_una();
+    connection.receive_ack_with_timers(
+        connection_index, timer_wheel, &packet, acknowledgment,
+        advertised_window, sack_blocks, now,
+    )?;
+    snd_una_before.distance_to(connection.snd_una())
+};
+if bytes_acked != 0 {
+    tcp.program_dequeue(connection_index, bytes_acked);
+}
+
+impl TcpWorker {
+    fn program_dequeue(&mut self, connection_index: u32, bytes_acked: u32) {
+        let connection = self.connections.get_mut(connection_index)
+            .expect("ACK retains its TCP connection");
+        if !connection.deq_pending {
+            self.pending_deq_acked.push(connection_index);
+            connection.deq_pending = true;
+        }
+        connection.burst_acked = connection.burst_acked
+            .checked_add(bytes_acked).expect("ACK burst does not exceed TX flight");
+    }
+
+    fn handle_postponed_dequeues(
+        &mut self, runtime: &DataPlaneMain, sessions: &mut SessionWorker,
+    ) -> RuntimeResult<()> {
+        let mut timer_error = None;
+        for &index in &self.pending_deq_acked {
+            let connection = self.connections.get_mut(index)
+                .expect("pending ACK retains TCP connection until burst end");
+            connection.deq_pending = false;
+            let acked = std::mem::take(&mut connection.burst_acked);
+            if acked == 0 {
+                continue;
+            }
+            if connection.snd_una == connection.snd_nxt {
+                connection.delivered_time = self.time_us;
+            }
+            let dropped = sessions.tx_fifo_dequeue_drop(runtime, &connection.base, acked);
+            assert_eq!(dropped, acked, "acked bytes remain in Session TX FIFO");
+            let fifo = sessions.session_from_handle(connection.base.session)
+                .and_then(Session::tx_fifo)
+                .expect("ACK retains the TCP Session TX FIFO");
+            assert!(fifo.max_dequeue() >= connection.snd_nxt.raw()
+                .wrapping_sub(connection.snd_una.raw()) as usize);
+            if connection.base.is_descheduled()
+                && (connection.recovery.in_recovery() || connection.send_space() != 0)
+            {
+                connection.base.clear_descheduled();
+                if fifo.max_dequeue() != 0 {
+                    sessions.reschedule_tx(runtime, connection.base.session);
+                } else {
+                    fifo.unset_event();
+                    if fifo.max_dequeue() != 0 && fifo.set_event() {
+                        sessions.reschedule_tx(runtime, connection.base.session);
+                    }
+                }
+            }
+            if let Err(error) = connection.retransmit_timer_update(index, &mut self.timer_wheel) {
+                if timer_error.is_none() {
+                    timer_error = Some(error);
+                }
+            }
+            connection.tx_pacer_update();
+        }
+        self.pending_deq_acked.clear(); // retain Vec capacity for next burst
+        match timer_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    // VPP tcp_input.c:932-940. FIN and RST share the pending marker, so
+    // the same connection is not inserted twice during one input burst.
+    fn program_disconnect(&mut self, index: u32) {
+        let connection = self.connections.get_mut(index)
+            .expect("FIN retains TCP connection");
+        if !connection.disconnect_pending {
+            self.pending_disconnects.push(index);
+            connection.disconnect_pending = true;
+        }
+    }
+
+    // VPP tcp_input.c:135-149. SYN_SENT is handled immediately instead;
+    // other states retain the pre-close reset state until burst end.
+    fn program_reset(&mut self, index: u32) {
+        let connection = self.connections.get_mut(index)
+            .expect("RST retains TCP connection");
+        if !connection.disconnect_pending {
+            let state = connection.state();
+            connection.reset_state = state;
+            self.pending_resets.push(index);
+            connection.disconnect_pending = true;
+        }
+    }
+
+    fn handle_disconnects(
+        &mut self, runtime: &DataPlaneMain, sessions: &mut SessionWorker,
+    ) {
+        for &index in &self.pending_disconnects {
+            let connection = self.connections.get_mut(index)
+                .expect("pending FIN retains TCP connection");
+            connection.disconnect_pending = false;
+            let handle = connection.base.session;
+            let closed = connection.state() == TcpState::Closed;
+            sessions.transport_closing(runtime, handle, index)
+                .expect("owner Session accepts closing notification");
+            if closed {
+                sessions.transport_closed(runtime, handle, index)
+                    .expect("closed transport notifies its Session once");
+            }
+        }
+        self.pending_disconnects.clear();
+        for &index in &self.pending_resets {
+            let connection = self.connections.get_mut(index)
+                .expect("pending reset retains TCP connection");
+            connection.disconnect_pending = false;
+            let handle = connection.base.session;
+            // RST reception records the pre-close state before setting CLOSED.
+            match connection.reset_state {
+                TcpState::Established => {
+                    sessions.transport_reset(runtime, handle, index)
+                        .expect("established Session accepts reset");
+                    sessions.transport_closed(runtime, handle, index)
+                        .expect("reset transport also closes");
+                }
+                TcpState::CloseWait | TcpState::FinWait1 | TcpState::FinWait2
+                    | TcpState::Closing | TcpState::LastAck => {
+                    sessions.transport_closed(runtime, handle, index)
+                        .expect("closing Session accepts transport close");
+                }
+                TcpState::SynRcvd => {
+                    sessions.transport_deleted(runtime, handle, index)
+                        .expect("unaccepted Session requests transport deletion");
+                }
+                TcpState::SynSent => {
+                    unreachable!("SYN_SENT RST is handled on receipt, not queued")
+                }
+                TcpState::Closed | TcpState::TimeWait => {}
+                TcpState::Listen => unreachable!("listener cannot enter pending reset"),
+            }
+        }
+        self.pending_resets.clear();
+    }
+}
+```
+
+上述 per-packet ACK 示例中的 `receive_ack_with_timers` 在目标中只保留
+ACK/SACK、RTT、loss/CC 与不依赖最终 FIFO head 的 timer 处理；其现有
+retransmit/pacer 更新必须从该方法移走，集中在 `handle_postponed_dequeues`。
+借用时将 `connections` 与 `timer_wheel` 解构成不相交字段，不能一边持有
+`tcp.connection_mut(...)` 一边再次借整个 `tcp`；不要求新 ACK carrier。
+输入 frame 结尾的固定顺序是：
+
+```rust
+// VPP tcp_input.c:1407-1413,1926,2365-2370.
+sessions.flush_enqueue_events(runtime, tcp.protocol);
+let dequeue_error = tcp.handle_postponed_dequeues(runtime, sessions).err();
+tcp.handle_disconnects(runtime, sessions);
+if let Some(error) = dequeue_error {
+    return Err(error);
+}
+```
+
+`reset_state` 在收到 RST、把 connection 改为 `Closed` **之前**记录；
+`SynSent` 不进入 `pending_resets`，在接收处立即给 service 的 connect 失败通知
+`SessionError::Refused`，随后走现有 half-open TCP cleanup；`SynRcvd` 则在 burst
+尾部请求 service 删除尚未向应用交付的 Session，不能发 established reset/closed。
+此处 `transport_deleted` 对应 ADR-0040 已设计、当前尚未实现的 service 生命周期
+入口；connect 失败通知亦须先在 service 完成，不能在 TCP 虚构 cleanup helper。
+两项是实现前置缺口，不可通过跳过分支或错误复用 `transport_reset` 来宣称完成。
+`handle_postponed_dequeues` 在每个 input frame 的 RX enqueue-event flush 之后执行，
+`handle_disconnects` 最后执行。不能在单 packet 的 `receive_ack_with_timers`
+内部一边 drop FIFO 一边逐 ACK 重排；该方法的 timer/pacer 更新也须延后到
+burst-end，避免两条路径重复执行。来源：`tcp_input.c:494-545,106-135,
+1407-1413,2365-2370`。
 
 ## FIFO TX 算法
 
@@ -849,11 +1969,95 @@ impl SessionWorker {
 
     // VPP session.c:738-749. TCP ACK removes retained TX bytes through
     // Session ownership, including FIFO tuning and dequeue notification.
-    #[inline(always)]
     pub fn tx_fifo_dequeue_drop<E, O>(
-        &mut self, connection: &TransportConnection<E, O>, max_bytes: u32,
-    ) -> u32;
+        &mut self, runtime: &DataPlaneMain,
+        connection: &TransportConnection<E, O>, max_bytes: u32,
+    ) -> u32 {
+        let session = self.session_from_handle(connection.session)
+            .expect("ACK retains its owner-worker Session");
+        let fifo = session.tx_fifo().expect("TCP data Session retains TX FIFO");
+        let dropped = fifo.drop_dequeue(max_bytes as usize) as u32;
+        // Existing Session FIFO tuning runs here, after the actual drop.
+        if fifo.needs_deq_notification(max_bytes as usize) {
+            if let Some(index) = session.application_worker() {
+                let application = ApplicationMain::global()
+                    .expect("attached Session retains Application Main");
+                let app_worker = unsafe { application.worker(index) }
+                    .expect("attached Session retains AppWorker");
+                let connectionless = matches!(
+                    session.load_state(), SessionState::Listening | SessionState::Opened,
+                );
+                self.program_io_event(app_worker, session, SessionEventType::Tx, connectionless);
+                self.program_app_worker(runtime, index);
+            }
+            // Existing FIFO subscriber list follows the same TX notification;
+            // it is not another ACK dequeue or another application event.
+        }
+        dropped
+    }
 }
+```
+
+整批分配和双包流水是 `tx_fifo_read_and_send_i` 的同一函数体，不再回到当前的
+单 buffer `tx_fifo_peek_and_send`。下面是完成 state/custom/send-params/pacer/
+`tx_set_dequeue_params` 后的核心代码；`next` 已由注册的 Session type 查得，
+`connection_index` 是 transport backlink，`ctx.left_to_send/max_dequeue` 已由前段
+计算。`tx_fill_buffer` 直接从 Session FIFO 写最终 Buffer，并在 peek 路径只推进
+本轮 offset。来源：VPP `session_node.c:1553-1677`。
+
+```rust
+// VPP session_node.c:1583-1677; inside tx_fifo_read_and_send_i.
+let needed = self.tx_context.buffers_needed as usize;
+self.tx_context.tx_buffers.resize(needed, 0);
+let allocated = runtime.buffer_alloc(&mut self.tx_context.tx_buffers[..needed]);
+if allocated != needed {
+    runtime.buffer_free(&self.tx_context.tx_buffers[..allocated]);
+    self.old_events.push_front(event_index);
+    runtime.record_current_node_error(SessionQueueNodeError::NoBuffer)
+        .expect("Session queue owns its NoBuffer counter");
+    return SessionTxOutcome::NoBuffers;
+}
+if transport.is_tx_paced(runtime, connection_index) {
+    transport.tx_pacer_update_bytes(runtime, connection_index,
+        self.tx_context.max_len_to_send);
+}
+let mut remaining_buffers = allocated as u16;
+let mut n_left = self.tx_context.segments_per_event;
+self.tx_context.transport_pending_buffers.clear();
+while n_left >= 4 {
+    runtime.prefetch_write(self.tx_context.tx_buffers[(remaining_buffers - 3) as usize]);
+    runtime.prefetch_write(self.tx_context.tx_buffers[(remaining_buffers - 4) as usize]);
+    remaining_buffers -= 1;
+    let first = self.tx_context.tx_buffers[remaining_buffers as usize];
+    remaining_buffers -= 1;
+    let second = self.tx_context.tx_buffers[remaining_buffers as usize];
+    self.tx_fill_buffer::<M, DGRAM>(runtime, first, &mut remaining_buffers, peek_data);
+    self.tx_fill_buffer::<M, DGRAM>(runtime, second, &mut remaining_buffers, peek_data);
+    self.tx_context.transport_pending_buffers.extend([first, second]);
+    self.tx_add_pending_buffer(first, next.slot());
+    self.tx_add_pending_buffer(second, next.slot());
+    n_left -= 2; // VPP's >=4 loop processes two packets, not four.
+}
+while n_left != 0 {
+    if n_left > 1 {
+        runtime.prefetch_write(self.tx_context.tx_buffers[(remaining_buffers - 2) as usize]);
+    }
+    remaining_buffers -= 1;
+    let first = self.tx_context.tx_buffers[remaining_buffers as usize];
+    self.tx_fill_buffer::<M, DGRAM>(runtime, first, &mut remaining_buffers, peek_data);
+    self.tx_context.transport_pending_buffers.push(first);
+    self.tx_add_pending_buffer(first, next.slot());
+    n_left -= 1;
+}
+transport.push_header(runtime, self, connection_index,
+    &self.tx_context.transport_pending_buffers, self.tx_context.max_dequeue);
+if remaining_buffers != 0 {
+    runtime.buffer_free(&self.tx_context.tx_buffers[..remaining_buffers as usize]);
+}
+*packets += self.tx_context.segments_per_event as usize;
+assert_eq!(self.tx_context.left_to_send, 0);
+// Then: old-list if this event was frame-limited, else unset/recheck FIFO
+// event; only dequeue TX issues AppWorker dequeue notification.
 ```
 
 `tx_fifo_read_and_send_i` 的执行顺序必须是：
@@ -1057,6 +2261,31 @@ transport 返回超过 burst 的 packet 数，均是 owner 不变量，带 Sessi
 | TCP 批量 ACK 排队/释放与 `push_header` 外层 | 不强制 inline | `tcp_input.c:494-545` 的 `static` 函数、`tcp_output.c:980-1035` 的普通函数；内部 `tcp_push_one_header` 为 `always_inline`（`tcp_output.c:965-978`） |
 | TCP 发送空间和 recovery FIFO 剩余量的小计算 | `#[inline]` | `tcp.c:1100-1164` 的 `static inline`、`tcp_output.c:1741-1746` 的 `static inline`；不把整个 `send_params` 强制内联 |
 | TCP 逐首 buffer 写 header 的内层 | `#[inline(always)]` | `tcp_output.c:966-978` 的 `always_inline tcp_push_one_header`；外层批次循环不强制内联 |
+| FIFO OOO 原位合并/收集、TCP custom TX 排队、ACK burst 排空、Session dequeue/drop 与 reschedule | 不强制 inline | `svm_fifo.c:171-340`、`session.c:172-221,738-749`、`tcp_input.c:494-545` 的普通函数；不因调用频繁擅自标 `always` |
+
+### 实施前 API 决策
+
+本 ADR 是目标设计，**不授权本次修改生产代码**。下表是实施时需逐项批准的新增或
+变更公开 API；私有 FIFO/TCP 函数仅为本模块实现，不另发对外能力。没有列出的
+新增包装类型、错误变体或兼容接口不属于本 ADR。
+
+| 目标 API / owner | 现有接口为何不足 | 消费者与失败处置 |
+|---|---|---|
+| `SessionTxDispatch`、`SessionTxOutcome`、`SessionMain::register_transport` / service | 旧 `SessionIoDispatch` 合并 RX/TX、`TransportTxMode` 按事件动态选、output next 可为哨兵 | Session queue 按 Session type 调已注册的单态化 TCP 入口；注册失败复用 `SessionQueueError::OutputMissing`，运行期缺 edge 为 owner 断言 |
+| `SessionWorker::add_self_custom_tx_event`、`reschedule_tx`、`tx_fifo_dequeue_drop` / service | `enqueue_ready` 不表达 custom flag/new-old 优先级；直接 FIFO drop 漏应用 TX/dequeue 通知 | TCP ACK、重传、burst 收尾；Session owner 保证 FIFO event 与 AppWorker 投递，缺 owner Session 为不变量 |
+| `Transport` 的即时 `send_params`、`flush_data`、`app_rx_event`、`custom_tx`、批量 `push_header` / service trait，由 TCP 实现 | 当前单包 TX、空 `flush_data`/`custom_tx`、RX `NotSupported` 不能承载 VPP 接线 | TCP plugin 在 owner worker 单态化调用；无 RX hook 是成功 no-op；Buffer 不足是 node/worker 资源路径，非新 `SessionError` |
+| `TransportTxTarget` / service | 同一 custom TX 入口在 VPP 注册期分别接 connection 或 internal Session；不能把 `void *`、IP 类型或运行时 `TxMode` 带进 service | 仅单态化入口构造；注册模式与 variant 不符为插件注册 bug，不返回数值错误 |
+| `OooResult` 语义、`RxDelivery::OutOfOrder.newest: Option<_>`、`Fifo` 的 OOO 元数据原位操作 / infra 与 service | 当前每包区间与临时 `Vec` 不是 FIFO 合并结果；按序总写入量不能反推 copied/promoted，segment 索引污染 chunk lookup，普通 `u32` 下从 `&Fifo` 写 list 索引不合法 | offset-zero 复用既有 `OooResult` 分离 copied/promoted，chunk lookup 只服务 chunk；容量不足归 TCP input node `FifoFull`，不增控制面错误 |
+| TCP existing connection/worker 的 PSH、ACK burst、reset state、timer/cleanup 字段与方法 / TCP plugin | 旧 packetized 路径直接 ACK/drop、默认 PSH，pending 列没有消费，timer/cleanup 分离 | TCP input/output owner 处理；timer wheel 的 Rust 可恢复失败保留已有 `TcpNodeError::TimerUpdateFailed`，必须清理 pending 队列后上报 |
+| TCP congestion 的 slow-start 事实与 recovery 的 dupACK/SACK/reorder 事实 / TCP plugin 私有契约 | 现有 `send_goal_size`/`tx_payload_budget` 不能重现 `tcp_cc_update_cwnd_limited` 的半窗口分支和 `tcp_snd_space_inline` 的 Limited Transmit | 只供 `TcpConnection::send_space` 与 `update_cwnd_limited` 使用；BBR 仍是既有连接私有算法，不把 CC 状态或新调度类型带进 service |
+
+`session_transport_delete_request`/`session_stream_connect_notify` 的 Rust 对应入口在
+ADR-0040 的 Session 生命周期范围内；本 ADR 的 SYN-RCVD/SYN-SENT RST 代码不能
+替代这项前置工作，也不能用 `transport_reset` 冒充。FIFO tuning、TX FIFO
+subscriber 通知与 AppWorker dequeue event 均由 service 在同一次
+`tx_fifo_dequeue_drop` 调用内完成；代码片段中的注释是该方法的必做步骤，
+不能在实施时省略。来源：VPP `session.c:548-567,602-625,657-680,738-749,753-805`、
+`tcp_input.c:105-149,494-545`。
 
 ## 迁移顺序与验收
 
@@ -1079,13 +2308,28 @@ transport 返回超过 burst 的 packet 数，均是 owner 不变量，带 Sessi
    只提交一次 sequence/recovery 状态；恢复期 custom TX 从 Session FIFO 直接
    读取未发送数据。TCP 输入复用 `pending_deq_acked`，在 burst 末尾统一执行
    `SessionWorker::tx_fifo_dequeue_drop`、timer/pacer 更新与重新调度，删掉各输入
-   node 的直接 `drop_dequeue` 和逐 ACK `enqueue_ready`。再接 datagram/internal
-   分支；DMA 待 runtime 通用能力存在才启用，默认软件路径。
-4. 验收需覆盖单事件多 MSS、首包与多 buffer 链、`n_left` 为 1/2/3/4/5 的循环
+   node 的直接 `drop_dequeue` 和逐 ACK `enqueue_ready`。同一 TCP time subscriber
+   处理到期 cleanup、唯一一次 wheel 更新和受限 timer 派发；FIN/RST pending 列
+   在 input burst 尾部消费，握手 RST 等待 ADR-0040 的 Session 生命周期入口。
+4. TCP RX 使用已有 FIFO `OooSegment`：让 `OooResult` 报告合并后的 newest，
+   `RxDelivery::OutOfOrder` 允许无 newest；service 对 Buffer chain 保留 FIFO
+   最后一次 OOO 插入的结果，不合成区间。`established`、`rcv_process` 和
+   `syn_sent` 都在 FIFO 实际入队后推进 `rcv_nxt`，按旧包/重叠/未来/按序四种
+   情况处理 DUPACK、SACK、FIN 与应用 RX event；移除 SYN-ACK data 的预推进。
+   infra 的 OOO chunk lookup 在 chunk 附着/回收时维护，future 写入用它定位，
+   segment pool/list 不得污染该 tree。
+   FIFO 容量不足归 TCP input node enum counter，不上翻为 control-plane Result。
+   再接 datagram/internal 分支；DMA 待 runtime 通用能力存在才启用，默认软件路径。
+5. 验收需覆盖单事件多 MSS、首包与多 buffer 链、`n_left` 为 1/2/3/4/5 的循环
    边界、部分 buffer allocation、窗口/offset/pacer、custom TX 后重入、TX_FLUSH、
    FIFO event 竞争、dequeue 通知、重复 flush 的 PSH 边界、RX FIFO 阈值上下界、
    zero-window ACK 的 buffer 不足、recovery 中的新数据只由 custom TX 发送、
    ACK burst 合并释放/应用通知/重新调度、单协议双 Session type、TCP worker
    guard 不跨 service 重借、init/graph/worker 启动顺序、
+   RX 旧包、前缀重叠、未来区间合并、重复 OOO 插入、跨 Buffer 链 OOO、
+   按序补洞一次推进 `rcv_nxt`/通知 app、带 data 的 SYN-ACK 仅按实际入队推进、
+   OOO FIN 被拒、FIFO 满/部分写入的 node 分类、SACK 取 FIFO merged newest、
+   ACK 后零窗口 persist/RTO 切换、timer token 在 cleanup 后失效跳过、cleanup
+   队头未来时间不越过、FIN/RST 同一 burst 去重及原状态通知、
    send params 不重复执行旧 pacing 门控、datagram 部分/完整 record、output next 4/6 和
    pending flush 的多 frame 扇出。当前仅写 ADR，未运行编译、测试、静态检查或 CI。
