@@ -1,5 +1,8 @@
-use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
-use hammer_runtime::{DataPlaneMain, DriverNode, Node, NodeRuntime, RuntimeError, RuntimeResult};
+use hammer_core::data_plane::{Frame, NodeId, NodeRegistration, NodeState};
+use hammer_runtime::{
+    DataPlaneMain, DataWorkerId, DriverNode, File, Node, NodeMain, NodeRuntime, RuntimeError,
+    RuntimeResult,
+};
 
 use crate::session::{SessionQueueError, app, core};
 
@@ -19,7 +22,9 @@ pub fn register_session_input_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
     if let Some(node) = runtime.nodes().node_by_name("session-input") {
         return Ok(node);
     }
-    runtime.nodes().try_register_driver(SessionInputNode)
+    let node = runtime.nodes().try_register_driver(SessionInputNode)?;
+    runtime.nodes().set_node_state(node, NodeState::Disabled)?;
+    Ok(node)
 }
 
 impl Node for SessionInputNode {
@@ -87,7 +92,46 @@ pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
     }
-    runtime.nodes().try_register_driver(SessionQueueNode)
+    let node = runtime.nodes().try_register_driver(SessionQueueNode)?;
+    runtime.nodes().set_node_state(node, NodeState::Disabled)?;
+    Ok(node)
+}
+
+/// VPP: session_node.c:2180-2188. The File stores the queue NodeId resolved
+/// at worker init; its polling thread identifies the owning Session worker.
+pub(crate) fn session_queue_timer_ready(graph: &mut NodeMain, file: &mut File) -> RuntimeResult<()> {
+    let queue = NodeId::new(
+        u32::try_from(file.private_data()).expect("session-queue NodeId fits File private data"),
+    );
+    graph.mark_interrupt_pending(queue)?;
+    let worker = u32::try_from(DataWorkerId::try_from(file.polling_thread_index())?.slot())
+        .expect("configured worker slot fits u32");
+    let mut expirations = 0_u64;
+    loop {
+        // SAFETY: FileMain owns the descriptor for this callback, and timerfd
+        // produces one u64 counter for each successful nonblocking read.
+        let read = unsafe {
+            libc::read(
+                file.fd(),
+                std::ptr::from_mut(&mut expirations).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if read >= 0 {
+            assert_eq!(
+                read,
+                std::mem::size_of::<u64>() as isize,
+                "timerfd returns one complete expiry counter"
+            );
+            return Ok(());
+        }
+        let source = std::io::Error::last_os_error();
+        match source.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Ok(()),
+            _ => return Err(SessionQueueError::TimerRead { worker, source }.into()),
+        }
+    }
 }
 
 impl SessionQueueNode {
@@ -134,8 +178,10 @@ impl Node for SessionQueueNode {
             .expect("Session Main initializes before session-queue executes");
         let session_worker = unsafe { session_main.worker_mut(runtime) }
             .expect("session-queue executes on its owning Data Worker");
+        let now = session_main.now();
+        session_worker.update_time(now);
         session_worker
-            .update_transport_time(runtime, session_main, session_main.now())
+            .update_transport_time(runtime, session_main, now)
             .expect("registered Session transport updates its worker time");
         let event_queue = session_main
             .event_queue(session_worker.worker_index())
@@ -144,10 +190,15 @@ impl Node for SessionQueueNode {
             .drain_event_queue(event_queue)
             .expect("Session worker message queue retains valid event records");
         session_worker
+            .dispatch_control_events(runtime, session_main)
+            .expect("registered Session control handlers accept their events");
+        session_worker
             .dispatch_io_events(runtime, session_main)
             .expect("registered Session transport handles its IO events");
         session_worker.schedule_pending_app_events(runtime);
-        session_worker.flush_pending_tx_buffers(runtime, data, frame)
+        let packets = session_worker.flush_pending_tx_buffers(runtime, data, frame);
+        session_worker.update_state(runtime);
+        packets
     }
 }
 

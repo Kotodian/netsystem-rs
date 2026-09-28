@@ -341,7 +341,9 @@ AppWorker 的 `wrk_evts[thread]` 和 app MQ 中都是同一记录
 pub struct SessionEvent {
     pub(crate) event_type: u8,
     pub(crate) postponed: u8,
-    pub(crate) payload: [u8; 16],
+    pub(crate) session_index: u32,
+    pub(crate) worker_index: u32,
+    pub(crate) rpc_sequence: u64,
 }
 
 // VPP: session.c:56-71; application_worker.c:935-967.
@@ -432,13 +434,17 @@ impl AppWorker<'_> {
 接线把任何 Main 或 runtime 塞回上述函数参数，也不能从全局 Main 再取一份
 与当前 `&mut SessionWorker` 重叠的可变借用。
 
-`SessionEvent` 是 18 字节：两个标签字节和 16 字节 payload，
+`SessionEvent` 是 18 字节：两个标签字节和 16 字节 union 存储区，
+Rust 用 `session_index`、`worker_index`、`rpc_sequence` 三个 packed 字段表达该
+存储区的布局；三个字段不表示每种事件都同时拥有这些语义。SessionWorker MQ
+producer 按 IO、Session、RPC 分支直接写已分配槽位（ADR-0043），不先构造本地
+记录并复制整条消息。
 不再使用原来的 32 字节平铺字段。
 `SessionHandle` 当前 Rust 字段顺序为 `worker_index, session_index`，
 VPP `session_handle_tu_t` 的顺序是 `session_index, thread_index`
 （`session_types.h:366-385`）；`From<(SessionEventType, SessionHandle)>`
-必须按事件格式逐字段写入，
-不能拷贝 `SessionHandle` 的内存布局。解读 payload 必须同时知道**事件来源**：
+必须按事件格式填入 index/worker 字段，
+不能拷贝 `SessionHandle` 的内存布局。解读 union 存储区必须同时知道**事件来源**：
 AppWorker 的 `RESET` 带 Session index，而投往 SessionWorker 的 `RESET`
 带完整 handle（`application_worker.c:672-676`、`session.c:64-71`）。
 因此 `event_type` 单独不足以决定 union arm。

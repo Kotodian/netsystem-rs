@@ -185,6 +185,8 @@ pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i
 
     loop {
         let mut progress = false;
+        // VPP vlib/main.h:426-431 resets this worker's maximum each round.
+        main.max_internal_frame_vectors = 0;
 
         // Step 1: Barrier check — VPP threads.c:296
         if let Some(barrier) = crate::barrier::global()
@@ -209,6 +211,9 @@ pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i
         if let Ok(scheduled) = main.schedule_remote_interrupts() {
             progress |= scheduled != 0;
         }
+        if let Ok(scheduled) = main.schedule_worker_node_interrupts() {
+            progress |= scheduled != 0;
+        }
         if let Ok(scheduled) = main.schedule_polling_pre_input_nodes() {
             progress |= scheduled != 0;
         }
@@ -226,7 +231,7 @@ pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i
         let _ = main.run_ready_nodes();
 
         if !progress {
-            std::thread::sleep(idle_slice);
+            std::thread::park_timeout(idle_slice);
         }
 
         // Step 4: Run any newly-scheduled frames (pre-input + input)

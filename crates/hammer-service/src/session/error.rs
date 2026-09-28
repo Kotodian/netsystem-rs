@@ -3,6 +3,7 @@ use hammer_infra::svm::fifo::FifoError;
 use hammer_infra::svm::fifo_segment::FifoSegmentError;
 use hammer_infra::svm::msg_queue::SvmMsgQError;
 use hammer_runtime::RuntimeError;
+use std::io;
 use thiserror::Error;
 
 use super::app::ApplicationError;
@@ -27,6 +28,36 @@ pub enum SessionQueueError {
     SegmentCreate {
         #[source]
         source: FifoSegmentError,
+    },
+    #[error("Session worker {worker} timerfd creation failed")]
+    TimerCreate {
+        worker: u32,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Session worker {worker} timerfd duplication failed")]
+    TimerDuplicate {
+        worker: u32,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Session worker {worker} timerfd File registration failed")]
+    TimerRegistration {
+        worker: u32,
+        #[source]
+        source: RuntimeError,
+    },
+    #[error("Session worker {worker} timerfd update failed")]
+    TimerArm {
+        worker: u32,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Session worker {worker} timerfd read failed")]
+    TimerRead {
+        worker: u32,
+        #[source]
+        source: io::Error,
     },
 }
 

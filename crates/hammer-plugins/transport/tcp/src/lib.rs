@@ -707,10 +707,54 @@ fn init_tcp() -> RuntimeResult<()> {
         TCP_MAIN.set(main).is_ok(),
         "TCP initialization callback executes once"
     );
-    ServiceSessionMain::global()
-        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?
+    let session_main = ServiceSessionMain::global()
+        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
+    session_main
         .register_transport_io(protocol, tcp_session_io, tcp_session_update_time)
         .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
+    session_main
+        .register_transport_control(protocol, tcp_session_control)
+        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
+    Ok(())
+}
+
+/// VPP: session_node.c:1766-1790, session.c:1641-1709. The Session worker
+/// chooses the registered protocol; TCP calls its concrete Transport trait.
+fn tcp_session_control(
+    sessions: &mut ServiceSessionWorker,
+    session_index: u32,
+    event: SessionEventType,
+) -> Result<(), SessionError> {
+    let tcp = TCP_MAIN
+        .get()
+        .expect("TCP Main remains published while its Session type is registered");
+    let session = sessions.session(session_index).ok_or(SessionError::NoSession)?;
+    let connection_index = session.connection_index();
+    let worker_index = sessions.worker_index();
+    match event {
+        SessionEventType::HalfClose => {
+            <TcpMain as Transport<IpTransportEndpointConfig>>::half_close(
+                tcp,
+                connection_index,
+                worker_index,
+            );
+        }
+        SessionEventType::Close => {
+            <TcpMain as Transport<IpTransportEndpointConfig>>::close(
+                tcp,
+                connection_index,
+                worker_index,
+            );
+        }
+        SessionEventType::Reset => {
+            <TcpMain as Transport<IpTransportEndpointConfig>>::reset(
+                tcp,
+                connection_index,
+                worker_index,
+            );
+        }
+        _ => unreachable!("TCP transport control receives only half-close, close, or reset"),
+    }
     Ok(())
 }
 

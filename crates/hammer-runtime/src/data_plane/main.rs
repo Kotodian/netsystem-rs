@@ -69,6 +69,9 @@ pub struct DataPlaneMain {
     /// `dispatch_node`'s `last_time_stamp`, refreshed once per main-loop
     /// iteration and otherwise advanced by the dispatch point itself.
     pub(crate) last_time_stamp: u64,
+    /// Largest internal pending frame dispatched in this worker main-loop
+    /// iteration. VPP: vlib/main.h:426-439, vlib/main.c:1064-1066.
+    pub(crate) max_internal_frame_vectors: usize,
     pub(crate) worker_init_functions_called: Bitmap,
 }
 
@@ -79,6 +82,12 @@ const _: () = {
 };
 
 impl DataPlaneMain {
+    /// VPP: `vlib_last_vectors_per_main_loop`, vlib/main.h:435-439.
+    #[inline(always)]
+    pub fn max_internal_frame_vectors(&self) -> usize {
+        self.max_internal_frame_vectors
+    }
+
     /// Worker-local, non-cryptographic randomness seeded at worker construction.
     #[inline]
     pub fn random(&mut self) -> &mut SmallRng {

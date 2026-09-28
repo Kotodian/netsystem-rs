@@ -2260,6 +2260,7 @@ impl DataPlaneMain {
                 continue;
             }
             assert!(!frame.is_empty(), "Pending Frame contains vectors");
+            let input_vectors = frame.len();
             self.nodes.clear_interrupt_pending(node)?;
 
             // dispatch_pending_node transfers the enqueue trace bit once and
@@ -2279,6 +2280,11 @@ impl DataPlaneMain {
                 runtime.flags = (runtime.flags & !(1 << 5)) | trace;
             }
             self.dispatch_node(node, &mut frame)?;
+            // VPP dispatch_pending_node, vlib/main.c:1064-1066. The input
+            // count is captured before dispatch because Hammer may reuse
+            // this Frame after the Node returns.
+            self.max_internal_frame_vectors =
+                self.max_internal_frame_vectors.max(input_vectors);
             processed += 1;
             frame.frame_flags &= !((1 << 2) | (1 << 14));
             // The callback may have grown Pending storage or moved the owner.

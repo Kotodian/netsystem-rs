@@ -1,10 +1,13 @@
 use std::cell::UnsafeCell;
 use std::mem::size_of;
 use std::num::NonZeroU32;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
@@ -15,12 +18,15 @@ use hammer_infra::svm::fifo_segment::SvmFifoSegment;
 use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQError, SvmMsgQRingConfig};
 use hammer_infra::svm::queue::SvmQueueConditionalWait;
 use hammer_infra::sync::SpinLock;
-use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_runtime::DataPlaneMain;
+#[cfg(target_os = "linux")]
+use hammer_runtime::{File, FileFunctions, FILE_MAIN};
+use hammer_runtime::{
+    DataPlaneMain, DataWorkerId, RuntimeResult, interrupt_worker_node, is_current_worker,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::app::ApplicationMain;
-use super::error::SessionError;
+use super::error::{SessionError, SessionQueueError};
 use super::segment_manager::{SegmentManager, SegmentManagerError, SegmentManagerMain};
 use crate::transport::{Transport, TransportSendParams, TransportTxMode};
 
@@ -36,6 +42,11 @@ pub type SessionIoDispatch = fn(
 /// VPP: session_node.c:2024-2031, session_update_time_subscribers.
 pub type SessionTimeDispatch =
     fn(&mut DataPlaneMain, &mut SessionWorker, f64) -> Result<(), SessionError>;
+
+/// VPP: session_node.c:1756-1790 and session.c:1641-1709. A transport
+/// plugin monomorphizes its Transport trait calls at registration.
+pub type SessionControlDispatch =
+    fn(&mut SessionWorker, u32, SessionEventType) -> Result<(), SessionError>;
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
 
@@ -168,11 +179,24 @@ impl Default for SessionTxContext {
     }
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionWorkerState {
     Polling,
     Interrupt,
     Idle,
+}
+
+impl From<u8> for SessionWorkerState {
+    #[inline(always)]
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Polling,
+            1 => Self::Interrupt,
+            2 => Self::Idle,
+            _ => panic!("invalid Session worker state {value}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,6 +220,30 @@ pub struct PoolReallocationState {
     pub workers_doing_work: u32,
 }
 
+struct SessionRpc {
+    callback: fn(u64),
+    argument: u64,
+    sequence: u64,
+}
+
+// VPP session.c:20-86. Selects the payload written to the target worker's
+// IO ring; the queue itself still stores one SessionEvent representation.
+#[derive(Clone, Copy)]
+enum SessionQueueEvent {
+    Io {
+        event_type: SessionEventType,
+        session_index: u32,
+    },
+    Session {
+        event_type: SessionEventType,
+        handle: SessionHandle,
+    },
+    Rpc {
+        callback: fn(u64),
+        argument: u64,
+    },
+}
+
 #[repr(C)]
 pub struct SessionWorker {
     cacheline0: hammer_infra::align::CacheLineAlignMark,
@@ -209,11 +257,9 @@ pub struct SessionWorker {
     app_workers_pending: Bitmap,
     input_node: Option<NodeId>,
     queue_node: Option<NodeId>,
-    timer_fd: i32,
-    timer_fd_file: u64,
-    timer: TimerWheel1t2w2048sl<SessionHandle>,
+    timer_fd: Option<OwnedFd>,
+    timer_fd_file: Option<u32>,
     flags: SessionWorkerFlags,
-    state: SessionWorkerState,
     tx_context: SessionTxContext,
     event_elements: Pool<SessionEventElement>,
     control_event_data: Pool<SessionControlData>,
@@ -260,6 +306,13 @@ pub enum RxDelivery {
 }
 
 impl SessionWorker {
+    #[inline(always)]
+    fn state(&self) -> SessionWorkerState {
+        SessionMain::global()
+            .expect("Session Main owns the published worker state")
+            .worker_state(self.worker_index)
+    }
+
     fn new(worker_index: u32, config: SessionConfig) -> Self {
         let preallocated_per_worker = if config.worker_count == 1 {
             config.preallocated_sessions
@@ -284,17 +337,9 @@ impl SessionWorker {
             app_workers_pending: Bitmap::new(),
             input_node: None,
             queue_node: None,
-            timer_fd: -1,
-            timer_fd_file: u64::MAX,
-            timer: TimerWheel1t2w2048sl::new(event_capacity),
-            flags: SessionWorkerFlags {
-                adaptive: !config.no_adaptive,
-            },
-            state: if config.poll_main {
-                SessionWorkerState::Polling
-            } else {
-                SessionWorkerState::Interrupt
-            },
+            timer_fd: None,
+            timer_fd_file: None,
+            flags: SessionWorkerFlags { adaptive: false },
             tx_context: SessionTxContext::default(),
             event_elements: Pool::with_capacity(event_capacity),
             control_event_data: Pool::with_capacity(event_capacity),
@@ -321,6 +366,182 @@ impl SessionWorker {
             dma_batch_number: 0,
             dma_batch: 0,
             last_event_poll: 0.0,
+        }
+    }
+
+    /// VPP: session_node.c:2180-2217. The worker retains the timerfd for
+    /// settime; FileMain owns a duplicate for readiness dispatch.
+    #[cfg(target_os = "linux")]
+    fn enable_adaptive_mode(&mut self, runtime: &DataPlaneMain) -> Result<(), SessionQueueError> {
+        assert!(self.timer_fd.is_none() && self.timer_fd_file.is_none());
+        // SAFETY: timerfd_create returns a fresh owned descriptor on success.
+        let raw_fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(SessionQueueError::TimerCreate {
+                worker: self.worker_index,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: the successful timerfd_create transferred this descriptor.
+        let timer_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let registered_fd = timer_fd.try_clone().map_err(|source| {
+            SessionQueueError::TimerDuplicate {
+                worker: self.worker_index,
+                source,
+            }
+        })?;
+        let mut file = File::new(
+            registered_fd,
+            format!("session-wrk-tfd-{}", runtime.thread_index()),
+            u64::from(
+                self.queue_node
+                    .expect("session-queue NodeId installs before its timerfd")
+                    .slot(),
+            ),
+            FileFunctions {
+                read: Some(super::node::session_queue_timer_ready),
+                write: None,
+                error: None,
+            },
+        );
+        file.set_polling_thread_index(runtime.thread_index());
+        let file_index = FILE_MAIN
+            .get()
+            .expect("FileMain initializes before Data Workers")
+            .add(file)
+            .map_err(|source| SessionQueueError::TimerRegistration {
+                worker: self.worker_index,
+                source,
+            })?;
+        self.timer_fd = Some(timer_fd);
+        self.timer_fd_file = Some(file_index);
+        self.flags.adaptive = true;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn enable_adaptive_mode(&mut self, _: &DataPlaneMain) -> Result<(), SessionQueueError> {
+        Err(SessionQueueError::TimerCreate {
+            worker: self.worker_index,
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    }
+
+    /// VPP: session_node.c:43-80. Polling disarms, Interrupt wakes every
+    /// millisecond, and Idle wakes every hundred milliseconds.
+    #[inline]
+    #[cfg(target_os = "linux")]
+    fn set_state(&mut self, state: SessionWorkerState) -> Result<(), SessionQueueError> {
+        let timer_fd = self
+            .timer_fd
+            .as_ref()
+            .expect("adaptive Session worker retains its timerfd");
+        let nanoseconds = Self::timeout(state)
+            .map_or(0, |timeout| libc::c_long::from(timeout.subsec_nanos()));
+        let interval = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: nanoseconds,
+        };
+        let spec = libc::itimerspec {
+            it_interval: interval,
+            it_value: interval,
+        };
+        // SAFETY: timer_fd remains owned by this worker for the syscall.
+        if unsafe { libc::timerfd_settime(timer_fd.as_raw_fd(), 0, &spec, std::ptr::null_mut()) }
+            < 0
+        {
+            return Err(SessionQueueError::TimerArm {
+                worker: self.worker_index,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        SessionMain::global()
+            .expect("Session Main owns the published worker state")
+            .set_worker_state(self.worker_index, state);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn set_state(&mut self, _: SessionWorkerState) -> Result<(), SessionQueueError> {
+        Err(SessionQueueError::TimerArm {
+            worker: self.worker_index,
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    }
+
+    /// VPP: session_node.c:56-66; Hammer Data Workers have no thread-zero case.
+    #[inline(always)]
+    const fn timeout(state: SessionWorkerState) -> Option<Duration> {
+        match state {
+            SessionWorkerState::Polling => None,
+            SessionWorkerState::Interrupt => Some(Duration::from_millis(1)),
+            SessionWorkerState::Idle => Some(Duration::from_millis(100)),
+        }
+    }
+
+    /// VPP: session.h:1112-1116. Transport subscribers run after this write.
+    #[inline(always)]
+    pub(crate) fn update_time(&mut self, now: f64) {
+        self.last_time = now;
+        self.last_time_us = (now * 1_000_000.0) as u64;
+    }
+
+    /// VPP: session_node.c:1989-2030,2160-2164. Called after event and TX
+    /// dispatch; its only graph mutation is the queue's polling mode.
+    pub(crate) fn update_state(&mut self, runtime: &DataPlaneMain) {
+        if !self.flags.adaptive {
+            return;
+        }
+        let has_events = !self.event_elements.is_empty();
+        let vectors = runtime.max_internal_frame_vectors();
+        let next = match self.state() {
+            SessionWorkerState::Polling if !has_events && vectors < 1 => {
+                Some(SessionWorkerState::Interrupt)
+            }
+            SessionWorkerState::Interrupt if has_events || vectors > 1 => {
+                Some(SessionWorkerState::Polling)
+            }
+            SessionWorkerState::Interrupt if self.sessions.is_empty() => {
+                Some(SessionWorkerState::Idle)
+            }
+            // VPP's five permanent list heads make its Idle test true on
+            // every queue dispatch, including a timer-only wakeup.
+            SessionWorkerState::Idle => Some(SessionWorkerState::Interrupt),
+            _ => None,
+        };
+        let Some(next) = next else { return };
+        if let Err(error) = self.set_state(next) {
+            tracing::error!(worker = self.worker_index, %error, "Session timer arm failed");
+            self.flags.adaptive = false;
+            SessionMain::global()
+                .expect("Session Main owns the published worker state")
+                .set_worker_state(self.worker_index, SessionWorkerState::Polling);
+            runtime
+                .nodes()
+                .set_node_state(
+                    self.queue_node.expect("session-queue installs before dispatch"),
+                    hammer_core::data_plane::NodeState::Polling,
+                )
+                .expect("installed session-queue accepts Polling state");
+            return;
+        }
+        if next == SessionWorkerState::Polling || next == SessionWorkerState::Interrupt {
+            runtime
+                .nodes()
+                .set_node_state(
+                    self.queue_node.expect("session-queue installs before dispatch"),
+                    if next == SessionWorkerState::Polling {
+                        hammer_core::data_plane::NodeState::Polling
+                    } else {
+                        hammer_core::data_plane::NodeState::Interrupt
+                    },
+                )
+                .expect("installed session-queue accepts its worker state");
         }
     }
 
@@ -404,7 +625,7 @@ impl SessionWorker {
         );
         self.pending_tx_buffers.push(buffer_index);
         self.pending_tx_nexts.push(next.slot());
-        if self.state == SessionWorkerState::Interrupt {
+        if self.state() == SessionWorkerState::Interrupt {
             runtime
                 .set_node_interrupt_pending(
                     self.queue_node
@@ -662,7 +883,49 @@ impl SessionWorker {
             let descriptor = queue
                 .sub(SvmQueueConditionalWait::Nowait)
                 .map_err(|source| SessionError::MessageQueueAllocation { source })?;
-            let event = queue.read::<SessionEvent>(descriptor);
+            // VPP session_node.c:1936-1960. The control ring stores a
+            // variable-size message at the SessionEvent union offset; copy
+            // its fixed maximum before returning this descriptor to the ring.
+            let decoded = match unsafe { queue.message_bytes(descriptor) } {
+                Ok(bytes) => {
+                    let event = bytes
+                        .get(..size_of::<SessionEvent>())
+                        .ok_or_else(|| SessionError::MessageQueueAllocation {
+                            source: SvmMsgQError::ElementSizeMismatch {
+                                requested: size_of::<SessionEvent>(),
+                                stored: bytes.len(),
+                            },
+                        })
+                        .and_then(|header| {
+                            SessionEvent::read_from_bytes(header).map_err(|_| {
+                                SessionError::MessageQueueAllocation {
+                                    source: SvmMsgQError::InvalidHeader,
+                                }
+                            })
+                        });
+                    event.and_then(|event| {
+                        let event_type = SessionEventType::try_from(event.event_type)?;
+                        let control_data =
+                            if u8::from(event_type) >= u8::from(SessionEventType::Bound) {
+                                let source = bytes
+                                    .get(2..2 + size_of::<SessionControlData>())
+                                    .ok_or_else(|| SessionError::MessageQueueAllocation {
+                                        source: SvmMsgQError::ElementSizeMismatch {
+                                            requested: 2 + size_of::<SessionControlData>(),
+                                            stored: bytes.len(),
+                                        },
+                                    })?;
+                                let mut data = SessionControlData { bytes: [0; 86] };
+                                data.bytes.copy_from_slice(source);
+                                Some(data)
+                            } else {
+                                None
+                            };
+                        Ok((event, event_type, control_data))
+                    })
+                }
+                Err(source) => Err(SessionError::MessageQueueAllocation { source }),
+            };
             match queue.free_msg(descriptor) {
                 Ok(())
                 | Err(
@@ -673,8 +936,11 @@ impl SessionWorker {
                     return Err(SessionError::MessageQueueAllocation { source });
                 }
             }
-            let event = event.map_err(|source| SessionError::MessageQueueAllocation { source })?;
-            let event_type = SessionEventType::try_from(event.event_type)?;
+            let (mut event, event_type, control_data) = decoded?;
+            if let Some(data) = control_data {
+                let index = self.allocate_control_data(data);
+                event.session_index = index;
+            }
             if u8::from(event_type) >= u8::from(SessionEventType::Rpc) {
                 self.allocate_control_event(event);
             } else {
@@ -682,6 +948,106 @@ impl SessionWorker {
             }
         }
         Ok(count)
+    }
+
+    /// VPP: session_node.c:1756-1855,2069-2092. Only the control-list prefix
+    /// present after MQ import is consumed in this queue dispatch.
+    pub(crate) fn dispatch_control_events(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        main: &SessionMain,
+    ) -> Result<(), SessionError> {
+        let Some(last_index) = self.control_events.back().copied() else {
+            return Ok(());
+        };
+        loop {
+            let index = self
+                .control_events
+                .pop_front()
+                .expect("control-list tail remains reachable during this dispatch");
+            let event = self
+                .event_elements
+                .get(index)
+                .expect("control list retains its event element")
+                .event;
+            let event_type = SessionEventType::try_from(event.event_type)
+                .expect("MQ import validates Session control event types");
+            let dispatch = match event_type {
+                SessionEventType::Rpc => {
+                    let index = event.session_index();
+                    let sequence = event.rpc_sequence;
+                    if let Some(request) = main.take_rpc(index, sequence) {
+                        (request.callback)(request.argument);
+                    }
+                    Ok(())
+                }
+                SessionEventType::HalfClose | SessionEventType::Close | SessionEventType::Reset => {
+                    let handle = event.session_handle();
+                    if let Some(session) = self.session_from_handle(handle) {
+                        let state = session.load_state();
+                        let protocol = session.transport_protocol();
+                        match event_type {
+                            SessionEventType::HalfClose
+                                if matches!(
+                                    state,
+                                    SessionState::Ready | SessionState::TransportClosing
+                                ) => {
+                                    if let Some(dispatch) = main.transport_control(protocol) {
+                                        dispatch(self, handle.session_index, event_type)
+                                    } else {
+                                        Err(SessionError::TransportNotRegistered)
+                                    }
+                                }
+                            SessionEventType::Close | SessionEventType::Reset
+                                if u8::from(state) >= u8::from(SessionState::AppClosed) => {
+                                    if state == SessionState::TransportClosed {
+                                        session.store_state(SessionState::Closed);
+                                    } else if u8::from(state)
+                                        >= u8::from(SessionState::TransportDeleted)
+                                        && !session.flags.half_open
+                                    {
+                                        self.queue_application_event(
+                                            runtime,
+                                            handle,
+                                            SessionEventType::Cleanup,
+                                        );
+                                    }
+                                    Ok(())
+                            }
+                            SessionEventType::Close | SessionEventType::Reset => {
+                                if let Some(dispatch) = main.transport_control(protocol) {
+                                    session.store_state(SessionState::AppClosed);
+                                    dispatch(self, handle.session_index, event_type)
+                                } else {
+                                    Err(SessionError::TransportNotRegistered)
+                                }
+                            }
+                            SessionEventType::HalfClose => Ok(()),
+                            _ => unreachable!("matched a transport control event"),
+                        }
+                    } else {
+                        // VPP session_event_dispatch_ctrl skips stale handles.
+                        Ok(())
+                    }
+                }
+                _ => {
+                    tracing::warn!(?event_type, "unhandled Session control event");
+                    Ok(())
+                }
+            };
+            if u8::from(event_type) >= u8::from(SessionEventType::Bound) {
+                self.release_control_data(event.session_index())
+                    .expect("imported control data remains owned by its event");
+            }
+            self.event_elements
+                .remove(index)
+                .expect("dispatched control element remains allocated");
+            dispatch?;
+            if index == last_index {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// VPP: `SESSION_IO_EVT_BUILTIN_RX`, session_node.c:1891-1898. The worker
@@ -730,7 +1096,9 @@ impl SessionWorker {
         runtime: &mut DataPlaneMain,
         main: &SessionMain,
     ) -> Result<usize, SessionError> {
-        let mut packets = 0;
+        // VPP session_node.c:2046,2096: buffers already pending at entry
+        // consume the same frame budget as newly packetized IO events.
+        let mut packets = self.pending_tx_buffers.len();
         let new_count = self.new_events.len();
         let old_count = self.old_events.len();
         for (old, count) in [(false, new_count), (true, old_count)] {
@@ -974,7 +1342,10 @@ impl SessionWorker {
             return SessionMain::global()?
                 .enqueue_event(
                     handle.worker_index,
-                    SessionEvent::from((SessionEventType::BuiltinRx, handle.session_index)),
+                    SessionQueueEvent::Io {
+                        event_type: SessionEventType::BuiltinRx,
+                        session_index: handle.session_index,
+                    },
                 )
                 .map(Some);
         }
@@ -1201,12 +1572,48 @@ impl SessionWorker {
         migration.handling.extend(requests);
         Ok(migration.handling.len())
     }
+}
 
-    pub fn update_time(&mut self, now: f64, now_us: u64) {
-        self.last_time = now;
-        self.last_time_us = now_us;
-        self.last_event_poll = now;
+/// VPP: session.c:2059-2061,2209-2241. Runtime invokes this worker-init
+/// hook once after cloning the graph and before its Data Worker loop starts.
+#[hammer_component_macros::worker_init_function(name = "session_worker_init")]
+fn init_session_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let main = SessionMain::global()
+        .expect("Session Main initializes before Session worker graph setup");
+    let worker = unsafe { main.worker_mut(runtime) }
+        .expect("Session worker graph setup runs on a configured Data Worker");
+    let input = runtime
+        .node_by_name("session-input")
+        .ok_or(SessionQueueError::NodeMissing)?;
+    let queue = runtime
+        .node_by_name("session-queue")
+        .ok_or(SessionQueueError::NodeMissing)?;
+    worker.install_input_node(input);
+    worker.install_queue_node(queue);
+
+    let published = main
+        .queue_node
+        .compare_exchange(u32::MAX, queue.slot(), Ordering::AcqRel, Ordering::Acquire)
+        .unwrap_or_else(|published| published);
+    assert!(
+        published == u32::MAX || published == queue.slot(),
+        "Session queue NodeId is identical in every worker graph"
+    );
+    if !main.is_enabled() {
+        return Ok(());
     }
+    if main.config.use_private_rx_mqs && !main.config.no_adaptive {
+        worker.enable_adaptive_mode(runtime)?;
+    }
+    runtime
+        .nodes()
+        .set_node_state(input, hammer_core::data_plane::NodeState::Interrupt)
+        .expect("installed session-input accepts Interrupt state");
+    runtime
+        .nodes()
+        .set_node_state(queue, hammer_core::data_plane::NodeState::Polling)
+        .expect("installed session-queue accepts Polling state");
+    Ok(())
 }
 
 pub struct Session {
@@ -1440,10 +1847,19 @@ impl<T> AppSession<T> {
             }
             Err(source) => return Err(SessionError::MessageQueueAllocation { source }),
         };
-        let message = SessionEvent::from((event, self.session_handle.session_index));
-        producer
-            .write(descriptor, &message)
-            .expect("Session worker IO ring stores one SessionEvent");
+        {
+            // SAFETY: this producer just allocated the descriptor, which is
+            // not visible to the Session worker before producer.add.
+            let bytes = unsafe { producer.message_bytes_mut(descriptor) }
+                .expect("allocated app IO event retains its ring slot");
+            let record = SessionEvent::mut_from_bytes(bytes)
+                .expect("Session worker IO ring stores one SessionEvent");
+            record.event_type = event.into();
+            record.postponed = 0;
+            record.session_index = self.session_handle.session_index;
+            record.worker_index = 0;
+            record.rpc_sequence = 0;
+        }
         match producer.add(descriptor) {
             Ok(())
             | Err(
@@ -1735,35 +2151,30 @@ pub struct SessionFlags {
     pub tx_ready: bool,
 }
 
-// VPP: session_types.h:476-492, session_event_t. The payload represents one
-// union arm selected by the event type and its destination queue.
+// VPP: session_types.h:476-492, session_event_t. The last 16 bytes are the
+// event union: IO uses session_index, Session also uses worker_index, and
+// RPC uses session_index as its pool index plus rpc_sequence.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, KnownLayout, FromBytes, Immutable, IntoBytes)]
 pub struct SessionEvent {
     pub event_type: u8,
     pub postponed: u8,
-    pub payload: [u8; 16],
+    pub session_index: u32,
+    pub worker_index: u32,
+    pub rpc_sequence: u64,
 }
 
 impl SessionEvent {
     #[inline(always)]
     pub(crate) fn session_index(&self) -> u32 {
-        u32::from_ne_bytes(
-            self.payload[..4]
-                .try_into()
-                .expect("Session event index arm"),
-        )
+        self.session_index
     }
 
     #[inline(always)]
     pub(crate) fn session_handle(&self) -> SessionHandle {
         SessionHandle {
-            session_index: self.session_index(),
-            worker_index: u32::from_ne_bytes(
-                self.payload[4..8]
-                    .try_into()
-                    .expect("Session event handle arm"),
-            ),
+            session_index: self.session_index,
+            worker_index: self.worker_index,
         }
     }
 }
@@ -1771,12 +2182,12 @@ impl SessionEvent {
 impl From<(SessionEventType, u32)> for SessionEvent {
     #[inline(always)]
     fn from((event_type, session_index): (SessionEventType, u32)) -> Self {
-        let mut payload = [0; 16];
-        payload[..4].copy_from_slice(&session_index.to_ne_bytes());
         Self {
             event_type: event_type.into(),
             postponed: 0,
-            payload,
+            session_index,
+            worker_index: 0,
+            rpc_sequence: 0,
         }
     }
 }
@@ -1784,19 +2195,13 @@ impl From<(SessionEventType, u32)> for SessionEvent {
 impl From<(SessionEventType, SessionHandle)> for SessionEvent {
     #[inline(always)]
     fn from((event_type, handle): (SessionEventType, SessionHandle)) -> Self {
-        let mut event = Self::from((event_type, handle.session_index));
-        event.payload[4..8].copy_from_slice(&handle.worker_index.to_ne_bytes());
-        event
-    }
-}
-
-impl From<SessionEvent> for [u64; 2] {
-    #[inline(always)]
-    fn from(event: SessionEvent) -> Self {
-        [
-            u64::from_ne_bytes(event.payload[..8].try_into().expect("first union word")),
-            u64::from_ne_bytes(event.payload[8..].try_into().expect("second union word")),
-        ]
+        Self {
+            event_type: event_type.into(),
+            postponed: 0,
+            session_index: handle.session_index,
+            worker_index: handle.worker_index,
+            rpc_sequence: 0,
+        }
     }
 }
 
@@ -1814,8 +2219,10 @@ mod event_tests {
         let session_index = 0x1234_5678;
         let event = SessionEvent::from((SessionEventType::Rx, session_index));
         assert_eq!(event.session_index(), session_index);
-        assert_eq!(event.payload[..4], session_index.to_ne_bytes());
-        assert_eq!(event.payload[4..], [0; 12]);
+        let worker_index = event.worker_index;
+        let rpc_sequence = event.rpc_sequence;
+        assert_eq!(worker_index, 0);
+        assert_eq!(rpc_sequence, 0);
     }
 
     #[test]
@@ -1826,8 +2233,8 @@ mod event_tests {
         };
         let event = SessionEvent::from((SessionEventType::Reset, handle));
         assert_eq!(event.session_handle(), handle);
-        assert_eq!(event.payload[..4], handle.session_index.to_ne_bytes());
-        assert_eq!(event.payload[4..8], handle.worker_index.to_ne_bytes());
+        let rpc_sequence = event.rpc_sequence;
+        assert_eq!(rpc_sequence, 0);
     }
 }
 
@@ -1950,13 +2357,18 @@ pub struct SessionMain {
     started_at: Instant,
     config: SessionConfig,
     workers: Vec<UnsafeCell<SessionWorker>>,
+    worker_states: Vec<AtomicU8>,
+    queue_node: AtomicU32,
     listening_sessions: UnsafeCell<Pool<Session>>,
     session_tx_modes: UnsafeCell<Vec<TransportTxMode>>,
     session_type_to_next: UnsafeCell<Vec<u32>>,
     transport_io: UnsafeCell<Vec<Option<SessionIoDispatch>>>,
+    transport_control: UnsafeCell<Vec<Option<SessionControlDispatch>>>,
     transport_time: UnsafeCell<Vec<Option<SessionTimeDispatch>>>,
     transport_cl_thread: u32,
     pool_reallocation: SpinLock<PoolReallocationState>,
+    rpc_requests: SpinLock<Pool<SessionRpc>>,
+    rpc_sequence: AtomicU64,
     worker_mq_segment: SvmFifoSegment,
     last_transport_protocol: AtomicU8,
     is_enabled: AtomicBool,
@@ -2004,16 +2416,25 @@ impl SessionMain {
             started_at: Instant::now(),
             config,
             workers,
+            worker_states: (0..config.worker_count)
+                .map(|_| AtomicU8::new(SessionWorkerState::Polling as u8))
+                .collect(),
+            queue_node: AtomicU32::new(u32::MAX),
             listening_sessions: UnsafeCell::new(Pool::new()),
             session_tx_modes: UnsafeCell::new(Vec::new()),
             session_type_to_next: UnsafeCell::new(Vec::new()),
             transport_io: UnsafeCell::new(Vec::new()),
+            transport_control: UnsafeCell::new(Vec::new()),
             transport_time: UnsafeCell::new(Vec::new()),
             transport_cl_thread: 0,
             pool_reallocation: SpinLock::new(PoolReallocationState {
                 workers_at_barrier: 0,
                 workers_doing_work: 0,
             }),
+            rpc_requests: SpinLock::new(Pool::with_fixed_capacity(
+                config.worker_count.saturating_mul(config.configured_worker_mq_length.max(2_048)),
+            )),
+            rpc_sequence: AtomicU64::new(0),
             worker_mq_segment,
             last_transport_protocol: AtomicU8::new(0),
             is_enabled: AtomicBool::new(config.session_enable_asap),
@@ -2095,6 +2516,18 @@ impl SessionMain {
     }
 
     #[inline(always)]
+    fn worker_state(&self, worker_index: u32) -> SessionWorkerState {
+        SessionWorkerState::from(
+            self.worker_states[worker_index as usize].load(Ordering::Acquire),
+        )
+    }
+
+    #[inline(always)]
+    fn set_worker_state(&self, worker_index: u32, state: SessionWorkerState) {
+        self.worker_states[worker_index as usize].store(state as u8, Ordering::Release);
+    }
+
+    #[inline(always)]
     fn transport_tx_mode(&self, protocol: u8) -> Option<TransportTxMode> {
         unsafe { &*self.session_tx_modes.get() }
             .get(usize::from(protocol.checked_sub(1)?))
@@ -2121,6 +2554,7 @@ impl SessionMain {
         unsafe { &mut *self.session_tx_modes.get() }.push(tx_mode);
         unsafe { &mut *self.session_type_to_next.get() }.push(output_next);
         unsafe { &mut *self.transport_io.get() }.push(None);
+        unsafe { &mut *self.transport_control.get() }.push(None);
         unsafe { &mut *self.transport_time.get() }.push(None);
         for slot in &self.workers {
             // SAFETY: transport registration runs on Main Thread with the
@@ -2161,9 +2595,34 @@ impl SessionMain {
         Ok(())
     }
 
+    /// VPP: session_node.c:1766-1790. The registration is a single
+    /// monomorphized entry for one protocol, not a transport VFT.
+    pub fn register_transport_control(
+        &self,
+        protocol: u8,
+        dispatch: SessionControlDispatch,
+    ) -> Result<(), SessionError> {
+        if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
+            return Err(SessionError::Invalid);
+        }
+        let slot = unsafe { &mut *self.transport_control.get() }
+            .get_mut(usize::from(protocol.checked_sub(1).ok_or(SessionError::Invalid)?))
+            .ok_or(SessionError::TransportNotRegistered)?;
+        assert!(slot.replace(dispatch).is_none(), "transport control registers once");
+        Ok(())
+    }
+
     #[inline(always)]
     fn transport_io(&self, protocol: u8) -> Option<SessionIoDispatch> {
         unsafe { &*self.transport_io.get() }
+            .get(usize::from(protocol.checked_sub(1)?))
+            .copied()
+            .flatten()
+    }
+
+    #[inline(always)]
+    fn transport_control(&self, protocol: u8) -> Option<SessionControlDispatch> {
+        unsafe { &*self.transport_control.get() }
             .get(usize::from(protocol.checked_sub(1)?))
             .copied()
             .flatten()
@@ -2408,10 +2867,10 @@ impl SessionMain {
 
     /// VPP: `session_send_evt_to_thread`, session.c:28-86 (static inline).
     #[inline]
-    pub fn enqueue_event(
+    fn enqueue_event(
         &self,
         worker_index: u32,
-        event: SessionEvent,
+        event: SessionQueueEvent,
     ) -> Result<SessionEventEnqueue, SessionError> {
         let Some(queue) = self.event_queue(worker_index) else {
             return Err(SessionError::Invalid);
@@ -2421,24 +2880,105 @@ impl SessionMain {
             Err(SvmMsgQError::LockBusy) => return Ok(SessionEventEnqueue::Busy),
             Err(source) => return Err(SessionError::MessageQueueAllocation { source }),
         };
-        let descriptor = match producer.alloc_msg_on_ring(0) {
-            Ok(descriptor) => descriptor,
-            Err(SvmMsgQError::QueueFull | SvmMsgQError::RingFull { .. }) => {
+        if queue.is_full()
+            || queue
+                .ring_is_full(0)
+                .map_err(|source| SessionError::MessageQueueAllocation { source })?
+        {
+            return Ok(SessionEventEnqueue::Full);
+        }
+        // Lock order: target MQ producer, then RPC pool. The consumer drops
+        // its MQ descriptor before taking the RPC pool lock.
+        let rpc = if let SessionQueueEvent::Rpc { callback, argument } = event {
+            let mut requests = self.rpc_requests.lock();
+            if requests.len() == requests.capacity() {
                 return Ok(SessionEventEnqueue::Full);
             }
-            Err(source) => return Err(SessionError::MessageQueueAllocation { source }),
+            let sequence = self.rpc_sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let index = requests.insert(SessionRpc {
+                callback,
+                argument,
+                sequence,
+            });
+            Some((index, sequence))
+        } else {
+            None
         };
-        producer
-            .write(descriptor, &event)
-            .expect("Session worker IO ring stores one SessionEvent");
-        match producer.add(descriptor) {
-            Ok(()) => Ok(SessionEventEnqueue::Enqueued),
+        let descriptor = producer
+            .alloc_msg_on_ring(0)
+            .expect("locked Session worker MQ retains checked IO ring space");
+        {
+            // SAFETY: this guard just allocated the descriptor; the target
+            // worker cannot consume it until producer.add publishes it.
+            let bytes = unsafe { producer.message_bytes_mut(descriptor) }
+                .expect("allocated Session event retains its IO ring slot");
+            let record = SessionEvent::mut_from_bytes(bytes)
+                .expect("Session worker IO ring stores one SessionEvent");
+            record.postponed = 0;
+            record.worker_index = 0;
+            record.rpc_sequence = 0;
+            match event {
+                SessionQueueEvent::Io {
+                    event_type,
+                    session_index,
+                } => {
+                    assert!(matches!(
+                        event_type,
+                        SessionEventType::Rx
+                            | SessionEventType::Tx
+                            | SessionEventType::TxFlush
+                            | SessionEventType::BuiltinRx
+                    ));
+                    record.event_type = event_type.into();
+                    record.session_index = session_index;
+                }
+                SessionQueueEvent::Session { event_type, handle } => {
+                    assert!(matches!(
+                        event_type,
+                        SessionEventType::HalfClose
+                            | SessionEventType::Close
+                            | SessionEventType::Reset
+                    ));
+                    record.event_type = event_type.into();
+                    record.session_index = handle.session_index;
+                    record.worker_index = handle.worker_index;
+                }
+                SessionQueueEvent::Rpc { .. } => {
+                    let (index, sequence) =
+                        rpc.expect("RPC request is reserved before its MQ slot");
+                    record.event_type = SessionEventType::Rpc.into();
+                    record.session_index = index;
+                    record.rpc_sequence = sequence;
+                }
+            }
+        }
+        let status = match producer.add(descriptor) {
+            Ok(()) => SessionEventEnqueue::Enqueued,
             Err(
                 SvmMsgQError::SignalAfterCommit { .. }
                 | SvmMsgQError::EventSignalAfterCommit { .. },
-            ) => Ok(SessionEventEnqueue::Enqueued),
+            ) => SessionEventEnqueue::Enqueued,
             Err(source) => panic!("locked Session worker MQ rejected allocated event: {source}"),
+        };
+        drop(producer);
+        if self.worker_state(worker_index) == SessionWorkerState::Interrupt {
+            let queue_node = self.queue_node.load(Ordering::Acquire);
+            assert_ne!(
+                queue_node,
+                u32::MAX,
+                "Session queue NodeId installs before worker MQ publication"
+            );
+            interrupt_worker_node(DataWorkerId::new(worker_index), NodeId::new(queue_node));
         }
+        Ok(status)
+    }
+
+    fn take_rpc(&self, index: u32, sequence: u64) -> Option<SessionRpc> {
+        let mut requests = self.rpc_requests.lock();
+        if requests.get(index)?.sequence != sequence {
+            return None;
+        }
+        requests.remove(index)
     }
 
     pub fn program_migration(
@@ -2468,7 +3008,10 @@ pub fn program_tx_io_event(
     ));
     SessionMain::global()?.enqueue_event(
         handle.worker_index,
-        SessionEvent::from((event, handle.session_index)),
+        SessionQueueEvent::Io {
+            event_type: event,
+            session_index: handle.session_index,
+        },
     )
 }
 
@@ -2486,8 +3029,60 @@ pub fn program_transport_io_event(
     ));
     SessionMain::global()?.enqueue_event(
         handle.worker_index,
-        SessionEvent::from((event, handle.session_index)),
+        SessionQueueEvent::Io {
+            event_type: event,
+            session_index: handle.session_index,
+        },
     )
+}
+
+/// VPP: `session_send_ctrl_evt_to_thread`, session.c:142-148. Session
+/// control events carry the full handle in the worker MQ's IO ring.
+pub fn send_control_event(
+    handle: SessionHandle,
+    event: SessionEventType,
+) -> Result<SessionEventEnqueue, SessionError> {
+    assert!(matches!(
+        event,
+        SessionEventType::HalfClose | SessionEventType::Close | SessionEventType::Reset
+    ));
+    SessionMain::global()?.enqueue_event(
+        handle.worker_index,
+        SessionQueueEvent::Session {
+            event_type: event,
+            handle,
+        },
+    )
+}
+
+/// VPP: `session_send_rpc_evt_to_thread_force`, session.c:151-156.
+pub fn send_rpc_event_force(
+    worker_index: u32,
+    callback: fn(u64),
+    argument: u64,
+) -> Result<SessionEventEnqueue, SessionError> {
+    SessionMain::global()?.enqueue_event(
+        worker_index,
+        SessionQueueEvent::Rpc { callback, argument },
+    )
+}
+
+/// VPP: `session_send_rpc_evt_to_thread`, session.c:158-165.
+pub fn send_rpc_event(
+    worker_index: u32,
+    callback: fn(u64),
+    argument: u64,
+) -> Result<SessionEventEnqueue, SessionError> {
+    let main = SessionMain::global()?;
+    if main.event_queue(worker_index).is_none() {
+        return Err(SessionError::Invalid);
+    }
+    if is_current_worker(DataWorkerId::new(worker_index)) {
+        callback(argument);
+        Ok(SessionEventEnqueue::Enqueued)
+    } else {
+        main.enqueue_event(worker_index, SessionQueueEvent::Rpc { callback, argument })
+    }
 }
 
 /// VPP: `session_enqueue_notify`, session.c:626-648. A builtin callback may

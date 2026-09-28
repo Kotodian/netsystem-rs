@@ -68,6 +68,29 @@ impl DataPlaneMain {
         }
     }
 
+    pub(crate) fn schedule_worker_node_interrupts(&self) -> RuntimeResult<usize> {
+        let worker = match self.data_worker_id() {
+            Ok(worker) => worker,
+            Err(_) => return Ok(0),
+        };
+        let descriptor = crate::ThreadMain::global()
+            .thread_by_index(worker.thread_index())
+            .expect("executing Data Worker has a thread descriptor");
+        let mut scheduled = 0;
+        for word in 0..self.nodes.node_count().div_ceil(64) {
+            let Some(mut bits) = descriptor.take_node_interrupts(word) else {
+                break;
+            };
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let node = NodeId::new((word * 64 + bit) as u32);
+                scheduled += usize::from(self.set_node_interrupt_pending(node)?);
+            }
+        }
+        Ok(scheduled)
+    }
+
     pub(crate) fn attach_worker_interrupt_thread(&self) {
         if let Some(handoff) = &self.handoff {
             handoff.attach_current_thread();

@@ -2,6 +2,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use std::{sync::OnceLock, thread::ThreadId};
 
+use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
 
 use crate::config::WorkerScheduler;
@@ -9,6 +10,7 @@ use crate::config::WorkerScheduler;
 use crate::config::{WorkerCpu, WorkerNuma};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::worker_thread::WorkerThread;
+use crate::DataWorkerId;
 
 static MAIN_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
 pub(crate) static THREAD_MAIN: OnceLock<ThreadMain> = OnceLock::new();
@@ -387,6 +389,22 @@ impl ThreadMain {
         self.thread_count = next_thread_index;
         Ok(())
     }
+}
+
+/// Request an interrupt on the target worker after its domain queue commits.
+#[inline]
+pub fn interrupt_worker_node(worker: DataWorkerId, node: NodeId) {
+    ThreadMain::global()
+        .worker_descriptor(worker.thread_index())
+        .interrupt_node(node);
+}
+
+/// Whether this call runs on the selected Data Worker.
+#[inline]
+pub fn is_current_worker(worker: DataWorkerId) -> bool {
+    ThreadMain::global()
+        .worker_descriptor(worker.thread_index())
+        .is_current()
 }
 
 /// Declares the worker-count gauge `/sys/num_worker_threads`.
