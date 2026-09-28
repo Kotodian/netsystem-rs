@@ -12,7 +12,7 @@ use hammer_infra::svm::fifo_segment::{
 use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQRingConfig};
 use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
 
-use super::core::SessionEventRecord;
+use super::core::SessionEvent;
 
 /// Per-application FIFO segment policy.
 /// VPP: `segment_manager_props_t`, vnet/session/segment_manager.h:15-37.
@@ -165,7 +165,7 @@ impl<'segment> SegmentManager<'segment> {
         let rings = [
             SvmMsgQRingConfig::new(
                 properties.event_queue_size,
-                size_of::<SessionEventRecord>() as u32,
+                size_of::<SessionEvent>() as u32,
             ),
             SvmMsgQRingConfig::new((properties.event_queue_size >> 4).max(16), 256),
         ];

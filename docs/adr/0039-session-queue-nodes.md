@@ -20,10 +20,17 @@
 materialization 时安装；`main_loop_enter` 不注册 Node，只在配置的 `session_enable_asap` 为 `true`
 时调用 `SessionMain::enable`。默认 `session_enable_asap = false`。
 
-不引入额外的 scheduler trait/type、泛型 Graph Node、marker field、VFT、函数指针注册表、`dyn`
+不引入额外的 scheduler trait/type、泛型 Graph Node、marker field、VFT、`dyn`
 trait、provider、mailbox、第二条 event queue 或 `NodeRuntime` 中的 Main 指针。
+唯一允许的跨插件分发入口是每个已注册 transport protocol 对应的一个单态化函数指针：
+TCP/UDP 入口取得自己的 concrete Main，再调用 service 的泛型 Session event 执行方法；
+该方法以 `Transport` trait 静态调用 `app_rx_event`、`send_params`、`push_header` 等能力。
+这不是 transport 方法表，也不让 service 存具体插件状态。VPP 依据：
+`session_node.c:1858-1915,2033-2140` 的 service event 分发，
+`session.c:1819-1847` 的按 session type TX 函数选择，
+`transport.c` 的 protocol 注册。
 
-不存在额外的 transport graph node。仓库已有的 `TcpOutputNode` 和 `UdpOutputNode` 保持 packet node
+不存在额外的 transport graph node。TCP 的 `Tcp4OutputNode`/`Tcp6OutputNode` 与已有的 `UdpOutputNode` 保持 packet node
 语义：输入 frame 中的每个 `u32` 都是 `BufferIndex`，不是 Session event index。它们不以 empty frame
 唤醒，不读取 `SessionWorker` 的 new/old event list，也不负责 Session 调度。
 
@@ -97,12 +104,15 @@ hammer-service -X-> hammer-plugin-session/TCP/UDP
 ```
 
 `hammer-service` 不能在一个非泛型静态 Graph Node 中直接调用 plugin 的 concrete `Transport`
-implementation。若不允许 VFT、函数指针、`dyn` trait 和反向 crate 依赖，这个调用不可能由 service
-向 plugin 发起。Hammer 因而把 VPP 的调用位置拆为两个静态方向，但保留同一数据语义：
+implementation。每 protocol 的单态化事件入口解决静态 crate 依赖：入口由 transport 插件注册，
+只进入 service 泛型方法，不独立调度 Session，也不保存 transport 对象。此前用 per-buffer
+`SessionTxPacket` 把 `push_header` 移到 output node 的方案已经弃用；
+它不是 VPP 的调用路径。所有权边界保持：
 
-- concrete TCP/UDP worker 先计算 `TransportSendParams`，通过 `IpSessionMain` 更新对应 Session；
-- `session-queue` 使用这些 protocol-neutral send facts 从 SVM FIFO 生成 packet buffer；
-- concrete TCP/UDP output node 对收到的 packet buffer 静态调用自己的 `Transport::push_header`。
+- `session-queue` 根据 Session type 选择唯一事件入口，service 泛型方法从 concrete
+  `Transport` trait 读取 `TransportSendParams`，从 SVM FIFO 生成 packet buffer；
+- service 在 fanout 前通过同一个静态 trait 调用 transport `push_header`；TCP/UDP output
+  node 只消费 `BufferIndex`。不能让 output node 读取 Session event 或新 opaque 来代替此步骤。
 
 这是对 VPP ownership 的 Rust 化，不得伪称 VPP 具有额外 transport node。`send_params`、
 `push_header` 的 owner 仍是 transport；Session 仍拥有 TX FIFO、packetization、event 重排和 output
@@ -179,12 +189,12 @@ impl<O> Session<O> {
     fn set_tx_params(&mut self, params: TransportSendParams);
 }
 
-// Hammer adaptation: protocol-neutral facts carried with one generated packet.
-// VPP keeps equivalent facts reachable through session_t/transport_connection_t
-// while session-queue calls push_header before fanout; this is not a VPP type.
-// It is not a Session event and it does not own payload bytes.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+```
+
+以下是已弃用的旧设计记录，不是待实现类型；源码目前没有该类型：
+
+```rust
+#[deprecated(note = "VPP Session Queue pushes the transport header before output fanout")]
 pub struct SessionTxPacket {
     pub session: SessionHandle,
     pub connection_index: u32,
@@ -192,8 +202,10 @@ pub struct SessionTxPacket {
 }
 ```
 
-`SessionTxPacket` 写入 `session-queue` 新建 packet buffer 的现有 opaque 区。payload 已经从
-Session-owned SVM FIFO 进入 Data Plane Buffer；禁止中间 `Vec<u8>` 或 transport-private payload copy。
+`SessionTxPacket` 不写入 buffer opaque，也不新增同义的 per-buffer carrier。VPP 的
+`session_tx_fifo_read_and_snd_i` 在 Session Queue 内填充 packet、调用 `push_header`，然后按 next
+fanout（`session_node.c:1471-1676`）；payload 从 Session-owned SVM FIFO 进入 Data Plane Buffer
+时不得经过中间 `Vec<u8>` 或 transport-private payload copy。
 
 ## 5. Session Worker 调度接口
 
@@ -438,14 +450,12 @@ impl UdpOutputNode {
 }
 ```
 
-每个 output node 从 buffer opaque 读取 `SessionTxPacket`，通过 `IpSessionMain` 验证 Session/connection
-backlink，然后在 concrete `TcpMain`/`UdpMain` 上静态调用 `Transport::push_header`。随后按现有逻辑
-提交 protocol TX state、通过 `IpSessionMain::update_tx` 刷新 send facts、写入网络层 endpoint facts 并
-送往 IP lookup。这里没有 Session event、event list iterator、empty-frame wake 或第二条 queue。
-
-VPP 在 Session Queue 内调用 `push_header`；Hammer 把该 concrete trait 调用移动到已有 output node，
-原因是 service node 不能反向依赖 plugin，且已经明确禁止 runtime dispatch table。packet buffer、FIFO
-ownership、send budget、next fanout 与 output node 的 packet-vector ABI 不变。
+output node 继续只接收已完成 transport header 的 `BufferIndex`，按现有逻辑写网络层 endpoint facts
+并送往 IP lookup；它不读取 Session event，也不读取已弃用的 `SessionTxPacket`。此前把
+`Transport::push_header` 移到 output node 的描述作废。VPP 在 Session Queue 内、fanout 前完成
+`push_header`（`session_node.c:1647-1649`）。Hammer 使用上文唯一的按 protocol
+单态化事件入口跨过静态依赖边界；注册入口不代表 TX 路径已经实现，必须在
+service queue 的 FIFO packetization 和 transport header push 接线完成后才算接通。
 
 `TransportTxMode::Internal` 和依赖 `custom_tx` 直接生成 packet 的 transport 不在本 ADR 开放；注册时
 返回 `SessionError::NotSupported`。本 ADR 只接入 TCP 的 peek TX 与 UDP 的 datagram TX，不能用一条
@@ -535,11 +545,12 @@ inline 仅用于 VPP 已标为 inline/always-inline 且处于每 event/packet ho
 - `SessionQueueTransportDispatch`；
 - `SessionQueueDispatchFn`、`SessionQueueUpdateTimeFn`；
 - `install_worker_attachment`、`remove_worker_attachment`；
+- `SessionTxPacket` 以及 output node 读取它再调用 `push_header` 的设计；
 - `NodeRuntime` 中缓存的 `SessionMain` 地址；
 - output node 消费或查询 Session event 的任何入口；
-- worker init 中动态安装 transport callback 或强制启用 `session-queue` 的逻辑。
+- worker init 中安装旧 transport attachment callback 或强制启用 `session-queue` 的逻辑。
 
-保留并改造已有 `TcpOutputNode`、`UdpOutputNode`；不创建新的 transport graph node。
+将 TCP output 按 IP4/IP6 分成 `Tcp4OutputNode`、`Tcp6OutputNode`，保留 `UdpOutputNode`；不创建额外的 transport graph node。
 
 本次迁移先给上述 callback/attachment 兼容 API 加 `deprecated` 标记，保持已有调用方可编译；
 它们不再作为新的 Session Queue 接线依据。后续协议迁移完成后删除兼容实现。
@@ -548,8 +559,6 @@ inline 仅用于 VPP 已标为 inline/always-inline 且处于每 event/packet ho
 
 实现前需要明确批准以下最小新增面：
 
-- `SessionTxPacket`：跨 `session-queue -> output` graph edge 的 per-buffer Session/connection facts；现有
-  buffer opaque 没有这组事实，而 output node 不能再读取 Session event list；
 - `SessionWorker::update_tx` 与 `IpSessionMain::update_tx`：替代 service 保存 transport callback，保持
   `TCP/UDP -> plugin-session -> service` 单向依赖；
 - `SessionWorker::run_queue`：三个 service node 共用的非泛型 queue algorithm；

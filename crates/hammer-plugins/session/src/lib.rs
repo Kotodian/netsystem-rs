@@ -19,14 +19,14 @@ pub use api::{
 pub use config::{IpSessionConfig, IpSessionTableConfig};
 pub use endpoint::{
     ENDPOINT_INVALID_INDEX, IpHalfOpenHandle, IpSessionEndpoint, IpSessionEndpointConfig,
-    IpTransportConnectionId,
-    IpTransportEndpoint, IpTransportEndpointConfig,
+    IpTransportConnectionId, IpTransportEndpoint, IpTransportEndpointConfig,
 };
 pub use lookup::{IpSessionFamily, IpSessionLookup, IpSessionLookupKey, SessionTableIterator};
 pub use main::IpSessionMain;
 pub use namespace::{IpNamespaceBinding, IpNamespaceMain, namespaces};
 pub use transport::{
-    IpTransportConfig, IpTransportConnection, IpTransportMain, LocalEndpointCleanupState,
+    AppSessionTransport, IpTransportConfig, IpTransportConnection, IpTransportMain,
+    LocalEndpointCleanupState,
 };
 
 static SESSION_TABLE_CONFIG: OnceLock<IpSessionTableConfig> = OnceLock::new();
@@ -57,7 +57,7 @@ fn configure_session_tables(config: config::NetworkSessionConfig) -> RuntimeResu
 fn init_ip_session_main() -> RuntimeResult<()> {
     let table_config = SESSION_TABLE_CONFIG.get().copied().unwrap_or_default();
     IpSessionMain::init(table_config, table_config.transport)
-    .map_err(|source| IpSessionInitError::SessionCore { source })?;
+        .map_err(|source| IpSessionInitError::SessionCore { source })?;
     Ok(())
 }
 

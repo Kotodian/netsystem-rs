@@ -44,7 +44,7 @@ pub struct TcpWorker {
     pub(crate) time_origin_seconds: Option<f64>,
     cacheline2: CacheLineAlignMark,
     pub(crate) lookup: TcpLookupState,
-    protocol: u8,
+    pub(crate) protocol: u8,
 }
 
 struct TcpCleanupRequest {

@@ -3,9 +3,7 @@ use std::sync::OnceLock;
 
 use hammer_infra::svm::fifo::Fifo as SvmFifo;
 use hammer_runtime::DataPlaneMain;
-use hammer_service::session::app::{
-    ApplicationError, ApplicationEventResult, ApplicationMain,
-};
+use hammer_service::session::app::{ApplicationError, ApplicationEventResult, ApplicationMain};
 use hammer_service::session::{
     SessionEndpoint, SessionError, SessionHandle, SessionLookup, SessionMain, SessionState,
 };
@@ -22,7 +20,7 @@ use crate::transport::{IpTransportConfig, IpTransportMain};
 static IP_SESSION_MAIN: OnceLock<IpSessionMain> = OnceLock::new();
 
 pub struct IpSessionMain {
-    session: &'static SessionMain<u32>,
+    session: &'static SessionMain,
     lookup: IpSessionLookup,
     transport: IpTransportMain,
 }
@@ -49,7 +47,7 @@ impl IpSessionMain {
     }
 
     #[inline(always)]
-    pub fn session(&self) -> &SessionMain<u32> {
+    pub fn session(&self) -> &SessionMain {
         &self.session
     }
 
@@ -97,7 +95,9 @@ impl IpSessionMain {
             IpAddr::V4(_) => IpSessionFamily::Ip4,
             IpAddr::V6(_) => IpSessionFamily::Ip6,
         };
-        let table = self.lookup.table_index(family, endpoint.transport().local.fib_index);
+        let table = self
+            .lookup
+            .table_index(family, endpoint.transport().local.fib_index);
         self.lookup
             .lookup_listener(table, endpoint, use_wildcard)
             .map(SessionHandle::from)
@@ -120,7 +120,9 @@ impl IpSessionMain {
             IpAddr::V4(_) => IpSessionFamily::Ip4,
             IpAddr::V6(_) => IpSessionFamily::Ip6,
         };
-        let table = self.lookup.table_index(family, endpoint.transport().local.fib_index);
+        let table = self
+            .lookup
+            .table_index(family, endpoint.transport().local.fib_index);
         if table == ENDPOINT_INVALID_INDEX {
             return Err(SessionError::NoRoute);
         }
@@ -128,7 +130,8 @@ impl IpSessionMain {
             return Err(SessionError::AlreadyListening);
         }
         assert!(
-            self.lookup.add_session_endpoint(table, endpoint, session.into()),
+            self.lookup
+                .add_session_endpoint(table, endpoint, session.into()),
             "validated IP Session listener table remains allocated"
         );
         Ok(())
@@ -222,7 +225,9 @@ impl IpSessionMain {
             self.unlisten(transport, &request.endpoint, listener, session)
                 .expect("a newly published listener can stop");
             return Err(match source {
-                ApplicationError::SegmentCreate { source } => SessionError::SegmentCreate { source },
+                ApplicationError::SegmentCreate { source } => {
+                    SessionError::SegmentCreate { source }
+                }
                 ApplicationError::SegmentNoSpace => SessionError::SegmentNoSpace,
                 ApplicationError::ListenerWorkerAttached { .. } => SessionError::AlreadyListening,
                 source => panic!("validated Application listener worker setup failed: {source}"),
@@ -250,14 +255,20 @@ impl IpSessionMain {
             .session
             .listening_connection_index(session)
             .ok_or(SessionError::NoSession)?;
-        assert_ne!(connection, u32::MAX, "listening Session retains its transport");
+        assert_ne!(
+            connection,
+            u32::MAX,
+            "listening Session retains its transport"
+        );
         match self.lookup_listener(endpoint, false) {
             Some(current) if current == session => {
                 let family = match endpoint.transport().local.address {
                     IpAddr::V4(_) => IpSessionFamily::Ip4,
                     IpAddr::V6(_) => IpSessionFamily::Ip6,
                 };
-                let table = self.lookup.table_index(family, endpoint.transport().local.fib_index);
+                let table = self
+                    .lookup
+                    .table_index(family, endpoint.transport().local.fib_index);
                 assert!(
                     self.lookup.remove_session_endpoint(table, endpoint),
                     "validated IP listener lookup remains published until unlisten"
@@ -286,7 +297,8 @@ impl IpSessionMain {
         let Some(attached_namespace) = application_main.namespace(application) else {
             return Ok(None);
         };
-        if attached_namespace != namespace || crate::namespace::namespaces().get(namespace).is_none()
+        if attached_namespace != namespace
+            || crate::namespace::namespaces().get(namespace).is_none()
         {
             return Err(SessionError::InvalidNamespace);
         }
@@ -336,20 +348,32 @@ impl IpSessionMain {
                 | ApplicationEventResult::QueueFull
                 | ApplicationEventResult::LockUnavailable,
             ) => {
-                worker.cleanup(session).expect("unpublished accepted Session remains allocated");
+                worker
+                    .cleanup(session)
+                    .expect("unpublished accepted Session remains allocated");
                 Ok(None)
             }
             Err(source) => {
-                worker.cleanup(session).expect("failed accepted Session remains allocated");
+                worker
+                    .cleanup(session)
+                    .expect("failed accepted Session remains allocated");
                 Err(match source {
-                    ApplicationError::SegmentCreate { source } => SessionError::SegmentCreate { source },
+                    ApplicationError::SegmentCreate { source } => {
+                        SessionError::SegmentCreate { source }
+                    }
                     ApplicationError::SegmentNoSpace => SessionError::SegmentNoSpace,
                     ApplicationError::NoAcceptingWorker
                     | ApplicationError::InvalidApplicationWorker { .. }
-                    | ApplicationError::WorkerMissing { .. } => SessionError::InvalidApplicationWorker,
+                    | ApplicationError::WorkerMissing { .. } => {
+                        SessionError::InvalidApplicationWorker
+                    }
                     ApplicationError::NoListener { .. } => SessionError::NotListening,
-                    ApplicationError::MessageAllocation { source } => SessionError::MessageQueueAllocation { source },
-                    source => panic!("validated accepted Session rejected by Application: {source}"),
+                    ApplicationError::MessageAllocation { source } => {
+                        SessionError::MessageQueueAllocation { source }
+                    }
+                    source => {
+                        panic!("validated accepted Session rejected by Application: {source}")
+                    }
                 })
             }
         }
@@ -423,8 +447,7 @@ impl IpSessionMain {
         tx_mode: TransportTxMode,
         output_next: u32,
     ) -> Result<u8, SessionError> {
-        self.session
-            .register_transport_type(tx_mode, output_next)
+        self.session.register_transport_type(tx_mode, output_next)
     }
 
     /// # Safety
@@ -465,8 +488,11 @@ impl IpSessionMain {
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        (unsafe { self.session.worker_mut(runtime)? })
-            .transport_closing(runtime, session, connection_index)
+        (unsafe { self.session.worker_mut(runtime)? }).transport_closing(
+            runtime,
+            session,
+            connection_index,
+        )
     }
 
     /// # Safety
@@ -477,8 +503,11 @@ impl IpSessionMain {
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        (unsafe { self.session.worker_mut(runtime)? })
-            .transport_closed(runtime, session, connection_index)
+        (unsafe { self.session.worker_mut(runtime)? }).transport_closed(
+            runtime,
+            session,
+            connection_index,
+        )
     }
 
     /// # Safety
@@ -489,8 +518,11 @@ impl IpSessionMain {
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        (unsafe { self.session.worker_mut(runtime)? })
-            .transport_reset(runtime, session, connection_index)
+        (unsafe { self.session.worker_mut(runtime)? }).transport_reset(
+            runtime,
+            session,
+            connection_index,
+        )
     }
 
     /// # Safety
@@ -501,8 +533,8 @@ impl IpSessionMain {
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = (unsafe { self.session.worker_mut(runtime)? })
-            .session(session.session_index)
+        let Some(entry) =
+            (unsafe { self.session.worker_mut(runtime)? }).session(session.session_index)
         else {
             return Err(SessionError::NoSession);
         };

@@ -120,6 +120,15 @@ fn tcp_established_frame<const IS_IP4: bool>(
     if out_len != 0 {
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
+    let session_main = hammer_service::session::SessionMain::global()
+        .expect("Session Main initializes before TCP established input");
+    let sessions = unsafe { session_main.worker_mut(runtime) }
+        .expect("TCP established input runs on its Session worker");
+    let protocol = crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before established input")
+        .protocol();
+    sessions.flush_enqueue_events(runtime, protocol);
     ()
 }
 
@@ -234,7 +243,7 @@ fn tcp_established_index<const IS_IP4: bool>(
                 .and_then(|session| session.tx_fifo())
                 .is_some_and(|fifo| fifo.max_dequeue() != 0)
         {
-            sessions.enqueue_ready(handle, tcp.protocol())?;
+            sessions.enqueue_ready(handle, tcp.protocol)?;
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
@@ -278,9 +287,6 @@ fn tcp_established_index<const IS_IP4: bool>(
                     true
                 }
             };
-            if matches!(delivery, RxDelivery::InOrder { .. }) {
-                sessions.enqueue_notify(runtime, handle);
-            }
             match delivery {
                 RxDelivery::NotAccepted { .. } => {}
                 RxDelivery::InOrder {

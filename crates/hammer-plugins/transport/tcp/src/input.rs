@@ -219,14 +219,14 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool>(
         | SessionLookupResult::NotFound => None,
     };
     if let (Some(session), Some(current_worker)) = (exact_session, handoff_worker)
-        && session.worker_index != current_worker.slot() as u32
+        && session.thread_index != current_worker.slot() as u32
     {
         hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
             .set_handoff_source_worker(Some(current_worker.slot() as u16));
         let node = runtime
             .current_node()
             .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-        runtime.handoff_index(DataWorkerId::new(session.worker_index), node, index)?;
+        runtime.handoff_index(DataWorkerId::new(session.thread_index), node, index)?;
         return Ok(None);
     }
 

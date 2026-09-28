@@ -33,15 +33,16 @@ pub use application::{
 };
 pub use config::Session as SessionSettings;
 pub use core::{
-    PoolReallocationState, SESSION_E_ALLOC, SESSION_E_INVALID, SESSION_E_MQ_MSG_ALLOC,
+    PoolReallocationState, RxDelivery, SESSION_E_ALLOC, SESSION_E_INVALID, SESSION_E_MQ_MSG_ALLOC,
     SESSION_E_NOINTF, SESSION_E_NOIP, SESSION_E_NONE, SESSION_E_NOPORT, SESSION_E_NOROUTE,
     SESSION_E_NOSESSION, SESSION_E_NOSUPPORT, SESSION_E_PORTINUSE, SESSION_E_SEG_CREATE,
     SESSION_E_SEG_NO_SPACE, SESSION_E_TRANSPORT_NO_REG, SESSION_E_UNKNOWN,
-    SESSION_EVENT_QUEUE_FULL, SESSION_EVENT_QUEUE_LOCK_FAILED, SESSION_INDEX_INVALID, Session,
+    SESSION_EVENT_QUEUE_FULL, SESSION_EVENT_QUEUE_LOCK_FAILED, SESSION_INDEX_INVALID, AppSession, Session,
     SessionConfig, SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement,
     SessionEventEnqueue, SessionEventType, SessionFlags, SessionHandle, SessionMain,
-    SessionMigrationRequest, SessionMigrationState, SessionRxSegment, SessionState, RxDelivery,
+    SessionMigrationRequest, SessionMigrationState, SessionRxSegment, SessionState,
     SessionTxContext, SessionWorker, SessionWorkerFlags, SessionWorkerState,
+    enqueue_notify, program_transport_io_event, program_tx_io_event,
 };
 pub use endpoint::{SessionEndpoint, SessionEndpointConfig, SessionEndpointFlags};
 pub use error::{SessionConnectError, SessionError, SessionQueueError};
@@ -150,7 +151,10 @@ fn exit_session() -> RuntimeResult<()> {
 )]
 fn init_application() -> RuntimeResult<()> {
     SegmentManagerMain::init(SegmentManagerProperties::default());
-    app::ApplicationMain::init(hammer_runtime::config::worker::worker_count())?;
+    app::ApplicationMain::init(
+        u32::try_from(hammer_runtime::config::worker::worker_count())
+            .expect("configured worker count fits u32"),
+    )?;
     ApplicationMain::init()
 }
 

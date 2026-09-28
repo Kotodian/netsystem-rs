@@ -1,5 +1,4 @@
 use std::io::{self, Read};
-use std::mem::MaybeUninit;
 
 use hammer_infra::svm::fifo::Fifo;
 use thiserror::Error;
@@ -120,60 +119,47 @@ impl ControlParser {
         }
     }
 
-    pub fn consume(&mut self, rx: &Fifo) -> Result<Option<ControlAction>, Iperf3ProtocolError> {
-        match self.phase {
+    /// Inspect one complete command without changing the FIFO head or parser
+    /// phase.  The caller commits both only after its response capacity check.
+    // VPP: vperf_protos.c:58-127; the RX path computes availability before
+    // app_recv_stream and only then advances the FIFO.
+    #[inline(always)]
+    pub fn inspect(
+        phase: ControlPhase,
+        rx: &Fifo,
+    ) -> Result<Option<(ControlAction, usize)>, Iperf3ProtocolError> {
+        match phase {
             ControlPhase::Cookie => {
                 if rx.max_dequeue() < COOKIE_SIZE {
                     return Ok(None);
                 }
-                let mut inspected = 0;
-                while inspected < COOKIE_SIZE {
-                    let mut segments = [MaybeUninit::uninit()];
-                    let count = rx
-                        .readable_segments(inspected, &mut segments)
-                        .expect("available cookie bytes retain their FIFO chunks");
-                    assert_eq!(count, 1, "available cookie has a readable segment");
-                    // SAFETY: readable_segments initialized the one returned slot.
-                    let bytes: &[u8] = unsafe { segments[0].assume_init() };
-                    let length = bytes.len().min(COOKIE_SIZE - inspected);
-                    assert_ne!(length, 0, "available cookie segment is nonempty");
-                    if !bytes[..length].iter().all(u8::is_ascii) {
-                        return Err(Iperf3ProtocolError::CookieInvalid);
-                    }
-                    inspected += length;
+                let mut cookie = [0; COOKIE_SIZE];
+                assert_eq!(
+                    rx.peek(0, COOKIE_SIZE, &mut cookie),
+                    COOKIE_SIZE,
+                    "complete cookie remains readable in the RX FIFO"
+                );
+                if !cookie.iter().all(u8::is_ascii) {
+                    return Err(Iperf3ProtocolError::CookieInvalid);
                 }
-                assert_eq!(rx.drop_dequeue(COOKIE_SIZE), COOKIE_SIZE);
-                self.phase = ControlPhase::Parameters;
-                Ok(Some(ControlAction::SendState(
-                    ControlState::ParameterExchange,
+                Ok(Some((
+                    ControlAction::SendState(ControlState::ParameterExchange),
+                    COOKIE_SIZE,
                 )))
             }
             ControlPhase::Parameters => {
                 if rx.max_dequeue() < PARAMETER_LENGTH_SIZE {
                     return Ok(None);
                 }
-                let mut segments = [MaybeUninit::uninit()];
-                let count = rx
-                    .readable_segments(0, &mut segments)
-                    .expect("available parameter length retains its FIFO chunk");
-                assert_eq!(count, 1, "available parameter length has a readable segment");
-                // SAFETY: readable_segments initialized the one returned slot.
-                let bytes: &[u8] = unsafe { segments[0].assume_init() };
-                let length = if bytes.len() >= PARAMETER_LENGTH_SIZE {
-                    ParameterLength::ref_from_bytes(&bytes[..PARAMETER_LENGTH_SIZE])
-                        .expect("fixed parameter length has its declared layout")
-                        .value()
-                } else {
-                    let mut header = [0; PARAMETER_LENGTH_SIZE];
-                    assert_eq!(
-                        rx.peek(0, PARAMETER_LENGTH_SIZE, &mut header),
-                        PARAMETER_LENGTH_SIZE,
-                        "available parameter length spans readable FIFO chunks"
-                    );
-                    ParameterLength::ref_from_bytes(&header)
-                        .expect("fixed parameter length has its declared layout")
-                        .value()
-                };
+                let mut header = [0; PARAMETER_LENGTH_SIZE];
+                assert_eq!(
+                    rx.peek(0, PARAMETER_LENGTH_SIZE, &mut header),
+                    PARAMETER_LENGTH_SIZE,
+                    "available parameter length spans readable FIFO chunks"
+                );
+                let length = ParameterLength::ref_from_bytes(&header)
+                    .expect("fixed parameter length has its declared layout")
+                    .value();
                 if length == 0 || length > MAX_PARAMETER_SIZE {
                     return Err(Iperf3ProtocolError::ParameterLengthInvalid { length });
                 }
@@ -190,25 +176,22 @@ impl ControlParser {
                 if !parameters.tcp || parameters.udp || parameters.sctp {
                     return Err(Iperf3ProtocolError::TcpRequired);
                 }
-                assert_eq!(
-                    rx.drop_dequeue(PARAMETER_LENGTH_SIZE + length),
-                    PARAMETER_LENGTH_SIZE + length
-                );
-                self.phase = ControlPhase::Running;
-                Ok(Some(ControlAction::Parameters(parameters)))
+                Ok(Some((
+                    ControlAction::Parameters(parameters),
+                    PARAMETER_LENGTH_SIZE + length,
+                )))
             }
             ControlPhase::Running => {
                 if rx.max_dequeue() < CONTROL_STATE_SIZE {
                     return Ok(None);
                 }
-                let mut segments = [MaybeUninit::uninit()];
-                let count = rx
-                    .readable_segments(0, &mut segments)
-                    .expect("available control state retains its FIFO chunk");
-                assert_eq!(count, 1, "available control state has a readable segment");
-                // SAFETY: readable_segments initialized the one returned slot.
-                let bytes: &[u8] = unsafe { segments[0].assume_init() };
-                let record = StateRecord::ref_from_bytes(&bytes[..CONTROL_STATE_SIZE])
+                let mut state_bytes = [0; CONTROL_STATE_SIZE];
+                assert_eq!(
+                    rx.peek(0, CONTROL_STATE_SIZE, &mut state_bytes),
+                    CONTROL_STATE_SIZE,
+                    "complete control state remains readable in the RX FIFO"
+                );
+                let record = StateRecord::ref_from_bytes(&state_bytes)
                     .expect("fixed control state has its declared layout");
                 let state = ControlState::try_from(record.value)?;
                 let action = match state {
@@ -227,14 +210,26 @@ impl ControlParser {
                         });
                     }
                 };
-                assert_eq!(rx.drop_dequeue(CONTROL_STATE_SIZE), CONTROL_STATE_SIZE);
-                if matches!(state, ControlState::TestEnd | ControlState::ClientTerminate) {
-                    self.phase = ControlPhase::Finished;
-                }
-                Ok(Some(action))
+                Ok(Some((action, CONTROL_STATE_SIZE)))
             }
             ControlPhase::Finished => Ok(None),
         }
+    }
+
+    /// Commit the parser phase after the caller has consumed the inspected
+    /// bytes.  No FIFO operation belongs here.
+    // VPP: vperf_protos.c:102-122; parser state follows successful receive.
+    #[inline(always)]
+    pub fn commit(&mut self, action: &ControlAction) {
+        self.phase = match (self.phase, action) {
+            (ControlPhase::Cookie, ControlAction::SendState(ControlState::ParameterExchange)) => {
+                ControlPhase::Parameters
+            }
+            (ControlPhase::Parameters, ControlAction::Parameters(_)) => ControlPhase::Running,
+            (ControlPhase::Running, ControlAction::SendState(ControlState::ExchangeResults))
+            | (ControlPhase::Running, ControlAction::Close) => ControlPhase::Finished,
+            (phase, _) => phase,
+        };
     }
 
     #[inline(always)]
@@ -262,19 +257,10 @@ impl Read for ParameterInput<'_> {
         if count == 0 {
             return Ok(0);
         }
-        let mut segments = [MaybeUninit::uninit()];
-        let available = self
-            .fifo
-            .readable_segments(self.offset, &mut segments)
-            .expect("declared parameter body retains its FIFO chunks");
-        if available == 0 {
+        let read = self.fifo.peek(self.offset, count, output);
+        if read == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
-        // SAFETY: readable_segments initialized the one returned slot.
-        let bytes: &[u8] = unsafe { segments[0].assume_init() };
-        let read = count.min(bytes.len());
-        assert_ne!(read, 0, "available parameter segment is nonempty");
-        output[..read].copy_from_slice(&bytes[..read]);
         self.offset += read;
         self.remaining -= read;
         Ok(read)

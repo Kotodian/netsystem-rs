@@ -76,6 +76,7 @@ pub use error::{AttachError, RuntimeError, RuntimeResult};
 pub use hammer_infra::hint::unlikely;
 pub use hammer_infra::simd::Simd;
 
+#[deprecated(note = "legacy application/session surface; use hammer-service::session")]
 pub mod app;
 pub mod attach;
 pub mod data_plane;

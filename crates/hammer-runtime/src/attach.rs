@@ -39,6 +39,7 @@ pub const ATTACH_METADATA_BYTES: usize = ATTACH_METADATA_WORDS * size_of::<u64>(
 pub const MAX_ATTACH_DESCRIPTORS: usize = 128;
 
 #[derive(Clone)]
+#[deprecated(note = "legacy App Session publication; use hammer-service::session")]
 pub struct AppSessionPublication {
     session: crate::app::SessionHandle,
     event_queue: Arc<SessionMsgQueue>,
@@ -118,6 +119,7 @@ enum PublicationSendError {
 }
 
 #[derive(Clone)]
+#[deprecated(note = "legacy App Session publication; use hammer-service::session")]
 pub struct AppSessionPublisher {
     queue: Weak<AppSessionPublicationQueue>,
 }

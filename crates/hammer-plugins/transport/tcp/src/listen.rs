@@ -8,7 +8,7 @@ use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{TcpInputNext, TcpNodeError, write_session_route_opaque};
 use hammer_service::opaque::NetworkOpaque;
-use hammer_service::session::{RxDelivery, SessionHandle, SessionWorker};
+use hammer_service::session::{SessionHandle, SessionWorker};
 
 const TCP_LISTENER_BACKLOG: usize = 128;
 
@@ -131,6 +131,11 @@ fn tcp_listen_process_frame<const IS_IP4: bool>(
     if out_len != 0 {
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
+    let session_main = hammer_service::session::SessionMain::global()
+        .expect("Session Main initializes before TCP listener input");
+    let sessions = unsafe { session_main.worker_mut(runtime) }
+        .expect("TCP listener input runs on its Session worker");
+    sessions.flush_enqueue_events(runtime, main.protocol());
     ()
 }
 
@@ -183,10 +188,15 @@ fn tcp_listen_index<const IS_IP4: bool>(
     let endpoint = IpSessionEndpoint::new(transport, main.protocol());
     let listener = main
         .listener_control
-        .listener_for_session(ip_session.lookup_listener(&endpoint, true).ok_or_else(|| {
-            let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
-            TcpError::NoListener
-        })?)
+        .listener_for_session(
+            ip_session
+                .lookup_listener(&endpoint, true)
+                .ok_or_else(|| {
+                    let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
+                    TcpError::NoListener
+                })?
+                .into(),
+        )
         .ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
             TcpError::NoListener
@@ -400,7 +410,7 @@ impl<'a> TcpListener<'a> {
         let mut connection = TcpConnection::new(
             None,
             hammer_runtime::DataWorkerId::new(self.sessions.worker_index()),
-            self.tcp.protocol(),
+            self.tcp.protocol,
             packet.local.port(),
             Some(packet.local),
             packet.remote,
@@ -431,10 +441,7 @@ impl<'a> TcpListener<'a> {
             buffer.advance(packet.payload_offset as isize);
             buffer.truncate(packet.payload_len)?;
         }
-        let delivery = self.sessions.enqueue_rx(runtime, session, index, 0)?;
-        if matches!(delivery, RxDelivery::InOrder { .. }) {
-            self.sessions.enqueue_notify(runtime, session);
-        }
+        self.sessions.enqueue_rx(runtime, session, index, 0)?;
         Ok((control, Some(session.session_index)))
     }
 
@@ -476,7 +483,7 @@ impl<'a> TcpListener<'a> {
         let mut connection = TcpConnection::new(
             None,
             hammer_runtime::DataWorkerId::new(self.sessions.worker_index()),
-            self.tcp.protocol(),
+            self.tcp.protocol,
             packet.local.port(),
             Some(packet.local),
             packet.remote,
@@ -558,7 +565,7 @@ impl<'a> TcpListener<'a> {
                 runtime,
                 self.session_listener,
                 connection_index,
-                self.tcp.protocol(),
+                self.tcp.protocol,
             )
         };
         let session = match accepted {

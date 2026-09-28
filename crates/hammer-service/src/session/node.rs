@@ -39,10 +39,9 @@ impl Node for SessionInputNode {
         let pending = match app::ApplicationMain::global() {
             Some(application_main) => match application_main.flush_worker_events(session_worker) {
                 Ok(pending) => pending,
-                Err(source) => {
-                    tracing::error!(%source, "session-input Application event delivery failed");
-                    true
-                }
+                // VPP: session_input.c:359-385 keeps unflushed events pending
+                // and reschedules session-input without logging in the node.
+                Err(_) => true,
             },
             None => false,
         };
@@ -509,50 +508,50 @@ fn session_queue_node_process(
             // and points at the process-global legacy SessionMain for its lifetime.
             let main = unsafe { &*ptr };
             'dispatch: {
-            // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-            let Ok(mut sessions) = (unsafe { main.worker(runtime.thread_index()) }) else {
-                break 'dispatch;
-            };
-            let dispatch_count = sessions.transport_dispatches.len();
-            for dispatch_index in 0..dispatch_count {
-                let dispatch = sessions.transport_dispatches[dispatch_index];
-                if (dispatch.update_time)(
-                    runtime,
-                    &mut sessions,
-                    *data,
-                    dispatch.output_next,
-                    now,
-                    frame,
-                    &mut output,
-                )
-                .is_err()
-                {
+                // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+                let Ok(mut sessions) = (unsafe { main.worker(runtime.thread_index()) }) else {
+                    break 'dispatch;
+                };
+                let dispatch_count = sessions.transport_dispatches.len();
+                for dispatch_index in 0..dispatch_count {
+                    let dispatch = sessions.transport_dispatches[dispatch_index];
+                    if (dispatch.update_time)(
+                        runtime,
+                        &mut sessions,
+                        *data,
+                        dispatch.output_next,
+                        now,
+                        frame,
+                        &mut output,
+                    )
+                    .is_err()
+                    {
+                        break 'dispatch;
+                    }
+                }
+                if sessions.poll_session_events().is_err() {
                     break 'dispatch;
                 }
-            }
-            if sessions.poll_session_events().is_err() {
-                break 'dispatch;
-            }
-            let dispatch_count = sessions.transport_dispatches.len();
-            for dispatch_index in 0..dispatch_count {
-                let dispatch = sessions.transport_dispatches[dispatch_index];
-                if (dispatch.function)(
-                    runtime,
-                    &mut sessions,
-                    *data,
-                    dispatch.output_next,
-                    now,
-                    frame,
-                    &mut output,
-                )
-                .is_err()
-                {
+                let dispatch_count = sessions.transport_dispatches.len();
+                for dispatch_index in 0..dispatch_count {
+                    let dispatch = sessions.transport_dispatches[dispatch_index];
+                    if (dispatch.function)(
+                        runtime,
+                        &mut sessions,
+                        *data,
+                        dispatch.output_next,
+                        now,
+                        frame,
+                        &mut output,
+                    )
+                    .is_err()
+                    {
+                        break 'dispatch;
+                    }
+                }
+                if sessions.update_state(runtime, output.io_count()).is_err() {
                     break 'dispatch;
                 }
-            }
-            if sessions.update_state(runtime, output.io_count()).is_err() {
-                break 'dispatch;
-            }
             }
         }
         output.flush(runtime, data, frame);
@@ -563,6 +562,19 @@ fn session_queue_node_process(
             .expect("Session Main initializes before session-queue executes");
         let session_worker = unsafe { session_main.worker_mut(runtime) }
             .expect("session-queue executes on its owning Data Worker");
+        session_worker
+            .update_transport_time(runtime, session_main, session_main.now())
+            .expect("registered Session transport updates its worker time");
+        let event_queue = session_main
+            .event_queue(session_worker.worker_index())
+            .expect("Session worker retains its message queue");
+        session_worker
+            .drain_event_queue(event_queue)
+            .expect("Session worker message queue retains valid event records");
+        session_worker
+            .dispatch_io_events(runtime, session_main)
+            .expect("registered Session transport handles its IO events");
+        session_worker.schedule_pending_app_events(runtime);
         dispatched + session_worker.flush_pending_tx_buffers(runtime, data, frame)
     })()
 }

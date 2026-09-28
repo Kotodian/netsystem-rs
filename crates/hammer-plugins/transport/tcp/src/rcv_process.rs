@@ -3,7 +3,7 @@ use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, Node
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::session::{RxDelivery, SessionHandle};
+use hammer_service::session::SessionHandle;
 
 use super::TcpError;
 use super::TcpNodeError;
@@ -121,6 +121,15 @@ fn tcp_rcv_process_frame<const IS_IP4: bool>(
     if out_len != 0 {
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
+    let session_main = hammer_service::session::SessionMain::global()
+        .expect("Session Main initializes before TCP receive processing");
+    let sessions = unsafe { session_main.worker_mut(runtime) }
+        .expect("TCP receive processing runs on its Session worker");
+    let protocol = crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before receive processing")
+        .protocol();
+    sessions.flush_enqueue_events(runtime, protocol);
     ()
 }
 
@@ -228,7 +237,7 @@ fn tcp_rcv_process_index<const IS_IP4: bool>(
                 .and_then(|session| session.tx_fifo())
                 .is_some_and(|fifo| fifo.max_dequeue() != 0)
         {
-            sessions.enqueue_ready(handle, tcp.protocol())?;
+            sessions.enqueue_ready(handle, tcp.protocol)?;
         }
         if established_with_payload {
             {
@@ -236,10 +245,7 @@ fn tcp_rcv_process_index<const IS_IP4: bool>(
                 buffer.advance(packet.payload_offset as isize);
                 buffer.truncate(packet.payload_len)?;
             }
-            let enqueue = sessions.enqueue_rx(runtime, handle, index, 0)?;
-            if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                sessions.enqueue_notify(runtime, handle);
-            }
+            sessions.enqueue_rx(runtime, handle, index, 0)?;
         }
         (control, connection_index)
     };

@@ -3,14 +3,15 @@ use std::sync::OnceLock;
 
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
-use hammer_plugin_session::IpSessionMain;
+use hammer_plugin_session::{AppSessionTransport, IpSessionMain};
 use hammer_plugin_tcp::TCP_MAIN;
 use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult};
 use hammer_service::session::app::{
     ApplicationConfig, ApplicationError, ApplicationFlags, ApplicationMain, SessionCleanup,
 };
 use hammer_service::session::{
-    SegmentManagerProperties, SessionError, SessionHandle, SessionMain, SessionState, SessionWorker,
+    AppSession, SegmentManagerProperties, Session, SessionError, SessionEventEnqueue,
+    SessionEventType, SessionHandle, SessionMain, SessionState,
 };
 use thiserror::Error;
 
@@ -66,8 +67,10 @@ pub enum SessionPhase {
     Closing,
 }
 
+#[repr(C)]
 pub struct Iperf3Session {
-    handle: SessionHandle,
+    cacheline0: CacheLineAlignMark,
+    app: AppSession<AppSessionTransport>,
     role: ListenerRole,
     phase: SessionPhase,
     parser: ControlParser,
@@ -77,15 +80,42 @@ pub struct Iperf3Session {
 }
 
 impl Iperf3Session {
-    fn new(handle: SessionHandle, role: ListenerRole) -> Self {
+    fn new(app: AppSession<AppSessionTransport>, role: ListenerRole) -> Self {
         Self {
-            handle,
+            cacheline0: CacheLineAlignMark,
+            app,
             role,
             phase: SessionPhase::Accepted,
             parser: ControlParser::new(),
             parameters: None,
             received: 0,
             sent: 0,
+        }
+    }
+
+    /// VPP: vperf_protos.c:142-155, vp_proto_server_stream_rx_no_echo.
+    #[inline]
+    fn server_stream_rx_no_echo(&mut self, session: &mut Session) {
+        let rx = session
+            .rx_fifo()
+            .expect("accepted iperf3 Session owns an RX FIFO");
+        let available = rx.max_dequeue();
+        if available == 0 {
+            return;
+        }
+        let consumed = rx.drop_dequeue(available);
+        self.received = self.received.saturating_add(consumed as u64);
+        if rx.needs_deq_notification(consumed) {
+            match hammer_service::session::program_transport_io_event(
+                session.handle(),
+                SessionEventType::Rx,
+            )
+            .expect("accepted iperf3 Session retains its worker event queue")
+            {
+                SessionEventEnqueue::Enqueued
+                | SessionEventEnqueue::Busy
+                | SessionEventEnqueue::Full => {}
+            }
         }
     }
 }
@@ -143,10 +173,10 @@ impl Iperf3Main {
     }
 
     fn start(config: Iperf3Config) -> Result<Self, Iperf3Error> {
-        let app_main = ApplicationMain::global()
-            .expect("Application Main initializes before builtin iperf3");
-        let ip_session = IpSessionMain::global()
-            .map_err(|source| Iperf3Error::ControlListen { source })?;
+        let app_main =
+            ApplicationMain::global().expect("Application Main initializes before builtin iperf3");
+        let ip_session =
+            IpSessionMain::global().map_err(|source| Iperf3Error::ControlListen { source })?;
         let tcp = TCP_MAIN.get().ok_or(Iperf3Error::TransportProtocol {
             source: RuntimeError::PluginStateNotInitialized { plugin: "tcp" },
         })?;
@@ -172,7 +202,7 @@ impl Iperf3Main {
                 add_segment: |_, _| Ok(()),
                 del_segment: |_, _| Ok(()),
                 accepted: on_accept,
-                connected: |_, _, _, _, _| Err(ApplicationError::CallbackRejected),
+                connected: |_, _, _, _| Err(ApplicationError::CallbackRejected),
                 disconnected: on_disconnect,
                 reset: on_reset,
                 transport_closed: Some(on_transport_closed),
@@ -187,36 +217,46 @@ impl Iperf3Main {
             .map_err(|source| Iperf3Error::ApplicationAttach { source })?;
         control_request.opaque = Some(u32::from(ListenerRole::Control));
         data_request.opaque = Some(u32::from(ListenerRole::Data));
-        let (control_application_listener, control_listener) =
-            match ip_session.listen(tcp, application, 0, &control_request) {
-                Ok(Some(listener)) => listener,
-                Ok(None) => panic!("newly attached iperf3 Application remains allocated"),
-                Err(source) => {
-                    app_main.detach(application).unwrap_or_else(|cleanup_error| {
+        let (control_application_listener, control_listener) = match ip_session.listen(
+            tcp,
+            application,
+            0,
+            &control_request,
+        ) {
+            Ok(Some(listener)) => listener,
+            Ok(None) => panic!("newly attached iperf3 Application remains allocated"),
+            Err(source) => {
+                app_main.detach(application).unwrap_or_else(|cleanup_error| {
                         panic!("iperf3 control listen failed: {source}; Application detach failed: {cleanup_error}")
                     });
-                    return Err(Iperf3Error::ControlListen { source });
-                }
-            };
-        let (data_application_listener, data_listener) =
-            match ip_session.listen(tcp, application, 0, &data_request) {
-                Ok(Some(listener)) => listener,
-                Ok(None) => panic!("iperf3 Application remains attached during data listen"),
-                Err(source) => {
-                    let unlisten_error = ip_session.unlisten(
+                return Err(Iperf3Error::ControlListen { source });
+            }
+        };
+        let (data_application_listener, data_listener) = match ip_session.listen(
+            tcp,
+            application,
+            0,
+            &data_request,
+        ) {
+            Ok(Some(listener)) => listener,
+            Ok(None) => panic!("iperf3 Application remains attached during data listen"),
+            Err(source) => {
+                let unlisten_error = ip_session
+                    .unlisten(
                         tcp,
                         &control_request.endpoint,
                         control_application_listener,
                         control_listener,
-                    ).err();
-                    let detach_error = app_main.detach(application).err();
-                    assert!(
-                        unlisten_error.is_none() && detach_error.is_none(),
-                        "iperf3 data listen failed: {source}; control unlisten: {unlisten_error:?}; Application detach: {detach_error:?}"
-                    );
-                    return Err(Iperf3Error::DataListen { source });
-                }
-            };
+                    )
+                    .err();
+                let detach_error = app_main.detach(application).err();
+                assert!(
+                    unlisten_error.is_none() && detach_error.is_none(),
+                    "iperf3 data listen failed: {source}; control unlisten: {unlisten_error:?}; Application detach: {detach_error:?}"
+                );
+                return Err(Iperf3Error::DataListen { source });
+            }
+        };
         Ok(Self {
             cacheline0: CacheLineAlignMark,
             config,
@@ -273,17 +313,12 @@ pub enum Iperf3Error {
     },
 }
 
-fn on_accept(
-    worker: &mut SessionWorker,
-    handle: SessionHandle,
-) -> Result<(), ApplicationError> {
+fn on_accept(session: &mut Session) -> Result<(), ApplicationError> {
     let main = IPERF3_MAIN
         .get()
         .expect("iperf3 Main publishes before Session callbacks execute");
-    let listener = worker
-        .session_from_handle(handle)
-        .expect("accepted Session remains allocated during its callback")
-        .listener_handle();
+    let handle = session.handle();
+    let listener = session.listener_handle();
     let role = if listener == main.control_listener {
         ListenerRole::Control
     } else if listener == main.data_listener {
@@ -294,26 +329,19 @@ fn on_accept(
     let slot = main
         .worker(DataWorkerId::new(handle.worker_index))
         .expect("iperf3 worker exists for each Session worker");
-    let index = slot.sessions.insert(Iperf3Session::new(handle, role));
-    let session = worker
-        .session_mut(handle.session_index)
-        .expect("accepted Session remains allocated after iperf3 record insertion");
+    let app = AppSession::new(session);
+    let index = slot.sessions.insert(Iperf3Session::new(app, role));
     *session.opaque_mut() = index;
     session.store_state(SessionState::Ready);
     Ok(())
 }
 
-fn on_rx(worker: &mut SessionWorker, handle: SessionHandle) {
+fn on_rx(app_session: &mut Session) {
     let main = IPERF3_MAIN
         .get()
         .expect("iperf3 Main publishes before Session callbacks execute");
-    let app_session = worker
-        .session_from_handle(handle)
-        .expect("RX event retains an allocated Session");
+    let handle = app_session.handle();
     let index = *app_session.opaque();
-    let rx = app_session
-        .rx_fifo()
-        .expect("accepted iperf3 Session owns an RX FIFO");
     let slot = main
         .worker(DataWorkerId::new(handle.worker_index))
         .expect("iperf3 worker exists for each Session worker");
@@ -323,36 +351,73 @@ fn on_rx(worker: &mut SessionWorker, handle: SessionHandle) {
         .expect("iperf3 Session record remains live until Session cleanup");
     match session.role {
         ListenerRole::Control => {
+            let rx = app_session
+                .rx_fifo()
+                .expect("accepted iperf3 Session owns an RX FIFO");
             let tx = app_session
                 .tx_fifo()
                 .expect("accepted iperf3 Session owns a TX FIFO");
-            let mut sent_any = false;
-            while tx.max_enqueue() != 0 {
-                let action = match session.parser.consume(rx) {
-                    Ok(Some(action)) => action,
-                    Ok(None) => break,
-                    Err(source) => {
-                        tracing::error!(%source, ?handle, "iperf3 control input rejected");
+            rx.unset_event();
+            loop {
+                let inspected = match ControlParser::inspect(session.parser.phase(), rx) {
+                    Ok(inspected) => inspected,
+                    Err(_) => {
                         session.phase = SessionPhase::Closing;
                         app_session.store_state(SessionState::AppClosed);
-                        break;
+                        return;
                     }
                 };
+                let Some((action, inspected_len)) = inspected else {
+                    break;
+                };
+
+                let reply = match action {
+                    ControlAction::Parameters(_) => {
+                        Some(ControlParser::state_bytes(ControlState::CreateStreams))
+                    }
+                    ControlAction::SendState(state) => Some(ControlParser::state_bytes(state)),
+                    ControlAction::Close => None,
+                };
+                if reply
+                    .as_ref()
+                    .is_some_and(|bytes| tx.max_enqueue() < bytes.len())
+                {
+                    // VPP: vperf_protos.c:80-99. The current session-input
+                    // dispatch retains this AppWorker's pending bit until the
+                    // callback returns and observes the appended RX event.
+                    if rx.set_event() {
+                        hammer_service::session::enqueue_notify(app_session)
+                            .expect("accepted iperf3 Session retains its AppWorker");
+                    }
+                    return;
+                }
+
+                // VPP: app_recv_stream_raw, application_interface.h:795-810.
+                let consumed = rx.drop_dequeue(inspected_len);
+                assert_eq!(
+                    consumed, inspected_len,
+                    "inspected command is still in the RX FIFO"
+                );
+                session.received = session.received.saturating_add(consumed as u64);
+                if rx.needs_deq_notification(consumed) {
+                    match hammer_service::session::program_transport_io_event(
+                        handle,
+                        SessionEventType::Rx,
+                    )
+                    .expect("accepted iperf3 Session retains its worker event queue")
+                    {
+                        SessionEventEnqueue::Enqueued
+                        | SessionEventEnqueue::Busy
+                        | SessionEventEnqueue::Full => {}
+                    }
+                }
+                session.parser.commit(&action);
+
                 match action {
                     ControlAction::Parameters(parameters) => {
                         session.parameters = Some(parameters);
-                        let bytes = ControlParser::state_bytes(ControlState::CreateStreams);
-                        let sent = tx.enqueue(&bytes);
-                        assert_eq!(sent, bytes.len(), "reserved control response fits TX FIFO");
-                        session.sent = session.sent.saturating_add(sent as u64);
-                        sent_any = true;
                     }
                     ControlAction::SendState(state) => {
-                        let bytes = ControlParser::state_bytes(state);
-                        let sent = tx.enqueue(&bytes);
-                        assert_eq!(sent, bytes.len(), "reserved control response fits TX FIFO");
-                        session.sent = session.sent.saturating_add(sent as u64);
-                        sent_any = true;
                         session.phase = if state == ControlState::TestStart {
                             SessionPhase::Running
                         } else {
@@ -362,34 +427,32 @@ fn on_rx(worker: &mut SessionWorker, handle: SessionHandle) {
                     ControlAction::Close => {
                         session.phase = SessionPhase::Closing;
                         app_session.store_state(SessionState::AppClosed);
-                        break;
+                        return;
                     }
                 }
-            }
-            if sent_any {
-                worker
-                    .enqueue_ready(handle, main.transport_protocol)
-                    .expect("iperf3 TX Session retains its registered transport protocol");
+
+                if let Some(bytes) = reply {
+                    let sent = session
+                        .app
+                        .send_stream(&bytes, false)
+                        .expect("blocking iperf3 stream send publishes its TX event");
+                    assert_eq!(sent, bytes.len(), "reserved control response fits TX FIFO");
+                    session.sent = session.sent.saturating_add(sent as u64);
+                }
             }
         }
         ListenerRole::Data => {
-            let received = rx.max_dequeue();
-            if received != 0 {
-                let dropped = rx.drop_dequeue(received);
-                session.received = session.received.saturating_add(dropped as u64);
-            }
+            session.server_stream_rx_no_echo(app_session);
         }
     }
 }
 
-fn on_disconnect(worker: &mut SessionWorker, handle: SessionHandle) {
+fn on_disconnect(app_session: &mut Session) {
     let main = IPERF3_MAIN
         .get()
         .expect("iperf3 Main publishes before Session callbacks execute");
-    let index = *worker
-        .session_from_handle(handle)
-        .expect("disconnect event retains an allocated Session")
-        .opaque();
+    let handle = app_session.handle();
+    let index = *app_session.opaque();
     let session = main
         .worker(DataWorkerId::new(handle.worker_index))
         .expect("iperf3 worker exists for each Session worker")
@@ -397,23 +460,19 @@ fn on_disconnect(worker: &mut SessionWorker, handle: SessionHandle) {
         .get_mut(index)
         .expect("iperf3 Session record remains live until Session cleanup");
     session.phase = SessionPhase::Closing;
-    worker
-        .store_state(handle, SessionState::AppClosed)
-        .expect("disconnect event retains its Session");
+    app_session.store_state(SessionState::AppClosed);
 }
 
-fn on_reset(worker: &mut SessionWorker, handle: SessionHandle) {
-    on_disconnect(worker, handle);
+fn on_reset(session: &mut Session) {
+    on_disconnect(session);
 }
 
-fn on_transport_closed(worker: &mut SessionWorker, handle: SessionHandle) {
+fn on_transport_closed(app_session: &mut Session) {
     let main = IPERF3_MAIN
         .get()
         .expect("iperf3 Main publishes before Session callbacks execute");
-    let index = *worker
-        .session_from_handle(handle)
-        .expect("transport-closed event retains an allocated Session")
-        .opaque();
+    let handle = app_session.handle();
+    let index = *app_session.opaque();
     let session = main
         .worker(DataWorkerId::new(handle.worker_index))
         .expect("iperf3 worker exists for each Session worker")
@@ -423,17 +482,15 @@ fn on_transport_closed(worker: &mut SessionWorker, handle: SessionHandle) {
     session.phase = SessionPhase::Closing;
 }
 
-fn on_cleanup(worker: &mut SessionWorker, handle: SessionHandle, cleanup: SessionCleanup) {
+fn on_cleanup(app_session: &mut Session, cleanup: SessionCleanup) {
     if cleanup != SessionCleanup::Session {
         return;
     }
     let main = IPERF3_MAIN
         .get()
         .expect("iperf3 Main publishes before Session callbacks execute");
-    let index = *worker
-        .session_from_handle(handle)
-        .expect("cleanup event retains an allocated Session")
-        .opaque();
+    let handle = app_session.handle();
+    let index = *app_session.opaque();
     main.worker(DataWorkerId::new(handle.worker_index))
         .expect("iperf3 worker exists for each Session worker")
         .sessions

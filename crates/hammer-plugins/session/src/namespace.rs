@@ -2,7 +2,8 @@ use std::sync::OnceLock;
 
 use hammer_app::{AppNamespace, AppNamespaceMain};
 use hammer_plugin_ip::{IpVersion, fib_table_find, fib_table_get_index_for_sw_if_index};
-use hammer_service::net::{FibEntrySourceBehaviorId, FibSource, NetMain};
+use hammer_service::net::fib::FibEntrySourceBehaviorId;
+use hammer_service::net::{FibSource, NetMain};
 
 use crate::api::AppNamespaceAddDelRetval;
 use crate::{IpSessionFamily, session_lookup};

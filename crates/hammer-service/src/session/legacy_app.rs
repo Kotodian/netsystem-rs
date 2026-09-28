@@ -10,7 +10,8 @@ use hammer_infra::segment::Segment;
 use hammer_infra::svm::fifo::Fifo;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, SessionAcceptedMsg, SessionConnectedMsg,
-    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
+    SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError,
+    SessionOffsets,
 };
 use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
 use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};

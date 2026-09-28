@@ -52,7 +52,7 @@ composition，不是 application 抽象。
 
 ```text
 hammer-service::session
-  SessionMain / SessionWorker / Session<O>
+  SessionMain / SessionWorker / Session
   ApplicationMain / Application / AppWorker / ApplicationListener
   application-owned per-event Rust fn callbacks and app/session events
   generic CtMain<E, O> / CtWorker<E, O> / CtConnection<E, O> contracts
@@ -174,7 +174,7 @@ impl<'app> ApplicationMain<'app> {
     #[inline]
     pub fn listener_for_session(
         &self,
-        session_main: &SessionMain<u32>,
+        session_main: &SessionMain,
         session: SessionHandle,
     ) -> Option<u32>;
 }
@@ -222,20 +222,20 @@ pub struct Application<'app> {
     // Application fields, not an embedded callback-table struct.
     add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
-    accepted: fn(&mut SessionWorker, SessionHandle) -> Result<(), ApplicationError>,
-    connected: fn(&mut SessionWorker, u32, u64, Option<SessionHandle>, Option<SessionError>)
+    accepted: fn(&mut Session<u32>) -> Result<(), ApplicationError>,
+    connected: fn(u32, u64, Option<&mut Session<u32>>, Option<SessionError>)
         -> Result<(), ApplicationError>,
-    disconnected: fn(&mut SessionWorker, SessionHandle),
-    reset: fn(&mut SessionWorker, SessionHandle),
-    transport_closed: Option<fn(&mut SessionWorker, SessionHandle)>,
-    cleanup: Option<fn(&mut SessionWorker, SessionHandle, SessionCleanup)>,
-    half_open_cleanup: Option<fn(&mut SessionWorker, SessionHandle)>,
-    migrated: Option<fn(&mut SessionWorker, SessionHandle, SessionHandle)>,
+    disconnected: fn(&mut Session<u32>),
+    reset: fn(&mut Session<u32>),
+    transport_closed: Option<fn(&mut Session<u32>)>,
+    cleanup: Option<fn(&mut Session<u32>, SessionCleanup)>,
+    half_open_cleanup: Option<fn(&mut Session<u32>)>,
+    migrated: Option<fn(&mut Session<u32>, SessionHandle)>,
     listened: Option<fn(u32, u32, SessionHandle, Option<SessionError>)
         -> Result<(), ApplicationError>>,
     unlistened: Option<fn(u32, SessionHandle, u32, Option<SessionError>)>,
-    builtin_rx: Option<fn(&mut SessionWorker, SessionHandle)>,
-    builtin_tx: Option<fn(&mut SessionWorker, SessionHandle)>,
+    builtin_rx: Option<fn(&mut Session<u32>)>,
+    builtin_tx: Option<fn(&mut Session<u32>)>,
     segment: SegmentManagerProperties,
     worker_maps: Pool<ApplicationWorkerMap>,
     // Sole owner of the application name bytes. The name is immutable after
@@ -274,6 +274,10 @@ impl<'app> Application<'app> {
 `Application`/`ApplicationConfig`，不再包一层 `ApplicationCallbacks` 结构体或 trait。
 每个 `fn` 都实现 Rust `Fn`，可由非捕获闭包提供；捕获闭包不能放进非泛型的
 Application pool。业务可变状态仍由当前 Data Worker 的具体 plugin owner 持有。
+所有 VPP 以 `session_t *` 为参数的回调在 Rust 中直接借用 `&mut Session`，
+不是把 `&mut SessionWorker` 与 `SessionHandle` 暴露给应用。
+`connected` 在失败时可能没有 Session，因此保留 `Option<&mut Session>`；
+segment/listener 回调没有 `session_t *` 参数，不强行改成 Session 借用。
 
 ```rust
 // VPP: session_cleanup_ntf_t, session_types.h:173-177.
@@ -343,6 +347,10 @@ callback-before-consume semantics and pending re-arm. Rust may temporarily take 
 its queue to end the queue borrow before invoking the closure, but the Session worker retains
 the obligation until the event-specific outcome is committed; a callback rejection follows the
 same accept/connect/segment cleanup decision as VPP and cannot silently lose the event.
+The service resolves the worker-local Session before each Session callback, then releases that
+borrow before any worker-level enqueue, cleanup, or state follow-up. For a builtin callback that
+sets the TX FIFO event bit, service enqueues the Session for TX after the callback returns; the
+application callback does not receive the SessionWorker just to schedule work.
 `SESSION_CTRL_EVT_CLEANUP` first notifies the Application only while the Session remains attached;
 the Session-stage cleanup still returns its FIFO pair and removes the Session after a rejected
 accept cleared `app_wrk_index` (`session_input.c:279-305`, `session.c:300-304`). A stale handle
@@ -365,20 +373,20 @@ pub struct ApplicationConfig {
     // copied into application_t.cb_fns at application.c:696-703.
     pub add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     pub del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
-    pub accepted: fn(&mut SessionWorker, SessionHandle) -> Result<(), ApplicationError>,
-    pub connected: fn(&mut SessionWorker, u32, u64, Option<SessionHandle>, Option<SessionError>)
+    pub accepted: fn(&mut Session<u32>) -> Result<(), ApplicationError>,
+    pub connected: fn(u32, u64, Option<&mut Session<u32>>, Option<SessionError>)
         -> Result<(), ApplicationError>,
-    pub disconnected: fn(&mut SessionWorker, SessionHandle),
-    pub reset: fn(&mut SessionWorker, SessionHandle),
-    pub transport_closed: Option<fn(&mut SessionWorker, SessionHandle)>,
-    pub cleanup: Option<fn(&mut SessionWorker, SessionHandle, SessionCleanup)>,
-    pub half_open_cleanup: Option<fn(&mut SessionWorker, SessionHandle)>,
-    pub migrated: Option<fn(&mut SessionWorker, SessionHandle, SessionHandle)>,
+    pub disconnected: fn(&mut Session<u32>),
+    pub reset: fn(&mut Session<u32>),
+    pub transport_closed: Option<fn(&mut Session<u32>)>,
+    pub cleanup: Option<fn(&mut Session<u32>, SessionCleanup)>,
+    pub half_open_cleanup: Option<fn(&mut Session<u32>)>,
+    pub migrated: Option<fn(&mut Session<u32>, SessionHandle)>,
     pub listened: Option<fn(u32, u32, SessionHandle, Option<SessionError>)
         -> Result<(), ApplicationError>>,
     pub unlistened: Option<fn(u32, SessionHandle, u32, Option<SessionError>)>,
-    pub builtin_rx: Option<fn(&mut SessionWorker, SessionHandle)>,
-    pub builtin_tx: Option<fn(&mut SessionWorker, SessionHandle)>,
+    pub builtin_rx: Option<fn(&mut Session<u32>)>,
+    pub builtin_tx: Option<fn(&mut Session<u32>)>,
 }
 
 // VPP: app_rx_mq_flags_t, application.h:103-107.
@@ -617,7 +625,7 @@ pub struct AppWorker<'segment> {
     app_is_builtin: bool,
     // VPP app_worker_t.wrk_evts and wrk_mq_congested,
     // application.h:70-74; direct per-worker Vec storage.
-    events_by_worker: Vec<Vec<ApplicationEvent>>,
+    events_by_worker: Vec<UnsafeCell<Vec<SessionEvent>>>,
     mq_congested: bool,
     worker_mq_congested: Vec<bool>,
     detached_segment_managers: Vec<u32>,
@@ -641,12 +649,13 @@ impl<'segment> AppWorker<'segment> {
     pub fn own_session(&mut self, session: SessionHandle)
         -> Result<(), ApplicationError>;
 
-    // VPP: app_worker_add_event/app_worker_add_event_custom,
-    // application_worker.c:934-967. This is a bounded data-plane outcome,
-    // not a numeric error code.
+    // VPP: app_worker_add_event, application_worker.c:934-952.
     #[inline]
-    pub fn add_event(&mut self, worker: DataWorkerId, event: ApplicationEvent)
-        -> ApplicationEventResult;
+    pub fn add_event(&self, session: &Session, event: SessionEventType);
+
+    // VPP: app_worker_add_event_custom, application_worker.c:954-967.
+    #[inline]
+    pub fn add_event_custom(&self, thread_index: u32, event: &SessionEvent);
 
     // VPP: app_wrk_flush_wrk_events and app_worker_flush_events_inline,
     // session_input.c:80-389.
@@ -657,43 +666,16 @@ impl<'segment> AppWorker<'segment> {
 ```
 
 `event_queue` 是 application 给外部 app 接收 control/IO event 的 SVM MQ；
-`events_by_worker` 是 Session worker 到达 app worker 的 bounded event storage。两者含义不同，
-但都复用现有 SVM/infra primitive。producer 在移交 event 后不再访问该 event；MQ full、lock
-failure 和 postponed event 使用 `ApplicationEventResult`，由 Session input node 决定保留/重试，
-不把每一个 packet/event failure 变成 control-plane `Result`。
-
-```rust
-// VPP: session.c:34-85 and application_worker.c:969-1001.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApplicationEventResult {
-    Queued,
-    Deferred,
-    QueueFull,
-    LockUnavailable,
-}
-
-// VPP: session_node.c/session_input.c event families.
-#[derive(Debug)]
-pub enum ApplicationEvent {
-    Accepted { application: u32, session: SessionHandle },
-    Connected {
-        application: u32,
-        session: Option<SessionHandle>,
-        opaque: u64,
-        error: Option<SessionError>,
-    },
-    Disconnected { application: u32, session: SessionHandle },
-    Reset { application: u32, session: SessionHandle },
-    TransportClosed { application: u32, session: SessionHandle },
-    Cleanup { application: u32, session: SessionHandle },
-    HalfOpenCleanup { application: u32, session: SessionHandle },
-    Rx { application: u32, session: SessionHandle },
-    Tx { application: u32, session: SessionHandle },
-    Listened { application: u32, listener: u32, opaque: u64 },
-    Unlistened { application: u32, listener: u32, opaque: u64 },
-}
-
-```
+`events_by_worker` 是 AppWorker 按执行 worker 保存的 `SessionEvent` 列；
+`event_queue` 是外部应用接收通知的 SVM MQ。VPP 两处都使用同一个
+`session_event_t`（`application_worker.c:934-967`、`session_input.c:80-153`），
+不另造 `ApplicationEvent` 或 `ApplicationEventResult`。每个 `UnsafeCell` 槽仅由
+对应的 Session worker 写入；`add_event` 依 `session.thread_index` 追加
+Session index 事件，`add_event_custom` 依传入的当前执行 thread index
+追加完整事件。两者都只在该列从空变为非空时标记 `session-input` pending。
+MQ 的锁忙和容量不足在 `flush_events` 处理：保留尚未发出的事件，并按已有
+AppWorker 拥塞位重试，不把这类结果当成向本地列追加时的失败。
+事件记录布局、两种 `BUILTIN_RX` 投递路径和 FIFO 通知位的边界见 ADR-0042。
 
 ### 3.4 ApplicationListener
 
@@ -755,10 +737,9 @@ operation.
 
 ## 4. Session record and app/session relation
 
-Application ownership is a relation on the existing generic `Session<O>`, not a new
-`ApplicationSession` wrapper. The `O` parameter is the session opaque, corresponding to VPP's
-`session_t.opaque`; it lets each concrete owner retain its own fact without `void *` or a universal
-context type.
+Application ownership is a relation on the concrete service `Session`, not a new
+`ApplicationSession` wrapper. Its `opaque: u32` is the pool index corresponding to VPP's
+`session_t.opaque`; the owning application interprets that index in its worker-local pool.
 
 VPP's app-facing `app_session_t` includes `volatile u8 session_state` and FIFO/session identity
 (`application_interface.h:275-290`). Rust must not use `read_volatile` as a synchronization primitive:
@@ -773,7 +754,7 @@ use hammer_infra::svm::fifo::Fifo as SvmFifo;
 // VPP: app_session_t, application_interface.h:275-290;
 // session_t allocation/cleanup, session.c:244-304.
 #[repr(C)]
-pub struct Session<O> {
+pub struct Session {
     rx_fifo: SvmFifo,
     tx_fifo: SvmFifo,
     handle: SessionHandle,
@@ -783,17 +764,17 @@ pub struct Session<O> {
     app_worker: Option<u32>,
     listener: Option<SessionHandle>,
     connection_index: u32,
-    opaque: O,
+    opaque: u32,
     cacheline_end: CacheLineAlignMark,
 }
 
-impl<O> Session<O> {
+impl Session {
     // VPP: session_alloc/session_free, session.c:244-269.
     // SegmentManager allocates the pair before this record is published.
     pub fn allocate(
         handle: SessionHandle,
         session_type: u8,
-        opaque: O,
+        opaque: u32,
         rx_fifo: SvmFifo,
         tx_fifo: SvmFifo,
     ) -> Self;
@@ -805,10 +786,10 @@ impl<O> Session<O> {
     pub fn store_state(&self, state: SessionState);
 
     #[inline(always)]
-    pub fn opaque(&self) -> &O;
+    pub fn opaque(&self) -> &u32;
 
     #[inline(always)]
-    pub fn opaque_mut(&mut self) -> &mut O;
+    pub fn opaque_mut(&mut self) -> &mut u32;
 
     #[inline(always)]
     pub fn rx_fifo(&self) -> &SvmFifo;
@@ -1010,7 +991,7 @@ impl<'app> ApplicationMain<'app> {
 
     pub fn attach_listener_session(
         &mut self,
-        session_main: &SessionMain<u32>,
+        session_main: &SessionMain,
         listener: u32,
         global: Option<SessionHandle>,
         local: Option<SessionHandle>,
@@ -1030,7 +1011,7 @@ impl<'app> ApplicationMain<'app> {
 
     pub fn remove_listener(
         &mut self,
-        session_main: &SessionMain<u32>,
+        session_main: &SessionMain,
         listener: u32,
     ) -> Result<(), ApplicationError>;
 }
@@ -1495,7 +1476,7 @@ The names above are semantic names for VPP's `SESSION_E_*` categories; they do n
 discriminants, `code()` methods, `repr(i32)`, or a second error-code table. `Ok(())` represents
 `SESSION_E_NONE`.
 
-Application event queue congestion is an expected data-plane outcome (`ApplicationEventResult`), not
+Application event queue congestion is an expected data-plane outcome, not
 an `ApplicationError`. An invalid pool handle, a missing promised listener/session, or a broken
 Session-to-transport backlink is an owner invariant and must assert at the owner boundary rather than
 silently becoming `None`.
@@ -1524,7 +1505,7 @@ pub struct AppWorker {
 
 // VPP: session_worker_t.cacheline0, session.h:82-85.
 #[repr(C)]
-pub struct SessionWorker<O> {
+pub struct SessionWorker {
     cacheline0: hammer_infra::align::CacheLineAlignMark,
     // ADR-0038 fields
 }

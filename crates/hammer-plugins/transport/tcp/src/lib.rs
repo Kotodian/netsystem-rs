@@ -62,7 +62,8 @@ use hammer_service::session::runtime::{
     SessionTransport, SessionWorker, dispatch_session_queue_events,
 };
 use hammer_service::session::{
-    SessionError, SessionHandle as ServiceSessionHandle, SessionQueueNext,
+    SessionError, SessionEventType, SessionHandle as ServiceSessionHandle, SessionQueueNext,
+    SessionMain as ServiceSessionMain, SessionWorker as ServiceSessionWorker,
 };
 use hammer_service::transport::{
     Transport, TransportMain, TransportOptions, TransportSendFlags, TransportSendParams,
@@ -806,6 +807,182 @@ fn init_tcp() -> RuntimeResult<()> {
         TCP_MAIN.set(main).is_ok(),
         "TCP initialization callback executes once"
     );
+    ServiceSessionMain::global()
+        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?
+        .register_transport_io(protocol, tcp_session_io, tcp_session_update_time)
+        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
+    Ok(())
+}
+
+/// VPP: session_node.c:1858-1915, the TCP session type's IO dispatch.
+fn tcp_session_io(
+    runtime: &mut DataPlaneMain,
+    sessions: &mut ServiceSessionWorker,
+    session_index: u32,
+    event: SessionEventType,
+) -> Result<(usize, bool), SessionError> {
+    let tcp = TCP_MAIN
+        .get()
+        .expect("TCP Main remains published while its Session type is registered");
+    let session = sessions
+        .session(session_index)
+        .ok_or(SessionError::NoSession)?;
+    let connection_index = session.connection_index();
+    let worker_index = sessions.worker_index();
+    match event {
+        SessionEventType::Tx | SessionEventType::TxFlush => {
+            if event == SessionEventType::TxFlush {
+                <TcpMain as Transport<IpTransportEndpointConfig>>::flush_data(
+                    tcp, connection_index, worker_index,
+                );
+            }
+            let next = {
+                let worker = tcp
+                    .worker(runtime.thread_index())
+                    .map_err(|source| SessionError::TransportOpFailed { source })?;
+                let connection = worker
+                    .connection(connection_index)
+                    .ok_or(SessionError::NoSession)?;
+                worker.tco_next_node[usize::from(!connection.remote().is_ipv4())]
+            };
+            sessions.tx_fifo_peek_and_send(runtime, session_index, tcp, next)
+        }
+        SessionEventType::Rx => {
+            // VPP: tcp.c:1382-1401, tcp_session_app_rx_evt.
+            let rx = session
+                .rx_fifo()
+                .expect("accepted TCP Session retains its RX FIFO");
+            let available = rx.max_enqueue();
+            let minimum = (rx.size() >> 3).clamp(4 << 10, 128 << 10);
+            let mut worker = tcp
+                .worker(runtime.thread_index())
+                .map_err(|source| SessionError::TransportOpFailed { source })?;
+            let next_nodes = worker.tco_next_node;
+            let connection = worker
+                .connection_mut(connection_index)
+                .ok_or(SessionError::NoSession)?;
+            connection.set_rcv_wnd(available);
+            if !connection.zero_receive_window_sent() {
+                return Ok((0, false));
+            }
+            if available < minimum {
+                rx.want_deq_notification();
+                return Ok((0, false));
+            }
+            let mut candidate = connection.clone();
+            let segment = candidate
+                .receive_window_update_segment(available)
+                .map_err(|source| SessionError::TransportOpFailed { source })?;
+            let next = next_nodes[usize::from(!candidate.remote().is_ipv4())];
+            if !enqueue_session_tcp_segment(runtime, sessions, connection_index, next, segment)? {
+                return Ok((0, true));
+            }
+            *connection = candidate;
+            Ok((0, false))
+        }
+        _ => unreachable!("TCP Session IO dispatch receives only stream events"),
+    }
+}
+
+/// VPP: tcp_output.c and session_node.c:1456-1468. TCP owns the header;
+/// Session owns the pending Buffer fanout to the TCP output node.
+fn enqueue_session_tcp_segment(
+    runtime: &mut DataPlaneMain,
+    sessions: &mut ServiceSessionWorker,
+    connection_index: u32,
+    next: SessionQueueNext,
+    segment: TcpSegment,
+) -> Result<bool, SessionError> {
+    let mut buffers = [0u32; 1];
+    if runtime.buffer_alloc(&mut buffers) == 0 {
+        return Ok(false);
+    }
+    if let Err(source) = segment.write_to_buffer(runtime.buffer_mut(buffers[0])) {
+        runtime.buffer_free_one(buffers[0]);
+        return Err(SessionError::TransportOpFailed { source });
+    }
+    let egress = hammer_core::buffer_opaque!(mut runtime.buffer_mut(buffers[0]) => TcpSecondaryOpaque)
+        .egress_mut();
+    egress.connection_index = connection_index;
+    egress.worker_index = sessions.worker_index();
+    sessions.add_pending_tx_buffer(runtime, buffers[0], next);
+    Ok(true)
+}
+
+/// VPP: tcp.c:1361-1369, tcp_update_time; tcp.c:1293-1335,
+/// tcp_dispatch_pending_timers.
+fn tcp_session_update_time(
+    runtime: &mut DataPlaneMain,
+    sessions: &mut ServiceSessionWorker,
+    now: f64,
+) -> Result<(), SessionError> {
+    let tcp = TCP_MAIN
+        .get()
+        .expect("TCP Main remains published while its time subscriber is registered");
+    let worker_index = sessions.worker_index();
+    <TcpMain as Transport<IpTransportEndpointConfig>>::update_time(tcp, now, worker_index);
+    let mut worker = tcp
+        .worker(runtime.thread_index())
+        .map_err(|source| SessionError::TransportOpFailed { source })?;
+    let now = worker.last_timer_update;
+    for _ in 0..worker.max_timers_per_loop {
+        let Some(token) = worker.take_pending_timer() else {
+            break;
+        };
+        let (session_index, outcome, is_ip4) = {
+            let worker::TcpWorker {
+                connections,
+                lookup,
+                timer_wheel,
+                ..
+            } = &mut *worker;
+            let Some(connection) = connections.get_mut(token.index) else {
+                continue;
+            };
+            let session_index = connection.session_id();
+            let capabilities = lookup
+                .pending_open_capabilities(session_index)
+                .unwrap_or_default();
+            let outcome = connection
+                .on_typed_timer_expiry(token.index, timer_wheel, token.kind, capabilities, now)
+                .map_err(|source| SessionError::TransportOpFailed { source })?;
+            (session_index, outcome, connection.remote().is_ipv4())
+        };
+        if let Some(action) = outcome.action {
+            let counter = match action {
+                connection::TcpTimerAction::RtoRetransmit => TcpNodeError::Retransmit,
+                connection::TcpTimerAction::RackRetransmit => TcpNodeError::RackRetransmit,
+                connection::TcpTimerAction::TlpProbe => TcpNodeError::TlpProbe,
+                connection::TcpTimerAction::PersistProbe => TcpNodeError::PersistProbe,
+                connection::TcpTimerAction::KeepaliveProbe => TcpNodeError::KeepaliveProbe,
+            };
+            runtime
+                .record_current_node_error(counter)
+                .expect("TCP timer runs in the registered Session Queue Node");
+        }
+        let handle = ServiceSessionHandle {
+            worker_index,
+            session_index,
+        };
+        if let Some(segment) = outcome.segment {
+            if segment.payload_len() == 0 {
+                let next = worker.tco_next_node[usize::from(!is_ip4)];
+                enqueue_session_tcp_segment(runtime, sessions, token.index, next, segment)?;
+            } else if sessions.session_from_handle(handle).is_some() {
+                sessions.enqueue_ready(handle, tcp.protocol)?;
+            }
+        } else if matches!(
+            token.kind,
+            timers::TcpTimerKind::Retransmit
+                | timers::TcpTimerKind::Rack
+                | timers::TcpTimerKind::Tlp
+                | timers::TcpTimerKind::Persist
+                | timers::TcpTimerKind::Pacing
+        ) && sessions.session_from_handle(handle).is_some()
+        {
+            sessions.enqueue_ready(handle, tcp.protocol)?;
+        }
+    }
     Ok(())
 }
 

@@ -18,8 +18,8 @@ use hammer_infra::sync::SpinLock;
 use hammer_runtime::config::worker::worker_count;
 
 use super::core::{
-    SessionControlData, SessionEvent, SessionEventRecord, SessionEventType, SessionHandle,
-    SessionState, SessionWorker,
+    Session, SessionControlData, SessionEvent, SessionEventType, SessionHandle, SessionState,
+    SessionWorker,
 };
 use super::error::SessionError;
 use super::segment_manager::{
@@ -151,25 +151,24 @@ pub struct ApplicationConfig {
     pub segment: SegmentManagerProperties,
     pub add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     pub del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
-    pub accepted: fn(&mut SessionWorker, SessionHandle) -> Result<(), ApplicationError>,
+    pub accepted: fn(&mut Session) -> Result<(), ApplicationError>,
     pub connected: fn(
-        &mut SessionWorker,
         u32,
         u64,
-        Option<SessionHandle>,
+        Option<&mut Session>,
         Option<SessionError>,
     ) -> Result<(), ApplicationError>,
-    pub disconnected: fn(&mut SessionWorker, SessionHandle),
-    pub reset: fn(&mut SessionWorker, SessionHandle),
-    pub transport_closed: Option<fn(&mut SessionWorker, SessionHandle)>,
-    pub cleanup: Option<fn(&mut SessionWorker, SessionHandle, SessionCleanup)>,
-    pub half_open_cleanup: Option<fn(&mut SessionWorker, SessionHandle)>,
-    pub migrated: Option<fn(&mut SessionWorker, SessionHandle, SessionHandle)>,
+    pub disconnected: fn(&mut Session),
+    pub reset: fn(&mut Session),
+    pub transport_closed: Option<fn(&mut Session)>,
+    pub cleanup: Option<fn(&mut Session, SessionCleanup)>,
+    pub half_open_cleanup: Option<fn(&mut Session)>,
+    pub migrated: Option<fn(&mut Session, SessionHandle)>,
     pub listened:
         Option<fn(u32, u32, SessionHandle, Option<SessionError>) -> Result<(), ApplicationError>>,
     pub unlistened: Option<fn(u32, SessionHandle, u32, Option<SessionError>)>,
-    pub builtin_rx: Option<fn(&mut SessionWorker, SessionHandle)>,
-    pub builtin_tx: Option<fn(&mut SessionWorker, SessionHandle)>,
+    pub builtin_rx: Option<fn(&mut Session)>,
+    pub builtin_tx: Option<fn(&mut Session)>,
 }
 
 bitflags::bitflags! {
@@ -204,25 +203,24 @@ pub struct Application<'app> {
     flags: ApplicationFlags,
     add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
-    accepted: fn(&mut SessionWorker, SessionHandle) -> Result<(), ApplicationError>,
+    accepted: fn(&mut Session) -> Result<(), ApplicationError>,
     connected: fn(
-        &mut SessionWorker,
         u32,
         u64,
-        Option<SessionHandle>,
+        Option<&mut Session>,
         Option<SessionError>,
     ) -> Result<(), ApplicationError>,
-    disconnected: fn(&mut SessionWorker, SessionHandle),
-    reset: fn(&mut SessionWorker, SessionHandle),
-    transport_closed: Option<fn(&mut SessionWorker, SessionHandle)>,
-    cleanup: Option<fn(&mut SessionWorker, SessionHandle, SessionCleanup)>,
-    half_open_cleanup: Option<fn(&mut SessionWorker, SessionHandle)>,
-    migrated: Option<fn(&mut SessionWorker, SessionHandle, SessionHandle)>,
+    disconnected: fn(&mut Session),
+    reset: fn(&mut Session),
+    transport_closed: Option<fn(&mut Session)>,
+    cleanup: Option<fn(&mut Session, SessionCleanup)>,
+    half_open_cleanup: Option<fn(&mut Session)>,
+    migrated: Option<fn(&mut Session, SessionHandle)>,
     listened:
         Option<fn(u32, u32, SessionHandle, Option<SessionError>) -> Result<(), ApplicationError>>,
     unlistened: Option<fn(u32, SessionHandle, u32, Option<SessionError>)>,
-    builtin_rx: Option<fn(&mut SessionWorker, SessionHandle)>,
-    builtin_tx: Option<fn(&mut SessionWorker, SessionHandle)>,
+    builtin_rx: Option<fn(&mut Session)>,
+    builtin_tx: Option<fn(&mut Session)>,
     segment: SegmentManagerProperties,
     worker_maps: Pool<ApplicationWorkerMap>,
     name: String,
@@ -468,31 +466,25 @@ impl<'segment> AppWorker<'segment> {
 
     /// VPP: `app_worker_add_event`, application_worker.c:934-951.
     /// The first event schedules this app worker on its Session worker.
-    #[inline]
-    pub fn add_event(
-        &self,
-        runtime: &hammer_runtime::DataPlaneMain,
-        session_worker: &mut SessionWorker,
-        event: SessionEvent,
-    ) -> ApplicationEventResult {
-        let worker = event.session.worker_index;
-        assert_eq!(
-            session_worker.worker_index(),
-            worker,
-            "Application event must be delivered on its Session worker"
-        );
+    pub fn add_event(&self, session: &Session, event: SessionEventType) {
+        let worker = session.handle().worker_index;
         let slot = self
             .events_by_worker
             .get(worker as usize)
             .expect("Application event worker entry is preconstructed");
         // SAFETY: this Session worker is the sole executor of its event slot.
         let events = unsafe { &mut *slot.get() };
-        let was_empty = events.is_empty();
-        events.push(event);
-        if was_empty {
-            session_worker.program_app_worker(runtime, self.worker_index);
-        }
-        ApplicationEventResult::Queued
+        events.push(SessionEvent::from((event, session.handle().session_index)));
+    }
+
+    /// VPP: `app_worker_add_event_custom`, application_worker.c:954-967.
+    pub fn add_event_custom(&self, thread_index: u32, event: &SessionEvent) {
+        let slot = self
+            .events_by_worker
+            .get(thread_index as usize)
+            .expect("Application event worker entry is preconstructed");
+        // SAFETY: the selected Session worker exclusively mutates its slot.
+        unsafe { &mut *slot.get() }.push(*event);
     }
 
     #[inline(always)]
@@ -509,6 +501,7 @@ impl<'segment> AppWorker<'segment> {
     /// VPP: `app_worker_flush_events_inline`, session_input.c:80-389. The
     /// initial event count is bounded; a callback can append later events to
     /// the same worker slot without invalidating an outstanding Vec borrow.
+    #[inline(always)]
     pub fn flush_events(
         &self,
         application: &Application<'_>,
@@ -530,12 +523,28 @@ impl<'segment> AppWorker<'segment> {
             let event = unsafe { (&*slot.get())[consumed] };
             let event_type = SessionEventType::try_from(event.event_type)
                 .expect("AppWorker received a registered Session event type");
-            let valid_session = session_worker
-                .session(event.session.session_index)
-                .is_some_and(|session| {
-                    session.handle() == event.session
-                        && session.application_worker() == Some(self.worker_index)
-                });
+            let payload: [u64; 2] = event.into();
+            let handle = if matches!(
+                event_type,
+                SessionEventType::BuiltinRx
+                    | SessionEventType::TxMain
+                    | SessionEventType::Bound
+                    | SessionEventType::UnlistenReply
+            ) {
+                event.session_handle()
+            } else {
+                SessionHandle {
+                    worker_index: worker,
+                    session_index: event.session_index(),
+                }
+            };
+            let valid_session =
+                session_worker
+                    .session(handle.session_index)
+                    .is_some_and(|session| {
+                        session.handle() == handle
+                            && session.application_worker() == Some(self.worker_index)
+                    });
             if !self.app_is_builtin
                 && matches!(event_type, SessionEventType::Rx | SessionEventType::Tx)
             {
@@ -566,27 +575,29 @@ impl<'segment> AppWorker<'segment> {
                         break;
                     }
                 };
-                let record = SessionEventRecord::from(event);
                 producer
-                    .write(descriptor, &record)
-                    .expect("IO ring element matches the Session event record layout");
+                    .write(descriptor, &event)
+                    .expect("IO ring element matches the Session event layout");
                 producer
                     .add(descriptor)
                     .expect("locked, non-full Application MQ accepts allocated descriptor");
+                if event_type == SessionEventType::Rx && valid_session {
+                    session_worker
+                        .session_mut(handle.session_index)
+                        .expect("validated RX Session remains allocated")
+                        .clear_rx_event();
+                }
             } else {
                 match event_type {
                     SessionEventType::Rx | SessionEventType::BuiltinRx => {
                         if valid_session {
                             let session = session_worker
-                                .session(event.session.session_index)
+                                .session_mut(handle.session_index)
                                 .expect("validated RX Session remains allocated");
-                            session
-                                .rx_fifo()
-                                .expect("attached RX Session retains its FIFO")
-                                .unset_event();
+                            session.clear_rx_event();
                             if session.rx_ready() {
                                 if let Some(callback) = application.builtin_rx {
-                                    callback(session_worker, event.session);
+                                    callback(session);
                                 }
                             }
                         }
@@ -594,19 +605,28 @@ impl<'segment> AppWorker<'segment> {
                     SessionEventType::Tx | SessionEventType::TxMain => {
                         if valid_session {
                             if let Some(callback) = application.builtin_tx {
-                                callback(session_worker, event.session);
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated TX Session remains allocated");
+                                callback(session);
                             }
                         }
                     }
                     SessionEventType::Accepted => {
                         if valid_session {
                             let state = session_worker
-                                .session(event.session.session_index)
+                                .session(handle.session_index)
                                 .expect("validated accepted Session remains allocated")
                                 .load_state();
-                            if (application.accepted)(session_worker, event.session).is_err() {
+                            let accepted = {
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated accepted Session remains allocated");
+                                (application.accepted)(session).is_ok()
+                            };
+                            if !accepted {
                                 if let Some(session) =
-                                    session_worker.session_mut(event.session.session_index)
+                                    session_worker.session_mut(handle.session_index)
                                 {
                                     session.detach_application();
                                 }
@@ -622,7 +642,7 @@ impl<'segment> AppWorker<'segment> {
                                 // VPP: session_input.c:157-195. The accept callback
                                 // may have set Ready after transport close began.
                                 let session = session_worker
-                                    .session_mut(event.session.session_index)
+                                    .session_mut(handle.session_index)
                                     .expect("accepted Session remains allocated after callback");
                                 let app_closed = matches!(
                                     state,
@@ -643,40 +663,41 @@ impl<'segment> AppWorker<'segment> {
                                     .is_some_and(|fifo| fifo.max_dequeue() != 0);
                                 if rx_pending {
                                     if let Some(callback) = application.builtin_rx {
-                                        callback(session_worker, event.session);
+                                        callback(session);
                                     }
                                 }
                                 if !app_closed {
-                                    (application.disconnected)(session_worker, event.session);
+                                    (application.disconnected)(session);
                                 }
-                            } else if let Some(session) = session_worker
-                                .session_mut(event.session.session_index)
+                            } else if let Some(session) =
+                                session_worker.session_mut(handle.session_index)
                             {
                                 session.set_rx_ready(true);
                             }
                         }
                     }
                     SessionEventType::Connected => {
-                        let session = valid_session.then_some(event.session);
-                        if (application.connected)(
-                            session_worker,
+                        let connected = (application.connected)(
                             self.worker_index,
-                            event.payload[0],
-                            session,
+                            payload[1] >> 32,
+                            if valid_session {
+                                session_worker.session_mut(handle.session_index)
+                            } else {
+                                None
+                            },
                             None,
                         )
-                        .is_err()
-                        {
+                        .is_ok();
+                        if !connected {
                             if valid_session {
                                 if let Some(session) =
-                                    session_worker.session_mut(event.session.session_index)
+                                    session_worker.session_mut(handle.session_index)
                                 {
                                     session.detach_application();
                                 }
                             }
                         } else if valid_session {
-                            if let Some(session) =
-                                session_worker.session_mut(event.session.session_index)
+                            if let Some(session) = session_worker.session_mut(handle.session_index)
                             {
                                 session.set_rx_ready(true);
                             }
@@ -684,31 +705,48 @@ impl<'segment> AppWorker<'segment> {
                     }
                     SessionEventType::Disconnected | SessionEventType::Reset => {
                         if valid_session {
-                            if let Some(session) =
-                                session_worker.session_mut(event.session.session_index)
+                            if let Some(session) = session_worker.session_mut(handle.session_index)
                             {
                                 session.set_rx_ready(false);
                             }
                             if event_type == SessionEventType::Disconnected {
-                                (application.disconnected)(session_worker, event.session);
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated disconnect Session remains allocated");
+                                (application.disconnected)(session);
                             } else {
-                                (application.reset)(session_worker, event.session);
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated reset Session remains allocated");
+                                (application.reset)(session);
                             }
                         }
                     }
                     SessionEventType::TransportClosed => {
                         if valid_session {
                             if let Some(callback) = application.transport_closed {
-                                callback(session_worker, event.session);
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated transport-closed Session remains allocated");
+                                callback(session);
                             }
                         }
                     }
                     SessionEventType::Cleanup => {
-                        let cleanup = SessionCleanup::try_from(event.operation)
+                        let cleanup = SessionCleanup::try_from((payload[0] >> 32) as u8)
                             .expect("Session cleanup event has a registered stage");
                         if valid_session {
                             if let Some(callback) = application.cleanup {
-                                callback(session_worker, event.session, cleanup);
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated cleanup Session remains allocated");
+                                callback(session, cleanup);
+                            }
+                            if cleanup == SessionCleanup::Session {
+                                session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("Application cleanup retains its Session")
+                                    .detach_application();
                             }
                         }
                         // VPP session_input.c:282-305 skips the application
@@ -717,41 +755,46 @@ impl<'segment> AppWorker<'segment> {
                         // pool slot or a Session attached to another worker.
                         if cleanup == SessionCleanup::Session
                             && session_worker
-                                .session_from_handle(event.session)
+                                .session_from_handle(handle)
                                 .is_some_and(|session| {
                                     session.application_worker().is_none()
                                         || session.application_worker() == Some(self.worker_index)
                                 })
                         {
                             session_worker
-                                .cleanup(event.session)
+                                .cleanup(handle)
                                 .expect("validated Session remains allocated until cleanup");
                         }
                     }
                     SessionEventType::HalfCleanup => {
-                        if let Some(callback) = application.half_open_cleanup {
-                            callback(session_worker, event.session);
+                        if valid_session {
+                            if let Some(callback) = application.half_open_cleanup {
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated half-open Session remains allocated");
+                                callback(session);
+                            }
                         }
                     }
                     SessionEventType::Migrated => {
                         if valid_session {
                             if let Some(callback) = application.migrated {
                                 let destination = SessionHandle {
-                                    session_index: event.payload[1] as u32,
-                                    worker_index: (event.payload[1] >> 32) as u32,
+                                    session_index: payload[1] as u32,
+                                    worker_index: (payload[1] >> 32) as u32,
                                 };
-                                callback(session_worker, event.session, destination);
+                                let session = session_worker
+                                    .session_mut(handle.session_index)
+                                    .expect("validated migrated Session remains allocated");
+                                callback(session, destination);
                             }
                         }
                     }
                     SessionEventType::Bound => {
                         if let Some(callback) = application.listened {
-                            if let Err(source) = callback(
-                                self.worker_index,
-                                event.control_data_index,
-                                event.session,
-                                None,
-                            ) {
+                            if let Err(source) =
+                                callback(self.worker_index, (payload[1] >> 32) as u32, handle, None)
+                            {
                                 callback_error = Some(source);
                                 break;
                             }
@@ -759,12 +802,7 @@ impl<'segment> AppWorker<'segment> {
                     }
                     SessionEventType::UnlistenReply => {
                         if let Some(callback) = application.unlistened {
-                            callback(
-                                self.worker_index,
-                                event.session,
-                                event.control_data_index,
-                                None,
-                            );
+                            callback(self.worker_index, handle, (payload[1] >> 32) as u32, None);
                         }
                     }
                     SessionEventType::AppAddSegment | SessionEventType::AppDelSegment => {
@@ -773,7 +811,7 @@ impl<'segment> AppWorker<'segment> {
                         } else {
                             application.del_segment
                         };
-                        if let Err(source) = callback(self.worker_index, event.payload[1]) {
+                        if let Err(source) = callback(self.worker_index, payload[1]) {
                             callback_error = Some(source);
                             break;
                         }
@@ -891,16 +929,17 @@ impl<'app> ApplicationMain<'app> {
         // owns the current execution interval.
         let application_record = unsafe { self.application(application) }
             .expect("Application listener retains its owning Application");
-        let worker = application_record
-            .worker(worker_map)
-            .ok_or(ApplicationError::WorkerMissing {
-                application,
-                worker: worker_map,
-            })?;
+        let worker =
+            application_record
+                .worker(worker_map)
+                .ok_or(ApplicationError::WorkerMissing {
+                    application,
+                    worker: worker_map,
+                })?;
         // SAFETY: AppWorker pool entries are barrier-published and remain live
         // while their ApplicationListener accepts Sessions.
-        let app_worker = unsafe { self.worker(worker) }
-            .expect("accepting worker map retains its AppWorker");
+        let app_worker =
+            unsafe { self.worker(worker) }.expect("accepting worker map retains its AppWorker");
         if app_worker.mq_congested.load(Ordering::Acquire) != 0 {
             return Ok(ApplicationEventResult::Deferred);
         }
@@ -930,19 +969,12 @@ impl<'app> ApplicationMain<'app> {
                     panic!("installed listener Segment Manager accepts this Session worker")
                 }
             })?;
-        let event = SessionEvent {
-            event_type: u8::from(SessionEventType::Accepted),
-            postponed: false,
-            protocol: session_worker
-                .session_from_handle(session)
-                .expect("accepted Session remains allocated")
-                .transport_protocol(),
-            operation: 0,
-            session,
-            control_data_index: u32::MAX,
-            payload: [0; 2],
-        };
-        Ok(app_worker.add_event(runtime, session_worker, event))
+        let accepted = session_worker
+            .session_from_handle(session)
+            .expect("accepted Session remains allocated after FIFO attachment");
+        app_worker.add_event(accepted, SessionEventType::Accepted);
+        session_worker.program_app_worker(runtime, app_worker.index());
+        Ok(ApplicationEventResult::Queued)
     }
 
     /// VPP: `app_listener_alloc`, application.c:24-38. The accepting-worker
@@ -981,7 +1013,7 @@ impl<'app> ApplicationMain<'app> {
     /// VPP: `app_worker_listen_sep`, application_worker.c:230-322.
     pub fn attach_listener_session(
         &self,
-        session_main: &super::core::SessionMain<u32>,
+        session_main: &super::core::SessionMain,
         listener: u32,
         global: Option<SessionHandle>,
         local: Option<SessionHandle>,
@@ -1164,7 +1196,7 @@ impl<'app> ApplicationMain<'app> {
     /// transport owner stops the listening connection before this call.
     pub fn remove_listener(
         &self,
-        session_main: &super::core::SessionMain<u32>,
+        session_main: &super::core::SessionMain,
         listener: u32,
     ) -> Result<(), ApplicationError> {
         assert!(
@@ -1634,7 +1666,7 @@ impl<'app> ApplicationMain<'app> {
     #[inline]
     pub fn listener_for_session(
         &self,
-        session_main: &super::core::SessionMain<u32>,
+        session_main: &super::core::SessionMain,
         session: SessionHandle,
     ) -> Option<u32> {
         let listener = session_main.application_listener(session)?;

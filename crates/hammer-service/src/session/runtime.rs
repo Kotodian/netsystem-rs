@@ -1388,12 +1388,7 @@ impl SessionWorker {
         };
         let reset_stream = transport_vft(transport)
             .and_then(|vft| vft.reset_stream)
-            .ok_or(SessionError::TransportOpFailed {
-                source: crate::transport::TransportError::OperationUnsupported {
-                    operation: "reset_stream",
-                }
-                .into(),
-            })?;
+            .ok_or(SessionError::NotSupported)?;
         if !self.entry_app_close_guard(session_id)? {
             return Ok(());
         }
@@ -1417,12 +1412,7 @@ impl SessionWorker {
         };
         let stop_sending = transport_vft(transport)
             .and_then(|vft| vft.stop_sending)
-            .ok_or(SessionError::TransportOpFailed {
-                source: crate::transport::TransportError::OperationUnsupported {
-                    operation: "stop_sending",
-                }
-                .into(),
-            })?;
+            .ok_or(SessionError::NotSupported)?;
         let active = matches!(
             self.entries
                 .get(session_id)
@@ -1465,12 +1455,7 @@ impl SessionWorker {
         };
         let close_connection = transport_vft(transport)
             .and_then(|vft| vft.close_connection)
-            .ok_or(SessionError::TransportOpFailed {
-                source: crate::transport::TransportError::OperationUnsupported {
-                    operation: "close_connection",
-                }
-                .into(),
-            })?;
+            .ok_or(SessionError::NotSupported)?;
         if !self.entry_app_close_guard(connection)? {
             return Ok(());
         }

@@ -6,7 +6,6 @@ use hammer_runtime::app::{SessionControlError, SessionHandle};
 use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
 
-
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
 pub enum SessionQueueError {
