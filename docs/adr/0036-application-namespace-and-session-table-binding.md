@@ -6,6 +6,8 @@
 - VPP 基线：`third_party/vpp`，提交
   `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`
 - 前置决定：ADR-0035
+- Owner 迁移（2026-09-28）：generic namespace 从已删除的 `hammer-app` 移至
+  `hammer-service::session::namespace`；IP binding 仍属于 plugin-session。
 
 本文继续 ADR-0035，记录 App Namespace、Session table、当前 Binary API request/reply 和
 外部 client 的实施决定。
@@ -15,7 +17,7 @@ connection 或 MQ。它们在后续迁移中再接入 namespace。
 
 ## 1. 决定
 
-`hammer-app` 只提供 generic namespace owner：
+`hammer-service::session` 提供 generic namespace owner：
 
 ```rust
 pub struct AppNamespace<B> {
@@ -29,7 +31,7 @@ pub struct AppNamespaceMain<B> {
 }
 ```
 
-`B` 是 namespace 直接拥有的 binding。`hammer-app` 不知道 IP、FIB、interface 或 Session
+`B` 是 namespace 直接拥有的 binding。service 的 generic namespace 不知道 IP、FIB、interface 或 Session
 table，也不保存另一张 `u32 -> binding` side table。
 
 `hammer-plugin-session` 拥有其余 concrete state：
@@ -56,9 +58,8 @@ IP6 FIB。generic namespace 没有 FIB 概念，plugin 边界也不传 `[u32; 2]
 
 ```text
 hammer-plugin-session
-  -> hammer-app                    generic namespace storage
+  -> hammer-service::session       generic namespace storage and Session table types
   -> hammer-plugin-ip              interface/FIB operations
-  -> hammer-service                generic Session table types
   -> hammer-ipc                    Binary API capability
 ```
 
@@ -68,7 +69,7 @@ Namespace 协议。`hammer-plugin-session` 直接声明当前 Session API messag
 namespace index 直接使用 pool index `u32`，invalid sentinel 是 `u32::MAX`。不增加 index
 newtype、dynamic dispatch、capability registry 或 callback access。
 
-## 2. `hammer-app` owner
+## 2. `hammer-service::session` owner
 
 ### 2.1 类型
 
@@ -204,7 +205,7 @@ retval enum。
 ```rust
 use std::sync::OnceLock;
 
-use hammer_app::{AppNamespace, AppNamespaceMain};
+use hammer_service::session::namespace::{AppNamespace, AppNamespaceMain};
 use hammer_service::net::FibSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -651,7 +652,7 @@ Session Binary API hookup
 
 迁移顺序：
 
-1. 在 `hammer-app` 增加 `AppNamespace<B>` 与 `AppNamespaceMain<B>`。
+1. 在 `hammer-service::session::namespace` 提供 `AppNamespace<B>` 与 `AppNamespaceMain<B>`。
 2. 在 plugin/ip 补 table-id lookup 和 source-based FIB lock/unlock。
 3. 在 plugin/session 声明 request-specific `AppNamespaceAddDelRetval`，增加 local table、
    association operations、`IpNamespaceBinding`、`IpNamespaceMain` 和 default namespace。
@@ -662,7 +663,7 @@ Session Binary API hookup
 
 ## 11. 实施 surface
 
-- hammer-app：`AppNamespace<B>`、`AppNamespaceMain<B>` 和本文列出的方法；
+- hammer-service/session：`AppNamespace<B>`、`AppNamespaceMain<B>` 和本文列出的方法；
 - plugin/ip：单-family table-id lookup、FIB lock/unlock；
 - plugin/session：`AppNamespaceAddDelRetval`、local table、五个 table operations、
   `IpNamespaceBinding`、`IpNamespaceMain`、global accessor、default namespace 和当前 Binary

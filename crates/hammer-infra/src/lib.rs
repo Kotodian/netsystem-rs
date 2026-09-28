@@ -13,7 +13,6 @@ pub mod map;
 pub mod mask_compare;
 pub mod mem;
 pub mod mtrie;
-pub mod multi_ring_msg_queue;
 pub mod physmem;
 pub mod pmalloc;
 pub mod pool;

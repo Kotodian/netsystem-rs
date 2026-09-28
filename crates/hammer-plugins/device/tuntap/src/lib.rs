@@ -797,5 +797,4 @@ hammer_component_macros::declare_plugin!(
     ],
     node_functions = [],
     process_nodes = [],
-    binary_api_methods = [],
 );

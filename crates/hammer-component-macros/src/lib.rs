@@ -2222,14 +2222,6 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-struct BinaryApiArgs {
-    name: LitStr,
-    /// Bare `mp_safe` marker, after VPP's `vl_msg_api_msg_config_t`
-    /// `is_mp_safe` bit (api_common.h:122): absent means the legacy barriered
-    /// dispatch.
-    mp_safe: bool,
-}
-
 struct RuntimeErrorArgs {
     subsystem: LitStr,
 }
@@ -2333,153 +2325,6 @@ fn expand_runtime_error(args: RuntimeErrorArgs, item: Item) -> Result<TokenStrea
                 ::hammer_runtime::RuntimeError::subsystem(#subsystem, source)
             }
         }
-    })
-}
-
-impl Parse for BinaryApiArgs {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
-        let mut name: Option<LitStr> = None;
-        let mut mp_safe = false;
-        while !input.is_empty() {
-            let key: Ident = input.parse()?;
-            match key.to_string().as_str() {
-                "name" => {
-                    input.parse::<Token![=]>()?;
-                    if name.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `name` argument"));
-                    }
-                    let value: LitStr = input.parse()?;
-                    if value.value().trim().is_empty() {
-                        return Err(Error::new(value.span(), "Binary API method name is empty"));
-                    }
-                    name = Some(value);
-                }
-                "mp_safe" => {
-                    if input.peek(Token![=]) {
-                        return Err(Error::new(
-                            key.span(),
-                            "the `mp_safe` argument takes no value; write `mp_safe` alone",
-                        ));
-                    }
-                    if mp_safe {
-                        return Err(Error::new(key.span(), "duplicate `mp_safe` argument"));
-                    }
-                    mp_safe = true;
-                }
-                other => {
-                    return Err(Error::new(
-                        key.span(),
-                        format!(
-                            "unknown Binary API argument `{other}`; expected `name` or `mp_safe`"
-                        ),
-                    ));
-                }
-            }
-            if input.is_empty() {
-                break;
-            }
-            input.parse::<Token![,]>()?;
-        }
-        let name = name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?;
-        Ok(Self { name, mp_safe })
-    }
-}
-
-/// Registers one protobuf request/reply handler in the current link image.
-#[proc_macro_attribute]
-pub fn binary_api(args: TokenStream, input: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(args as BinaryApiArgs);
-    let function = parse_macro_input!(input as ItemFn);
-    expand_binary_api(args, function)
-        .unwrap_or_else(Error::into_compile_error)
-        .into()
-}
-
-fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStream2> {
-    if function.sig.asyncness.is_some()
-        || function.sig.unsafety.is_some()
-        || function.sig.abi.is_some()
-        || function.sig.variadic.is_some()
-        || !function.sig.generics.params.is_empty()
-    {
-        return Err(Error::new_spanned(
-            &function.sig,
-            "Binary API handlers must be synchronous, safe, non-generic Rust functions",
-        ));
-    }
-    let inputs = function.sig.inputs.iter().collect::<Vec<_>>();
-    let [FnArg::Typed(request)] = inputs.as_slice() else {
-        return Err(Error::new_spanned(
-            &function.sig.inputs,
-            "Binary API handlers must accept exactly one protobuf request by value",
-        ));
-    };
-    if !request.attrs.is_empty() {
-        return Err(Error::new_spanned(
-            &request.attrs[0],
-            "Binary API request parameters do not accept attributes",
-        ));
-    }
-    let function_name = &function.sig.ident;
-    let ReturnType::Type(_, reply_ty) = &function.sig.output else {
-        return Err(Error::new_spanned(
-            &function.sig.output,
-            "Binary API handlers must return one protobuf reply",
-        ));
-    };
-    let request_ty = &request.ty;
-    let adapter_name = format_ident!("__hammer_binary_api_adapter_{}", function_name);
-    let static_name = format_ident!(
-        "__BINARY_API_{}",
-        to_snake_case(&function_name.to_string()).to_ascii_uppercase()
-    );
-    let name = args.name;
-    // Absent `mp_safe` keeps the legacy `new` constructor (barriered); the
-    // bare marker appends the mp-safe builder, after VPP's `is_mp_safe` flag.
-    let entry = if args.mp_safe {
-        quote! {
-            ::hammer_runtime::__private::BinaryApiMethodEntry::new(#name, #adapter_name).mp_safe()
-        }
-    } else {
-        quote! {
-            ::hammer_runtime::__private::BinaryApiMethodEntry::new(#name, #adapter_name)
-        }
-    };
-    let conditional_attributes: Vec<_> = function
-        .attrs
-        .iter()
-        .filter(|attribute| {
-            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
-        })
-        .cloned()
-        .collect();
-
-    Ok(quote! {
-        #function
-
-        #(#conditional_attributes)*
-        fn #adapter_name(
-            __hammer_request: ::hammer_runtime::__private::RSlice<'_, u8>,
-        ) -> ::hammer_runtime::__private::BinaryApiMethodReply {
-            let __hammer_request = match <#request_ty as ::prost::Message>::decode(
-                __hammer_request.as_slice(),
-            ) {
-                Ok(request) => request,
-                Err(_) => {
-                    return ::hammer_runtime::__private::BinaryApiMethodReply::invalid_request();
-                }
-            };
-            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                let __hammer_reply: #reply_ty = #function_name(__hammer_request);
-                <#reply_ty as ::prost::Message>::encode_to_vec(&__hammer_reply)
-            })) {
-                Ok(payload) => ::hammer_runtime::__private::BinaryApiMethodReply::ok(payload),
-                Err(_) => ::hammer_runtime::__private::BinaryApiMethodReply::panicked(),
-            }
-        }
-
-        #(#conditional_attributes)*
-        pub(crate) static #static_name: ::hammer_runtime::__private::BinaryApiMethodEntry = #entry;
     })
 }
 
@@ -3689,7 +3534,6 @@ struct PluginArgs {
     graph_nodes: Vec<Path>,
     node_functions: Vec<Path>,
     process_nodes: Vec<Path>,
-    binary_api_methods: Vec<Path>,
     stats_registrations: Vec<Path>,
 }
 
@@ -3707,7 +3551,6 @@ impl Parse for PluginArgs {
         let mut graph_nodes = Vec::new();
         let mut node_functions = Vec::new();
         let mut process_nodes = Vec::new();
-        let mut binary_api_methods = Vec::new();
         let mut stats_registrations = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -3736,7 +3579,6 @@ impl Parse for PluginArgs {
                 "graph_nodes" => graph_nodes = parse_path_array(input)?,
                 "node_functions" => node_functions = parse_path_array(input)?,
                 "process_nodes" => process_nodes = parse_path_array(input)?,
-                "binary_api_methods" => binary_api_methods = parse_path_array(input)?,
                 "stats_registrations" => stats_registrations = parse_path_array(input)?,
                 other => {
                     return Err(Error::new(
@@ -3762,7 +3604,6 @@ impl Parse for PluginArgs {
             graph_nodes,
             node_functions,
             process_nodes,
-            binary_api_methods,
             stats_registrations,
         })
     }
@@ -4242,7 +4083,6 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let graph_nodes = &args.graph_nodes;
     let node_functions = &args.node_functions;
     let process_nodes = &args.process_nodes;
-    let binary_api_methods = &args.binary_api_methods;
     let stats_registrations = &args.stats_registrations;
     let dependencies_ident = format_ident!(
         "__PLUGIN_LOAD_AFTER_{}",
@@ -4260,7 +4100,6 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
             graph_nodes = [#(#graph_nodes),*];
             node_functions = [#(#node_functions),*];
             process_nodes = [#(#process_nodes),*];
-            binary_api_methods = [#(#binary_api_methods),*];
             stats_registrations = [#(#stats_registrations),*];
         );
 

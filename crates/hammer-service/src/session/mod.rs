@@ -3,35 +3,24 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use hammer_core::data_plane::{NodeId, NodeState};
+use hammer_core::data_plane::NodeState;
 use hammer_infra::svm::fifo_segment::{FifoSegmentError, SvmFifoSegment, SvmFifoSegmentConfig};
 use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
-use hammer_runtime::attach::AppServer;
 use hammer_runtime::{DataPlaneMain, RuntimeResult};
 
 pub mod app;
-#[deprecated(note = "Legacy Application path; new Application ownership belongs in session::app")]
-pub mod application;
 pub mod config;
-mod control;
 pub mod core;
 pub mod endpoint;
 pub mod error;
-#[deprecated(note = "Legacy external App Session path; use session::app")]
-pub mod legacy_app;
 pub mod lookup;
+pub mod namespace;
 pub mod node;
-pub mod protocol;
-pub mod runtime;
 pub mod segment_manager;
-pub mod state;
 pub mod table;
 
 pub use app::{ApplicationConfig, ApplicationEventResult, ApplicationFlags, SessionCleanup};
-pub use application::{
-    APPLICATION_MAIN, AppWorker, ApplicationConfig, ApplicationError, ApplicationFlags,
-    ApplicationListener, ApplicationMain, ApplicationMqResources, application_main,
-};
+pub use app::{ApplicationError, ApplicationMain, ApplicationListener, AppWorker};
 pub use config::Session as SessionSettings;
 pub use core::{
     PoolReallocationState, RxDelivery, SESSION_E_ALLOC, SESSION_E_INVALID, SESSION_E_MQ_MSG_ALLOC,
@@ -46,15 +35,11 @@ pub use core::{
     enqueue_notify, program_transport_io_event, program_tx_io_event,
 };
 pub use endpoint::{SessionEndpoint, SessionEndpointConfig, SessionEndpointFlags};
-pub use error::{SessionConnectError, SessionError, SessionQueueError};
-pub use legacy_app::AppWorker;
+pub use error::{SessionError, SessionQueueError};
 pub use lookup::{SessionLookup, SessionLookupResult};
 pub use node::{
-    AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionInputNode, SessionQueueNext,
-    SessionQueueNode,
+    SESSION_QUEUE_IO_BUDGET, SessionInputNode, SessionQueueNext, SessionQueueNode,
 };
-pub use protocol::{SessionAppVft, register_session_app};
-pub use runtime::{SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, session_main};
 pub use segment_manager::{
     SegmentManager, SegmentManagerError, SegmentManagerFlags, SegmentManagerMain,
     SegmentManagerProperties,
@@ -62,12 +47,6 @@ pub use segment_manager::{
 pub use table::SessionTable;
 
 static SESSION_CONFIG: OnceLock<config::Session> = OnceLock::new();
-static APP_SERVER: OnceLock<Arc<AppServer>> = OnceLock::new();
-static APP_SESSION_INPUT_NODE: OnceLock<NodeId> = OnceLock::new();
-
-pub fn app_server() -> Option<Arc<AppServer>> {
-    APP_SERVER.get().map(Arc::clone)
-}
 
 pub fn session_config() -> &'static config::Session {
     SESSION_CONFIG
@@ -93,7 +72,7 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<()> 
 
 #[hammer_component_macros::init_function(
     name = "session_init",
-    runs_after = ["transport_main_init", "application_init", "session_attach_server"]
+    runs_after = ["application_init"]
 )]
 fn init_session() -> RuntimeResult<()> {
     let settings = session_config();
@@ -135,28 +114,17 @@ fn init_session() -> RuntimeResult<()> {
     )
     .map_err(|source| SessionQueueError::SegmentCreate { source })?;
     core::SessionMain::init(config, segment)?;
-    runtime::SessionMain::init(hammer_runtime::config::worker::worker_count())
-}
-
-#[hammer_component_macros::main_loop_exit_function]
-fn exit_session() -> RuntimeResult<()> {
-    if let Ok(session) = runtime::SessionMain::global() {
-        session.begin_session_migration_shutdown();
-    }
     Ok(())
 }
 
-#[hammer_component_macros::init_function(
-    name = "application_init",
-    runs_after = ["transport_main_init"]
-)]
+#[hammer_component_macros::init_function(name = "application_init")]
 fn init_application() -> RuntimeResult<()> {
     SegmentManagerMain::init(SegmentManagerProperties::default());
     app::ApplicationMain::init(
         u32::try_from(hammer_runtime::config::worker::worker_count())
             .expect("configured worker count fits u32"),
     )?;
-    ApplicationMain::init()
+    Ok(())
 }
 
 #[hammer_component_macros::worker_init_function(name = "session_worker_init")]
@@ -190,39 +158,5 @@ fn init_session_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
             NodeState::Disabled
         },
     )?;
-    let app_session_input = engine
-        .node_by_name("appsl-rx-mqs-input")
-        .ok_or(error::SessionQueueError::NodeMissing)?;
-    if let Some(installed) = APP_SESSION_INPUT_NODE.get() {
-        assert_eq!(
-            *installed, app_session_input,
-            "Session workers share graph node identities"
-        );
-    } else {
-        APP_SESSION_INPUT_NODE
-            .set(app_session_input)
-            .expect("Session input node identity is installed once");
-    }
-    engine
-        .nodes()
-        .set_node_state(app_session_input, NodeState::Disabled)?;
-    runtime::install_session_worker(engine, app_session_input, session_queue)?;
-    Ok(())
-}
-
-#[hammer_component_macros::init_function(
-    name = "session_attach_server",
-    runs_after = ["application_init"]
-)]
-fn configure_attach_server() -> RuntimeResult<()> {
-    let session = session_config();
-    let Some(path) = session.attach_socket_path.as_deref() else {
-        return Ok(());
-    };
-    let server = Arc::new(AppServer::bind(path, session.app_session_capacity)?);
-    assert!(
-        APP_SERVER.set(server).is_ok(),
-        "Session attach server configuration callback executes once"
-    );
     Ok(())
 }

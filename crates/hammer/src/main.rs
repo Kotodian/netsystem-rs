@@ -1,10 +1,8 @@
 //! hammer — VPP-clone daemon
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::OnceLock;
 
-use hammer_runtime::attach::AppServer;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
 use hammer_runtime::{
@@ -182,51 +180,8 @@ fn run(
 }
 
 async fn run_main_thread(unix: &mut UnixMain) -> RuntimeResult<i32> {
-    let attach_server = hammer_service::session::app_server();
-    let applications = hammer_service::session::ApplicationMain::global()?;
     tracing::info!("hammer started");
-    let exit_signal = unix.wait_for_exit_signal();
-    let attach = serve_applications(attach_server, applications);
-    tokio::pin!(exit_signal);
-    tokio::pin!(attach);
-    loop {
-        tokio::select! {
-            status = &mut exit_signal => return status,
-            result = &mut attach => {
-                result?;
-                return Err(RuntimeError::service_closed());
-            }
-        }
-    }
-}
-
-async fn serve_applications(
-    attach_server: Option<Arc<AppServer>>,
-    applications: &'static hammer_service::session::ApplicationMain,
-) -> RuntimeResult<()> {
-    let Some(attach) = attach_server else {
-        return std::future::pending::<RuntimeResult<()>>().await;
-    };
-    let attach_applications = applications;
-    let publish_applications = applications;
-    let detach_applications = applications;
-    attach
-        .serve(
-            move || attach_applications.attach_external_with_runtime(),
-            move |application| publish_applications.application_mq_publication(application),
-            move |application, requests, replies| {
-                hammer_service::session::runtime::SessionMain::global()?
-                    .dispatch_application_session_mq(application, requests, replies)
-            },
-            move |application| {
-                if detach_applications.contains(application).unwrap_or(false)
-                    && let Err(error) = detach_applications.detach(application)
-                {
-                    tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
-                }
-            },
-        )
-        .await
+    unix.wait_for_exit_signal().await
 }
 
 fn read_config(path: &Path) -> std::io::Result<String> {

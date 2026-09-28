@@ -1,18 +1,11 @@
-use std::time::Instant;
-
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
-use hammer_runtime::{DataPlaneMain, DriverNode, Node, NodeProcessFn, NodeRuntime};
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, DriverNode, Node, NodeRuntime, RuntimeError, RuntimeResult};
 
-use crate::session::SessionQueueError;
-use crate::session::runtime::{SessionMain, SessionWorker};
-use crate::session::{app, core};
+use crate::session::{SessionQueueError, app, core};
 
-/// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
 
-/// VPP: `session_input_node`, session_input.c:350-405. This service node
-/// consumes pending AppWorker events; plugin-session supplies no node code.
+/// VPP: session_input.c:350-405.
 #[hammer_component_macros::graph_node(
     graph = session,
     init = crate::session::node::register_session_input_node,
@@ -39,8 +32,6 @@ impl Node for SessionInputNode {
         let pending = match app::ApplicationMain::global() {
             Some(application_main) => match application_main.flush_worker_events(session_worker) {
                 Ok(pending) => pending,
-                // VPP: session_input.c:359-385 keeps unflushed events pending
-                // and reschedules session-input without logging in the node.
                 Err(_) => true,
             },
             None => false,
@@ -51,7 +42,7 @@ impl Node for SessionInputNode {
                 .expect("session-input is executing as a Graph Node");
             runtime
                 .set_node_interrupt_pending(node)
-                .expect("session-input can reschedule its pending AppWorker events");
+                .expect("session-input can reschedule pending events");
         }
         vectors
     }
@@ -67,86 +58,6 @@ impl DriverNode for SessionInputNode {
     }
 }
 
-#[hammer_component_macros::graph_node(
-    graph = session,
-    init = crate::session::node::register_app_session_input_node,
-    name = "appsl-rx-mqs-input",
-    kind = driver,
-)]
-#[derive(Clone, Copy, Default)]
-pub struct AppSessionInputNode;
-
-pub fn register_app_session_input_node(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    if let Some(node) = runtime.nodes().node_by_name("appsl-rx-mqs-input") {
-        return Ok(node);
-    }
-    runtime.nodes().try_register_driver(AppSessionInputNode)
-}
-
-impl AppSessionInputNode {
-    pub fn worker_runtime_data(
-        session_queue_data: NodeRuntime,
-        session_queue: NodeId,
-    ) -> NodeRuntime {
-        NodeRuntime::from_words([
-            session_queue_data.word(0),
-            session_queue.slot().into(),
-            0,
-            0,
-        ])
-    }
-}
-
-impl Node for AppSessionInputNode {
-    fn process(
-        runtime: &mut DataPlaneMain,
-        node_runtime: &mut hammer_runtime::NodeRuntime,
-        frame: &mut Frame,
-    ) -> usize {
-        let process: NodeProcessFn = app_session_input_node_process;
-        process(runtime, node_runtime, frame)
-    }
-}
-
-impl DriverNode for AppSessionInputNode {
-    #[inline]
-    fn node_registration(&self) -> Option<NodeRegistration>
-    where
-        Self: Sized,
-    {
-        Some(NodeRegistration::next("appsl-rx-mqs-input", 0))
-    }
-}
-
-fn app_session_input_node_process(
-    runtime: &mut DataPlaneMain,
-    data: &mut NodeRuntime,
-    frame: &mut Frame,
-) -> usize {
-    let processed_vectors = frame.len();
-    (|| {
-        let _ = (|| {
-            let handled = SessionQueueNode::poll_app(runtime, *data)?;
-            if handled != 0 && SessionQueueNode::session_queue_is_interrupt(runtime, *data)? {
-                let session_queue = NodeId::new(
-                    u32::try_from(data.word(1))
-                        .expect("Session Queue node identity is stored as a u32"),
-                );
-                let _ = runtime.set_node_interrupt_pending(session_queue)?;
-            }
-            if SessionQueueNode::has_pending_app_mqs(runtime, *data)? {
-                if let Some(node) = runtime.current_node() {
-                    let _ = runtime.set_node_interrupt_pending(node)?;
-                }
-            }
-            Ok::<(), RuntimeError>(())
-        })();
-        ()
-    })();
-    processed_vectors
-}
-
-/// Current-node-local next slot for Session Queue generated output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionQueueNext(u16);
 
@@ -162,196 +73,24 @@ impl SessionQueueNext {
     }
 }
 
-/// Legacy transport callback used only while protocol workers migrate to the
-/// service-owned Session Queue contract.
-#[deprecated(
-    note = "use Session Queue FIFO packetization; transport callbacks are not part of ADR-0039"
-)]
-pub type SessionQueueDispatchFn = fn(
-    &mut DataPlaneMain,
-    &mut SessionWorker,
-    NodeRuntime,
-    SessionQueueNext,
-    Instant,
-    &mut Frame,
-    &mut SessionQueueOutput,
-) -> RuntimeResult<()>;
-
-/// Legacy transport callback used only while protocol workers migrate to the
-/// service-owned Session Queue contract.
-#[deprecated(
-    note = "use the protocol worker's update_time path; Session Queue does not own transport callbacks"
-)]
-pub type SessionQueueUpdateTimeFn = fn(
-    &mut DataPlaneMain,
-    &mut SessionWorker,
-    NodeRuntime,
-    SessionQueueNext,
-    Instant,
-    &mut Frame,
-    &mut SessionQueueOutput,
-) -> RuntimeResult<()>;
-
-/// Accumulates Session Queue TX indexes on the driver Frame and records one
-/// local next per entry. Graph Fanout runs once at [`Self::flush`].
-#[deprecated(
-    note = "compatibility accumulator; ADR-0039 Session Queue owns packet fanout directly"
-)]
-pub struct SessionQueueOutput {
-    nexts: Vec<u16>,
-    io_count: usize,
-}
-
-impl Default for SessionQueueOutput {
-    #[inline]
-    fn default() -> Self {
-        Self::seeded(0)
-    }
-}
-
-impl SessionQueueOutput {
-    #[inline]
-    pub fn seeded(pending_seed: usize) -> Self {
-        Self {
-            nexts: Vec::new(),
-            io_count: pending_seed.min(SESSION_QUEUE_IO_BUDGET),
-        }
-    }
-
-    #[inline]
-    pub fn remaining_io_budget(&self) -> usize {
-        SESSION_QUEUE_IO_BUDGET.saturating_sub(self.io_count)
-    }
-
-    #[inline]
-    pub fn io_count(&self) -> usize {
-        self.io_count
-    }
-
-    /// Enqueue one normal/custom IO index into the driver Frame.
-    ///
-    /// Returns `Ok(false)` when the shared IO budget is exhausted; the caller
-    /// keeps ownership of `index` and should leave unserved work pending.
-    #[inline]
-    pub fn try_enqueue_io(
-        &mut self,
-        frame: &mut Frame,
-        next: SessionQueueNext,
-        index: u32,
-    ) -> RuntimeResult<bool> {
-        if self.io_count >= SESSION_QUEUE_IO_BUDGET {
-            return Ok(false);
-        }
-        {
-            let count = frame.len();
-            frame.set_vector_count(count + 1);
-            frame.vector_args_mut()[count] = index;
-        }
-        self.nexts.push(next.slot());
-        self.io_count += 1;
-        Ok(true)
-    }
-
-    /// One Graph Fanout flush for every index recorded on `frame` this dispatch.
-    #[inline]
-    pub fn flush(
-        self,
-        runtime: &mut DataPlaneMain,
-        node_runtime: &mut NodeRuntime,
-        frame: &mut Frame,
-    ) {
-        debug_assert_eq!(frame.len(), self.nexts.len());
-        if self.nexts.is_empty() {
-            return;
-        }
-        runtime.enqueue_to_next(node_runtime, frame, self.nexts.as_slice());
-    }
-}
-
-/// Worker-local transport dispatch, matching VPP's per-worker update-time and
-/// transport output tables.
-#[derive(Clone, Copy)]
-#[deprecated(note = "Session Worker no longer owns protocol dispatch tables under ADR-0039")]
-pub(crate) struct SessionQueueTransportDispatch {
-    output_next: SessionQueueNext,
-    update_time: SessionQueueUpdateTimeFn,
-    function: SessionQueueDispatchFn,
-}
-
+/// VPP: session_node.c:2148-2154.
 #[hammer_component_macros::graph_node(
     graph = session,
     init = crate::session::node::register_session_queue_node,
     name = "session-queue",
     kind = driver,
 )]
-#[derive(Clone)]
-pub struct SessionQueueNode {
-    runtime_data: NodeRuntime,
-}
+#[derive(Clone, Default)]
+pub struct SessionQueueNode;
 
 pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
     }
-    let node = SessionQueueNode::new()?;
-    runtime.nodes().try_register_driver(node)
+    runtime.nodes().try_register_driver(SessionQueueNode)
 }
 
 impl SessionQueueNode {
-    pub fn new() -> RuntimeResult<Self> {
-        Ok(Self {
-            runtime_data: NodeRuntime::empty(),
-        })
-    }
-
-    fn poll_app(runtime: &DataPlaneMain, runtime_data: NodeRuntime) -> RuntimeResult<usize> {
-        let ptr = runtime_data.word(0) as usize as *const SessionMain;
-        if ptr.is_null() {
-            return Err(RuntimeError::RuntimeCapabilityMissing {
-                type_name: std::any::type_name::<SessionMain>(),
-            });
-        }
-        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
-        // and points at the process-global SessionMain for its lifetime.
-        let main = unsafe { &*ptr };
-        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-        unsafe { main.worker(runtime.thread_index()) }?.poll_app()
-    }
-
-    fn has_pending_app_mqs(
-        runtime: &DataPlaneMain,
-        runtime_data: NodeRuntime,
-    ) -> RuntimeResult<bool> {
-        let ptr = runtime_data.word(0) as usize as *const SessionMain;
-        if ptr.is_null() {
-            return Err(RuntimeError::RuntimeCapabilityMissing {
-                type_name: std::any::type_name::<SessionMain>(),
-            });
-        }
-        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
-        // and points at the process-global SessionMain for its lifetime.
-        let main = unsafe { &*ptr };
-        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-        Ok(unsafe { main.worker(runtime.thread_index()) }?.has_pending_app_mqs())
-    }
-
-    fn session_queue_is_interrupt(
-        runtime: &DataPlaneMain,
-        runtime_data: NodeRuntime,
-    ) -> RuntimeResult<bool> {
-        let ptr = runtime_data.word(0) as usize as *const SessionMain;
-        if ptr.is_null() {
-            return Err(RuntimeError::RuntimeCapabilityMissing {
-                type_name: std::any::type_name::<SessionMain>(),
-            });
-        }
-        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
-        // and points at the process-global SessionMain for its lifetime.
-        let main = unsafe { &*ptr };
-        main.session_queue_is_interrupt(runtime)
-    }
-
-    /// Compiles the session queue's output edge in the main graph.
     pub fn compile_output_next(
         runtime: &DataPlaneMain,
         consumer: NodeId,
@@ -361,10 +100,6 @@ impl SessionQueueNode {
         Ok(SessionQueueNext::from_slot(slot))
     }
 
-    /// Resolves an already-compiled output edge in a worker graph clone.
-    ///
-    /// This only observes graph identity. Worker initialization must never add
-    /// or change a next arc.
     pub fn existing_output_next(
         runtime: &DataPlaneMain,
         consumer: NodeId,
@@ -391,173 +126,10 @@ impl SessionQueueNode {
             }
         }
     }
-
-    /// Installs one worker-local transport dispatch attachment.
-    ///
-    /// The graph edge is compiled by [`Self::compile_output_next`] on the main
-    /// thread. This method owns only the worker's dispatch table.
-    #[deprecated(
-        note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization"
-    )]
-    pub fn install_worker_attachment(
-        runtime: &DataPlaneMain,
-        runtime_data: NodeRuntime,
-        output_next: SessionQueueNext,
-        update_time: SessionQueueUpdateTimeFn,
-        function: SessionQueueDispatchFn,
-    ) -> RuntimeResult<bool> {
-        let ptr = runtime_data.word(0) as usize as *const SessionMain;
-        if ptr.is_null() {
-            return Err(RuntimeError::RuntimeCapabilityMissing {
-                type_name: std::any::type_name::<SessionMain>(),
-            });
-        }
-        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
-        // and points at the process-global SessionMain for its lifetime.
-        let main = unsafe { &*ptr };
-        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-        let mut sessions = unsafe { main.worker(runtime.thread_index()) }?;
-        if sessions.transport_dispatches.iter().any(|dispatch| {
-            dispatch.output_next == output_next
-                && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
-                && std::ptr::fn_addr_eq(dispatch.function, function)
-        }) {
-            return Ok(false);
-        }
-        sessions
-            .transport_dispatches
-            .push(SessionQueueTransportDispatch {
-                output_next,
-                update_time,
-                function,
-            });
-        Ok(true)
-    }
-
-    /// Removes one exact worker-local transport dispatch attachment.
-    #[deprecated(
-        note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization"
-    )]
-    pub fn remove_worker_attachment(
-        runtime: &DataPlaneMain,
-        runtime_data: NodeRuntime,
-        output_next: SessionQueueNext,
-        update_time: SessionQueueUpdateTimeFn,
-        function: SessionQueueDispatchFn,
-    ) -> RuntimeResult<bool> {
-        let ptr = runtime_data.word(0) as usize as *const SessionMain;
-        if ptr.is_null() {
-            return Err(RuntimeError::RuntimeCapabilityMissing {
-                type_name: std::any::type_name::<SessionMain>(),
-            });
-        }
-        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
-        // and the SessionMain Arc remains alive in that worker's SessionMain.
-        let main = unsafe { &*ptr };
-        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-        let mut sessions = unsafe { main.worker(runtime.thread_index()) }?;
-        let Some(index) = sessions.transport_dispatches.iter().position(|dispatch| {
-            dispatch.output_next == output_next
-                && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
-                && std::ptr::fn_addr_eq(dispatch.function, function)
-        }) else {
-            return Ok(false);
-        };
-        sessions.transport_dispatches.remove(index);
-        Ok(true)
-    }
 }
 
 impl Node for SessionQueueNode {
-    fn process(
-        runtime: &mut DataPlaneMain,
-        node_runtime: &mut hammer_runtime::NodeRuntime,
-        frame: &mut Frame,
-    ) -> usize {
-        let process: NodeProcessFn = session_queue_node_process;
-        process(runtime, node_runtime, frame)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
-        Ok(self.runtime_data)
-    }
-}
-
-impl DriverNode for SessionQueueNode {
-    #[inline]
-    fn node_registration(&self) -> Option<NodeRegistration>
-    where
-        Self: Sized,
-    {
-        Some(NodeRegistration::next("session-queue", 0))
-    }
-}
-
-fn session_queue_node_process(
-    runtime: &mut DataPlaneMain,
-    data: &mut NodeRuntime,
-    frame: &mut Frame,
-) -> usize {
-    (|| {
-        let now = Instant::now();
-        let mut output = SessionQueueOutput::default();
-        let ptr = data.word(0) as usize as *const SessionMain;
-        if !ptr.is_null() {
-            // SAFETY: worker NodeRuntime is installed by the owning Data Worker
-            // and points at the process-global legacy SessionMain for its lifetime.
-            let main = unsafe { &*ptr };
-            'dispatch: {
-                // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-                let Ok(mut sessions) = (unsafe { main.worker(runtime.thread_index()) }) else {
-                    break 'dispatch;
-                };
-                let dispatch_count = sessions.transport_dispatches.len();
-                for dispatch_index in 0..dispatch_count {
-                    let dispatch = sessions.transport_dispatches[dispatch_index];
-                    if (dispatch.update_time)(
-                        runtime,
-                        &mut sessions,
-                        *data,
-                        dispatch.output_next,
-                        now,
-                        frame,
-                        &mut output,
-                    )
-                    .is_err()
-                    {
-                        break 'dispatch;
-                    }
-                }
-                if sessions.poll_session_events().is_err() {
-                    break 'dispatch;
-                }
-                let dispatch_count = sessions.transport_dispatches.len();
-                for dispatch_index in 0..dispatch_count {
-                    let dispatch = sessions.transport_dispatches[dispatch_index];
-                    if (dispatch.function)(
-                        runtime,
-                        &mut sessions,
-                        *data,
-                        dispatch.output_next,
-                        now,
-                        frame,
-                        &mut output,
-                    )
-                    .is_err()
-                    {
-                        break 'dispatch;
-                    }
-                }
-                if sessions.update_state(runtime, output.io_count()).is_err() {
-                    break 'dispatch;
-                }
-            }
-        }
-        output.flush(runtime, data, frame);
-        let dispatched = frame.len();
-        // VPP: session_node.c:2148-2154. TCP control/retransmit buffers
-        // already carry the Session Queue local next selected by transport.
+    fn process(runtime: &mut DataPlaneMain, data: &mut NodeRuntime, frame: &mut Frame) -> usize {
         let session_main = core::SessionMain::global()
             .expect("Session Main initializes before session-queue executes");
         let session_worker = unsafe { session_main.worker_mut(runtime) }
@@ -575,6 +147,16 @@ fn session_queue_node_process(
             .dispatch_io_events(runtime, session_main)
             .expect("registered Session transport handles its IO events");
         session_worker.schedule_pending_app_events(runtime);
-        dispatched + session_worker.flush_pending_tx_buffers(runtime, data, frame)
-    })()
+        session_worker.flush_pending_tx_buffers(runtime, data, frame)
+    }
+}
+
+impl DriverNode for SessionQueueNode {
+    #[inline]
+    fn node_registration(&self) -> Option<NodeRegistration>
+    where
+        Self: Sized,
+    {
+        Some(NodeRegistration::next("session-queue", 0))
+    }
 }

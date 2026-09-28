@@ -178,18 +178,6 @@ pub enum RuntimeError {
     },
     #[error("thread-zero Process runtime is unavailable")]
     MainProcessRuntimeUnavailable,
-    #[error(transparent)]
-    AppSession(#[from] crate::app::AppSessionError),
-    #[error("Application Session control operation failed")]
-    SessionControl {
-        #[source]
-        source: crate::app::SessionMsgQueueError,
-    },
-    #[error("Application Session control payload decode failed")]
-    SessionControlDecode {
-        #[source]
-        source: crate::app::SessionControlDecodeError,
-    },
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
     #[error("Process Node declaration has no registered name")]
@@ -333,169 +321,11 @@ pub enum RuntimeError {
     NodeErrorSlotOverflow,
     #[error(transparent)]
     Init(#[from] crate::init::InitError),
-    #[error(transparent)]
-    Attach(#[from] AttachError),
     #[error("{subsystem} subsystem failed")]
     Subsystem {
         subsystem: &'static str,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-#[derive(Debug, Error)]
-pub enum AttachError {
-    #[error("failed to create shared Application Session control segment")]
-    ControlSegmentCreate {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("Application Session control segment capacity is exhausted")]
-    ControlSegmentCapacity,
-    #[error("Application Session control queue layout is invalid")]
-    ControlQueueLayout {
-        #[source]
-        source: crate::app::SessionMsgQueueError,
-    },
-    #[error("failed to initialize Application Session control queue")]
-    ControlQueueInit {
-        #[source]
-        source: crate::app::SessionMsgQueueError,
-    },
-    #[error("Application Session control operation failed")]
-    SessionControl {
-        #[source]
-        source: crate::app::SessionMsgQueueError,
-    },
-    #[error("Application Session ExtConfig request exceeds the fixed chunk capacity")]
-    ExtConfigOversized { requested: usize, max: usize },
-    #[error("Application Session ExtConfig storage is exhausted")]
-    ExtConfigExhausted,
-    #[error("Application Session ExtConfig offset is out of range")]
-    ExtConfigOffsetOutOfRange,
-    #[error(
-        "Application Session ExtConfig chunk is not allocated (double free or stale reference)"
-    )]
-    ExtConfigNotAllocated,
-    #[error("Application Session ACCEPTED publication is unavailable")]
-    AcceptedPublicationUnavailable,
-    #[error("Application Session control queue signal is missing")]
-    ControlSignalMissing,
-    #[error("failed to duplicate Application Session control queue signal")]
-    ControlSignalDuplicate {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to register Application Session control queue signal")]
-    ControlSignalRegistration {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to read Application Session control queue signal")]
-    ControlSignalRead {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("attach descriptor count {actual} exceeds protocol maximum {max}")]
-    DescriptorCountTooLarge { actual: usize, max: usize },
-    #[error("Application MQ segment has no backing descriptor")]
-    ApplicationMqSegmentMissing,
-    #[error("Application MQ publication requires at least one Data Worker")]
-    ApplicationMqWorkerCountZero,
-    #[error("Application MQ publication has {queues} queues but {offsets} offsets")]
-    ApplicationMqQueueCountMismatch { queues: usize, offsets: usize },
-    #[error("Application MQ descriptor count exceeds addressable range")]
-    ApplicationMqDescriptorCountOverflow,
-    #[error("Application MQ descriptor count {actual} exceeds protocol maximum {max}")]
-    ApplicationMqDescriptorCountTooLarge { actual: usize, max: usize },
-    #[error(
-        "Application MQ worker {worker} offset {offset} is outside segment size {segment_size}"
-    )]
-    ApplicationMqOffsetOutOfRange {
-        worker: usize,
-        offset: u64,
-        segment_size: u64,
-    },
-    #[error("Application MQ worker {worker} has no write signal descriptor")]
-    ApplicationMqWriteSignalMissing { worker: usize },
-    #[error("failed to create attach signal pipe")]
-    SignalPipeCreate {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to read attach signal status flags")]
-    SignalStatusFlags {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to set attach signal nonblocking status")]
-    SignalNonblocking {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to read attach signal descriptor flags")]
-    SignalDescriptorFlags {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to set attach signal close-on-exec")]
-    SignalCloseOnExec {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("attach control buffer has no first header")]
-    ControlHeaderMissing,
-    #[error("failed to send attach descriptors")]
-    Send {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("attach publication capacity must be non-zero")]
-    PublicationCapacityInvalid,
-    #[error("attach publication queue is full")]
-    PublicationQueueFull,
-    #[error("attach publication queue is closed")]
-    PublicationQueueClosed,
-    #[error("attach server is already running")]
-    ServerAlreadyRunning,
-    #[error("failed to set attach listener nonblocking status")]
-    ListenerNonblocking {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to register attach listener with Tokio")]
-    ListenerRegistration {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to bind attach server at {path}")]
-    Bind {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to allocate attach session layout")]
-    SessionLayout {
-        #[source]
-        source: hammer_infra::svm::fifo::FifoError,
-    },
-    #[error("attach RX FIFO configuration is invalid")]
-    RxFifoInvalid,
-    #[error("attach event queue configuration is invalid")]
-    EventQueueInvalid,
-    #[error("failed to accept attach client")]
-    Accept {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("attach segment has no backing descriptor")]
-    SegmentDescriptorMissing,
-    #[error("attach session event queue has no read signal descriptor")]
-    SessionSignalMissing,
-    #[error("failed to duplicate remote app session signal descriptor")]
-    SessionSignalDuplicate {
-        #[source]
-        source: std::io::Error,
     },
 }
 

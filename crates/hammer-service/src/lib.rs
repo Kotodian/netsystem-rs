@@ -55,12 +55,9 @@ hammer_runtime::__declare_registration_image!(
         ethernet::__INIT_FN_ETHERNET_MAIN_INIT,
         device::__INIT_FN_DEVICE_MAIN_INIT,
         session::__INIT_FN_SESSION_INIT,
-        session::__INIT_FN_SESSION_ATTACH_SERVER,
-        transport::__INIT_FN_TRANSPORT_MAIN_INIT,
         vpe_api::__INIT_FN_VPE_API_INIT,
     ];
     config_functions = [
-        binary_api::__CONFIG_FN_BINARY_API_CONFIG,
         binary_api::__CONFIG_FN_API_SEGMENT_CONFIG,
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
@@ -71,7 +68,6 @@ hammer_runtime::__declare_registration_image!(
     ];
     main_loop_exit_functions = [
         binary_api::__INIT_FN_EXIT_BINARY_API,
-        session::__INIT_FN_EXIT_SESSION,
     ];
     worker_init_functions = [
         session::__INIT_FN_SESSION_WORKER_INIT,
@@ -85,7 +81,6 @@ hammer_runtime::__declare_registration_image!(
         device::__SERVICE_GRAPH_NODE_DEVICE_INPUT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_ARC_END_NODE,
-        session::node::__SESSION_GRAPH_NODE_APP_SESSION_INPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_SESSION_INPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];
@@ -93,7 +88,6 @@ hammer_runtime::__declare_registration_image!(
     process_nodes = [
         binary_api::__PROCESS_NODE_BINARY_API,
     ];
-    binary_api_methods = [];
     stats_registrations = [
         hammer_ipc::binary_api::memory_shared::__STATS_COLLECT_REGISTRATION_REGISTER_ROOT_REGION_PVT_HEAP,
         hammer_ipc::binary_api::memory_shared::__STATS_COLLECT_REGISTRATION_REGISTER_API_REGION_PVT_HEAP,
@@ -106,7 +100,6 @@ pub fn registration_image() -> &'static hammer_runtime::__private::RegistrationI
     &__HAMMER_REGISTRATION_IMAGE
 }
 
-pub mod app;
 pub mod binary_api;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.
@@ -126,7 +119,7 @@ pub mod session;
 pub mod transport;
 pub mod vpe_api;
 
-pub use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+pub use hammer_runtime::{RuntimeError, RuntimeResult};
 
 #[cfg(test)]
 static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

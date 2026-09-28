@@ -22,7 +22,7 @@ This is a single-context repo: read root `CONTEXT.md` and relevant ADRs under `d
 
 ## Project Structure & Module Organization
 
-Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-infra, hammer-component-macros}`, `hammer-ipc → {hammer-core, hammer-runtime, hammer-stats}`, `hammer-runtime → {hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
+Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-service → {hammer-runtime, hammer-core, hammer-infra, hammer-component-macros}`, `hammer-ipc → {hammer-core, hammer-runtime, hammer-stats}`, `hammer-runtime → {hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
 
 | crate | role |
 |---|---|
@@ -30,8 +30,7 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 | `hammer-core` | Minimal cross-DSO packet-graph ABI — Node/Frame/Buffer/Index/Next primitives and errors intrinsic to them. |
 | `hammer-component-macros` | Proc macros: `#[graph_node]`, `#[init_function]`, `#[worker_init_function]` for declarative packet-graph node registration via `linkme` distributed slices. |
 | `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, VPP-style worker barriers and synchronization primitives, `RuntimeRegistry` (typed service registry), session/app handle types. |
-| `hammer-service` | Protocol-neutral network infrastructure — interface, session, device, and feature-arc contracts used by independent plugins. |
-| `hammer-app` | Client Rust SDK for business applications — the application-facing app/session boundary for local and cross-process (shared-memory) sessions. `AppClient` (Unix socket + SCM_RIGHTS) returns `AppSession<Svm>`; independent application crates use its async methods. It is not a business application implementation crate. Echo helpers are test support only. |
+| `hammer-service` | Protocol-neutral network infrastructure — interface, session, generic application namespace, device, and feature-arc contracts used by independent plugins. |
 | `hammer-ipc` | Server-side Binary API protocol and shared-memory transport definitions — message identity/codec, message tables, `ApiMain`, socket request/reply envelopes, and VPE protocol declarations. It contains no external client implementation. |
 | `hammer` | Daemon binary (analogous to VPP's `vpp`). Loads TOML config, initializes runtime engine + worker graph, binds IPC TCP socket (default `127.0.0.1:7299`, overridable via `HAMMER_IPC_ADDR`), runs the data-plane main loop. |
 
@@ -52,19 +51,15 @@ Patched dependencies live under `third_party/`. Architecture decisions, type/int
 
 ### Business application boundary
 
-- Every business application must be implemented as an independent crate that
-  depends on `hammer-app`; business applications do not live inside the
-  `hammer-app` crate.
+- Business applications must live outside the generic server and client SDK
+  crates. External client bindings belong to the sibling `netsystem-client`
+  repository; server-side builtin applications remain independent plugins.
 - Business entry points, domain logic, application-specific configuration,
   lifecycle orchestration, and application-specific use of App Session
   protocols belong to the owning business application crate.
-- `hammer-app` owns only the generic client SDK surface needed by business
-  applications to attach to Hammer and use App Sessions. Do not add business
-  policies, workflows, or application-specific protocol behavior to it.
-- The dependency direction is `business-application -> hammer-app`. The
-  `hammer-app` crate must not depend on, register, or select a business
-  application. Existing echo helpers are test support and must not be used as a
-  precedent for placing business behavior in `hammer-app`.
+- `hammer-service::session` owns generic application namespace records;
+  `hammer-plugin-session` owns their IP/FIB bindings. Neither owner contains
+  business policies or application-specific protocol behavior.
 
 ## Build, Test, and Development Commands
 

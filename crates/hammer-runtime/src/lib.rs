@@ -4,7 +4,6 @@ pub mod registration;
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::binary_api::{BinaryApiMethodEntry, BinaryApiMethodReply};
     pub use crate::registration::{RegistrationImage, StatsRegistration};
     pub use abi_stable::RRef;
     pub use abi_stable::export_root_module;
@@ -33,7 +32,6 @@ crate::__declare_registration_image!(
     graph_nodes = [];
     node_functions = [];
     process_nodes = [config::stats::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
-    binary_api_methods = [];
     stats_registrations = [
         config::stats::__STATS_REGISTRATION_Sys,
         thread_main::__STATS_REGISTRATION_WorkerThreadCount,
@@ -63,22 +61,17 @@ pub use file::{
 
 pub mod barrier;
 pub use barrier::WorkerBarrier;
-pub mod binary_api;
 pub mod init;
 pub mod log;
 pub mod main_loop;
 pub mod plugin;
 pub mod plugin_loader;
 mod process;
-pub mod session;
 
-pub use error::{AttachError, RuntimeError, RuntimeResult};
+pub use error::{RuntimeError, RuntimeResult};
 pub use hammer_infra::hint::unlikely;
 pub use hammer_infra::simd::Simd;
 
-#[deprecated(note = "legacy application/session surface; use hammer-service::session")]
-pub mod app;
-pub mod attach;
 pub mod data_plane;
 pub mod handoff;
 pub mod node;
@@ -101,7 +94,6 @@ pub use plugin::{
 };
 pub use process::Process;
 pub use main_loop::enqueue_main_thread_future;
-pub use session::{SessionConnectEndpoint, SessionListenEndpoint};
 pub use thread_main::ThreadMain;
 pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
 pub use trace::{

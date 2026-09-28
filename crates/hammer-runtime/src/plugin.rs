@@ -17,7 +17,6 @@ use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
 
-use crate::binary_api::BinaryApiMethodEntry;
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::registration::RegistrationImage;
 
@@ -158,10 +157,6 @@ pub enum PluginError {
         #[source]
         source: libloading::Error,
     },
-    #[error("Binary API method `{name}` is not registered")]
-    BinaryApiMethodMissing { name: String },
-    #[error("Binary API method `{name}` is registered more than once")]
-    BinaryApiMethodDuplicate { name: String },
     #[error("duplicate plugin roots at indexes {first} and {duplicate}")]
     DuplicateRoot { first: usize, duplicate: usize },
     #[error("plugin load_after cycle while loading `{path}`")]
@@ -569,30 +564,6 @@ impl PluginMain {
         });
     }
 
-    pub fn binary_api_method(&self, name: &str) -> Result<BinaryApiMethodEntry, PluginError> {
-        let mut found = None;
-        let mut duplicate = false;
-        self.visit_images(|image| {
-            for entry in image.binary_api_methods() {
-                if entry.name() != name {
-                    continue;
-                }
-                if found.is_some() {
-                    duplicate = true;
-                } else {
-                    found = Some(*entry);
-                }
-            }
-        });
-        if duplicate {
-            return Err(PluginError::BinaryApiMethodDuplicate {
-                name: name.to_owned(),
-            });
-        }
-        found.ok_or_else(|| PluginError::BinaryApiMethodMissing {
-            name: name.to_owned(),
-        })
-    }
 }
 
 pub fn host_meets_plugin_requirement(

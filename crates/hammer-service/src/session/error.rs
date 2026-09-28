@@ -2,11 +2,10 @@ use hammer_core::data_plane::NodeId;
 use hammer_infra::svm::fifo::FifoError;
 use hammer_infra::svm::fifo_segment::FifoSegmentError;
 use hammer_infra::svm::msg_queue::SvmMsgQError;
-use hammer_runtime::app::{SessionControlError, SessionHandle};
-use hammer_runtime::{DataWorkerId, RuntimeError};
+use hammer_runtime::RuntimeError;
 use thiserror::Error;
 
-use super::application::ApplicationError;
+use super::app::ApplicationError;
 
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
@@ -34,8 +33,6 @@ pub enum SessionQueueError {
     #[error("Session event queue capacity {capacity} does not fit u32")]
     EventQueueCapacityOverflow { capacity: usize },
 }
-
-pub use hammer_runtime::app::SessionConnectError;
 
 #[hammer_component_macros::runtime_error(subsystem = "session")]
 #[derive(Debug, Error)]
@@ -200,128 +197,9 @@ pub enum SessionError {
     OooSpanMissing { session_id: u32 },
     #[error("session {session_id:?} accepted OOO delivery reported an invalid span")]
     OooSpanInvalid { session_id: u32 },
-    #[error("Session has no data workers configured")]
-    NoDataWorkers,
-    #[error("Session listener {listener:?} is not registered")]
-    ListenerMissing { listener: SessionHandle },
-    #[error("Session listener control is owned by another thread")]
-    ListenerControlWrongThread,
-    #[error("Session transport does not register listener operations")]
-    TransportListenUnsupported,
-    #[error("Session transport does not register active-open")]
-    TransportConnectUnsupported,
-    #[error("Session active-open has no Application connection")]
-    ApplicationConnectionMissing,
-    #[error("Session transport does not register stream active-open")]
-    TransportConnectStreamUnsupported,
     #[error("Session transport operation failed")]
     TransportOpFailed {
         #[source]
         source: RuntimeError,
     },
-    #[error("CONNECT_STREAM requires a parent Session handle")]
-    ConnectStreamParentMissing,
-    #[error(
-        "CONNECT_STREAM for parent {parent:?} arrived on worker {actual:?}, expected owner worker {expected:?}"
-    )]
-    ConnectStreamWrongWorker {
-        parent: SessionHandle,
-        expected: DataWorkerId,
-        actual: DataWorkerId,
-    },
-    #[error("Session {session_id:?} connect publication failed and its cleanup failed")]
-    ConnectPublicationCleanup {
-        session_id: u32,
-        #[source]
-        publication: RuntimeError,
-        cleanup: RuntimeError,
-    },
-}
-
-/// Maps a concrete [`SessionError`] to the control-protocol error the
-/// Application observes, mirroring `From<ApplicationError>`. VPP notifies the
-/// app worker with the specific rv of the failed connect/listen op
-/// (`app_worker_connect_notify` with `rv != SESSION_E_NONE`,
-/// session_node.c:263-267, session.c:1419-1452); every variant is listed
-/// explicitly so an unmapped internal failure cannot silently substitute a
-/// misleading wire error.
-impl From<SessionError> for SessionControlError {
-    fn from(error: SessionError) -> Self {
-        match error {
-            SessionError::Unknown
-            | SessionError::Refused
-            | SessionError::TimedOut
-            | SessionError::Allocation
-            | SessionError::Owner
-            | SessionError::NoRoute
-            | SessionError::NoInterface
-            | SessionError::NoIp
-            | SessionError::NoPort
-            | SessionError::NotSupported
-            | SessionError::NotListening
-            | SessionError::NoSession
-            | SessionError::NoApplication
-            | SessionError::ApplicationAttached
-            | SessionError::ApplicationAttach { .. }
-            | SessionError::ApplicationDetach { .. }
-            | SessionError::PortInUse
-            | SessionError::IpInUse
-            | SessionError::AlreadyListening
-            | SessionError::AddressNotInUse
-            | SessionError::Invalid
-            | SessionError::InvalidRemoteIp
-            | SessionError::InvalidApplicationWorker
-            | SessionError::InvalidNamespace
-            | SessionError::SegmentNoSpace
-            | SessionError::NewSegmentNoSpace
-            | SessionError::SegmentCreate { .. }
-            | SessionError::Filtered
-            | SessionError::ScopeNotSupported
-            | SessionError::BinaryApiNoFileDescriptor
-            | SessionError::BinaryApiSendFileDescriptor
-            | SessionError::BinaryApiRegistrationMissing
-            | SessionError::MessageQueueAllocation { .. }
-            | SessionError::TlsHandshake
-            | SessionError::EventFdAllocation
-            | SessionError::ExtendedConfigMissing
-            | SessionError::CryptoEngineMissing
-            | SessionError::CryptoKeyPairMissing
-            | SessionError::LocalConnect
-            | SessionError::WrongNamespaceSecret
-            | SessionError::Syscall
-            | SessionError::TransportNotRegistered
-            | SessionError::MaxStreamsReached => Self::TransportFailed,
-            SessionError::ListenerMissing { .. } => Self::ListenerMissing,
-            SessionError::ListenerControlWrongThread => Self::ApplicationControlWrongThread,
-            SessionError::TransportListenUnsupported => Self::TransportListenUnsupported,
-            SessionError::TransportConnectUnsupported => Self::TransportConnectUnsupported,
-            SessionError::ApplicationConnectionMissing => Self::ConnectionMissing,
-            SessionError::TransportConnectStreamUnsupported { .. } => {
-                Self::TransportConnectUnsupported
-            }
-            SessionError::TransportOpFailed { .. } => Self::TransportFailed,
-            SessionError::NoDataWorkers => Self::NoDataWorkers,
-            SessionError::ConnectStreamParentMissing => Self::ConnectStreamParentMissing,
-            SessionError::ConnectStreamWrongWorker { .. } => Self::ConnectStreamWrongWorker,
-            // Session-table internals are never produced by a control op; the
-            // concrete error stays in the source chain for diagnostics while
-            // the wire reports the generic transport failure.
-            SessionError::SessionMissing { .. }
-            | SessionError::SessionAppNotRegistered { .. }
-            | SessionError::UpperSessionAlreadyAttached { .. }
-            | SessionError::PublicationRejected { .. }
-            | SessionError::RollbackRejected { .. }
-            | SessionError::NotPublished { .. }
-            | SessionError::RxOutOfOrderOffsetOverflow { .. }
-            | SessionError::RxOutOfOrderEnqueue { .. }
-            | SessionError::TxOffsetOutOfRange { .. }
-            | SessionError::TxFifoRangeInvalid { .. }
-            | SessionError::DatagramLengthMismatch { .. }
-            | SessionError::DatagramFifo { .. }
-            | SessionError::OooSpanMissing { .. }
-            | SessionError::OooSpanInvalid { .. }
-            | SessionError::TransportSessionCreateIncomplete { .. }
-            | SessionError::ConnectPublicationCleanup { .. } => Self::TransportFailed,
-        }
-    }
 }

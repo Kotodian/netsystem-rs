@@ -44,10 +44,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
 
 use hammer_core::data_plane::{BufferPacketCursor, NodeId};
-use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult,
-    SessionConnectEndpoint, SessionListenEndpoint,
 };
 use thiserror::Error;
 
@@ -57,10 +55,7 @@ use hammer_plugin_session::{
     IpSessionEndpoint, IpSessionMain, IpTransportConnectionId, IpTransportEndpoint,
     IpTransportEndpointConfig, IpTransportMain,
 };
-use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
-use hammer_service::session::runtime::{
-    SessionTransport, SessionWorker, dispatch_session_queue_events,
-};
+use hammer_service::session::node::SessionQueueNode;
 use hammer_service::session::{
     SessionError, SessionEventType, SessionHandle as ServiceSessionHandle, SessionQueueNext,
     SessionMain as ServiceSessionMain, SessionWorker as ServiceSessionWorker,
@@ -191,7 +186,7 @@ impl TcpMain {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: SessionHandle,
+        session_listener: ServiceSessionHandle,
         fib_index: u32,
     ) -> RuntimeResult<lookup::TcpLookupId> {
         let lookup_id =
@@ -222,7 +217,7 @@ impl TcpMain {
             }
             _ => unreachable!("listener and remote endpoint share one IP family"),
         };
-        connection.base.session = session_listener.into();
+        connection.base.session = session_listener;
         connection.base.connection_index = lookup_id;
         unsafe { &mut *self.listeners.get() }.insert(connection);
         Ok(lookup_id)
@@ -349,7 +344,7 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
             bind,
             DataWorkerId::new(0),
             listener_capabilities(),
-            session.into(),
+            session,
             local.fib_index,
         );
         match result {
@@ -675,101 +670,6 @@ pub fn protocol() -> RuntimeResult<u8> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })
 }
 
-pub(crate) fn start_listen(
-    listener: SessionHandle,
-    _: u32,
-    _: Option<u64>,
-    endpoint: SessionListenEndpoint,
-) -> RuntimeResult<u32> {
-    hammer_runtime::ensure_main_thread_with_barrier()?;
-    let main = TCP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    main.bind_tcp_listener(
-        endpoint.local(),
-        endpoint.worker(),
-        listener_capabilities(),
-        listener,
-        0,
-    )
-    .map(|lookup_id| lookup_id)
-}
-
-pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
-    hammer_runtime::ensure_main_thread_with_barrier()?;
-    let main = TCP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let result = main
-        .listener_control
-        .close_connection_index(connection_index);
-    if result.is_ok() {
-        main.remove_listener_connection(connection_index);
-    }
-    result
-}
-
-pub(crate) fn connect(
-    sessions: &mut SessionWorker,
-    endpoint: SessionConnectEndpoint,
-) -> RuntimeResult<()> {
-    let local = endpoint.local.ok_or(TcpError::InvalidConnection)?;
-    if local.is_ipv4() != endpoint.remote.is_ipv4() || local.port() == 0 {
-        return Err(TcpError::InvalidConnection.into());
-    }
-    let connection = endpoint
-        .connection
-        .ok_or(hammer_service::session::error::SessionError::ApplicationConnectionMissing)?;
-    let mut tcp = TCP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .worker(endpoint.worker.thread_index())?;
-    start_connect(sessions, &mut tcp, connection, local, endpoint.remote)
-}
-
-fn start_connect(
-    sessions: &mut SessionWorker,
-    tcp: &mut TcpWorker,
-    connection: u32,
-    local: SocketAddr,
-    remote: SocketAddr,
-) -> RuntimeResult<()> {
-    let initial_sequence = tcp.lookup.next_initial_sequence(local, remote);
-    let mut transport = TcpConnection::new(
-        None,
-        sessions.worker(),
-        tcp.protocol(),
-        local.port(),
-        Some(local),
-        remote,
-    );
-    transport.connect_state(initial_sequence);
-    let connection_index = tcp.insert_connection(transport);
-    let session_id =
-        match sessions.stream_connect_pending(tcp.protocol(), connection_index, connection) {
-            Ok(session_id) => session_id,
-            Err(error) => {
-                let _ = tcp.remove_connection(connection_index);
-                return Err(error);
-            }
-        };
-    let connection = tcp
-        .connection_mut(connection_index)
-        .ok_or(TcpNodeError::SessionMissing)?;
-    connection.attach_session(session_id)?;
-    let TcpWorker {
-        connections,
-        lookup,
-        ..
-    } = tcp;
-    let connection = connections
-        .get(connection_index)
-        .ok_or(TcpNodeError::SessionMissing)?;
-    assert!(!lookup.publish_connection(session_id, connection));
-    sessions.mark_ready(session_id);
-    Ok(())
-}
-
 #[hammer_component_macros::config_function(
     name = "tcp_config",
     section = "plugin.tcp",
@@ -1057,18 +957,10 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
                 name: Tcp6OutputNode::NODE_NAME,
             })?;
 
-    let session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
     let session_queue_output4 =
         SessionQueueNode::existing_output_next(engine, session_queue, tcp4_output)?;
     let session_queue_output6 =
         SessionQueueNode::existing_output_next(engine, session_queue, tcp6_output)?;
-    SessionQueueNode::install_worker_attachment(
-        engine,
-        session_queue_data,
-        session_queue_output4,
-        tcp_session_queue_update_time,
-        tcp_session_queue_dispatch,
-    )?;
     let main = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -1087,47 +979,6 @@ fn init_tcp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     bind_worker_graph(engine)
-}
-
-fn tcp_session_queue_update_time(
-    runtime: &mut DataPlaneMain,
-    sessions: &mut SessionWorker,
-    _: NodeRuntime,
-    output_next: SessionQueueNext,
-    now: std::time::Instant,
-    frame: &mut hammer_core::data_plane::Frame,
-    output: &mut SessionQueueOutput,
-) -> RuntimeResult<()> {
-    let mut tcp = TCP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .worker(runtime.thread_index())?;
-    tcp.update_time(sessions, runtime, output_next, frame, output, now)
-}
-
-fn tcp_session_queue_dispatch(
-    runtime: &mut DataPlaneMain,
-    sessions: &mut SessionWorker,
-    _: NodeRuntime,
-    output_next: SessionQueueNext,
-    now: std::time::Instant,
-    frame: &mut hammer_core::data_plane::Frame,
-    output: &mut SessionQueueOutput,
-) -> RuntimeResult<()> {
-    let mut tcp = TCP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .worker(runtime.thread_index())?;
-    dispatch_session_queue_events(
-        runtime,
-        sessions,
-        &mut *tcp,
-        output_next,
-        frame,
-        output,
-        now,
-    )
-    .map(|_| ())
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -1424,37 +1275,6 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
         .with_network_header(0, network_header_len)
         .with_transport_header(tcp_offset, tcp_header_len)
         .with_transport_payload_offset(tcp_offset + tcp_header_len))
-}
-
-fn enqueue_tcp_segment(
-    runtime: &mut DataPlaneMain,
-    _: &mut hammer_core::data_plane::Frame,
-    output_next: SessionQueueNext,
-    _: &mut SessionQueueOutput,
-    connection_index: u32,
-    segment: TcpSegment,
-) -> RuntimeResult<()> {
-    let session_main = hammer_service::session::SessionMain::global()?;
-    // SAFETY: TCP output runs on the Data Worker's owning runtime thread.
-    let worker = unsafe { session_main.worker_mut(runtime) }?;
-    let mut index = 0;
-    if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
-        return Err(hammer_core::error::DataPlaneError::from(
-            hammer_core::error::BufferInvariant::PoolExhausted,
-        )
-        .into());
-    }
-    if let Err(source) = segment.write_to_buffer(&mut *runtime.buffer_mut(index)) {
-        runtime.buffer_free_one(index);
-        return Err(source);
-    }
-    let worker_index = runtime.data_worker_id()?.slot() as u32;
-    let egress = hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => TcpSecondaryOpaque)
-        .egress_mut();
-    egress.connection_index = connection_index;
-    egress.worker_index = worker_index;
-    worker.add_pending_tx_buffer(runtime, index, output_next);
-    Ok(())
 }
 
 #[hammer_component_macros::node_next]

@@ -1289,7 +1289,6 @@ cargo clippy --workspace --all-targets
 cargo test -p hammer-infra
 cargo test -p hammer-runtime
 cargo test -p hammer-service
-cargo test -p hammer-app
 cargo test --workspace
 git diff --check
 ```

@@ -37,7 +37,7 @@ hammer-service::session
   ApplicationMain / AppWorker / SessionMain / FIFO / SVM MQ / session nodes
 ```
 
-`hammer-app` 不是 builtin app owner。iperf3 不走 external-app `appsl-rx-mqs-input`，而是使用
+外部 client SDK 不是 builtin app owner。iperf3 不走 external-app `appsl-rx-mqs-input`，而是使用
 VPP builtin application 的直接 callback 路径。Session queue nodes 仍由 service 注册和调度，
 iperf3 只处理由 service 投递的 application event。
 
@@ -814,7 +814,7 @@ worker Vec/pools prepared
 - 不引入 transport VFT、`dyn`、`SessionRuntimeEngine`、`SessionScheduler`、mailbox、
   multi-ring queue、dispatch queue 或新的 app event queue；复用 service 的 callback、
   SVM MQ、FIFO 和 session queue nodes。
-- 不把 builtin app 放进 `hammer-app`；`hammer-app` 仍是外部 SDK。
+- 不把 builtin app 放进通用 service 或外部 client SDK；iperf3 由独立插件持有。
 - 不把 IP endpoint、FIB、namespace object 或 TCP connection 指针下沉到 service。
 - 不恢复旧 FIFO；只使用仓库现有 SVM FIFO/segment manager。
 - 不增加 `ApplicationState`、`TransportConnection<()>`、NameRef、非拥有索引包装类型或

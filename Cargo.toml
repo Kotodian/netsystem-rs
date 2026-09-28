@@ -11,16 +11,10 @@ members = [
     "crates/hammer-plugins/net/ip",
     "crates/hammer-plugins/net/icmp",
     "crates/hammer-plugins/transport/tcp",
-    "crates/hammer-plugins/transport/udp",
     "crates/hammer-plugins/app/iperf3",
-    "crates/hammer-plugins/app-session/quic",
-    "crates/hammer-plugins/app-session/tls",
-    "crates/hammer-plugins/app-session/http",
-    "crates/hammer-app",
     "crates/hammer-stats",
     "crates/hammer-ipc",
     "crates/hammer",
-    "third_party/quinn/quinn-proto",
 ]
 exclude = [
     "netsystem-client",
@@ -77,9 +71,6 @@ core_affinity = "0.8"
 thread-priority = "1.2"
 rustc-hash = "2"
 indoc = "2.0"
-rcgen = "0.14"
-rustls = { version = "=0.23.31", default-features = false, features = ["ring", "std"] }
-quinn-proto = { path = "third_party/quinn/quinn-proto", default-features = false, features = ["rustls"] }
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 linkme = "0.3"
 prost = "0.14.4"

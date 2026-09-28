@@ -1,4 +1,4 @@
-use hammer_runtime::app::SessionHandle;
+use hammer_core::session::SessionHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionLookupResult<H> {

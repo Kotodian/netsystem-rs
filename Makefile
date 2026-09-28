@@ -1,4 +1,4 @@
-.PHONY: build build-release run clean clippy fmt fmt-check verify-allocation-contract verify-dataplane-performance
+.PHONY: build build-release run clean clippy fmt fmt-check verify-dataplane-performance
 
 build:
 	cargo build --workspace
@@ -20,10 +20,6 @@ fmt:
 
 fmt-check:
 	cargo fmt --all -- --check
-
-verify-allocation-contract:
-	cargo build -p hammer-plugin-ip -p hammer-plugin-session -p hammer-plugin-tcp -p hammer-plugin-udp
-	HAMMER_PLUGIN_DIR="$${CARGO_TARGET_DIR:-target}/debug" cargo run -p hammer --example plugin_additive_load
 
 verify-dataplane-performance:
 	cargo bench --profile release-perf -p hammer-runtime --bench buffer_alloc_free -- --noplot --sample-size 10 --warm-up-time 0.1 --measurement-time 0.2

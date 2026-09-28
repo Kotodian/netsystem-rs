@@ -6,7 +6,6 @@
 //! involved. Session App and transport protocol capabilities are intentionally
 //! absent: those are registered by their owning service/plugin authorities.
 
-use crate::binary_api::BinaryApiMethodEntry;
 use crate::error::RuntimeResult;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
@@ -40,7 +39,6 @@ pub struct RegistrationImage {
     graph_nodes: &'static [&'static NodeEntry],
     node_functions: &'static [&'static NodeFunctionRegistration],
     process_nodes: &'static [&'static NodeEntry],
-    binary_api_methods: &'static [&'static BinaryApiMethodEntry],
     stats_registrations: &'static [&'static StatsRegistration],
 }
 
@@ -58,7 +56,6 @@ impl RegistrationImage {
         graph_nodes: &'static [&'static NodeEntry],
         node_functions: &'static [&'static NodeFunctionRegistration],
         process_nodes: &'static [&'static NodeEntry],
-        binary_api_methods: &'static [&'static BinaryApiMethodEntry],
     ) -> Self {
         Self::new_with_stats(
             init_functions,
@@ -71,7 +68,6 @@ impl RegistrationImage {
             graph_nodes,
             node_functions,
             process_nodes,
-            binary_api_methods,
             &[],
         )
     }
@@ -89,7 +85,6 @@ impl RegistrationImage {
         graph_nodes: &'static [&'static NodeEntry],
         node_functions: &'static [&'static NodeFunctionRegistration],
         process_nodes: &'static [&'static NodeEntry],
-        binary_api_methods: &'static [&'static BinaryApiMethodEntry],
         stats_registrations: &'static [&'static StatsRegistration],
     ) -> Self {
         Self {
@@ -103,7 +98,6 @@ impl RegistrationImage {
             graph_nodes,
             node_functions,
             process_nodes,
-            binary_api_methods,
             stats_registrations,
         }
     }
@@ -175,13 +169,6 @@ impl RegistrationImage {
     }
 
     #[inline]
-    pub(crate) fn binary_api_methods(
-        &self,
-    ) -> impl Clone + Iterator<Item = &'static BinaryApiMethodEntry> + '_ {
-        self.binary_api_methods.iter().copied()
-    }
-
-    #[inline]
     pub(crate) fn stats_registrations(
         &self,
     ) -> impl Clone + Iterator<Item = &'static StatsRegistration> + '_ {
@@ -204,7 +191,6 @@ macro_rules! __declare_registration_image {
             graph_nodes = [];
             node_functions = [];
             process_nodes = [];
-            binary_api_methods = [];
             stats_registrations = [];
         );
     };
@@ -219,7 +205,6 @@ macro_rules! __declare_registration_image {
         graph_nodes = [$($graph_node:path),* $(,)?];
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
-        binary_api_methods = [$($binary_api_method:path),* $(,)?];
         stats_registrations = [$($stats_registration:path),* $(,)?];
     ) => {
         static __HAMMER_REGISTRATION_IMAGE: $crate::__private::RegistrationImage =
@@ -234,7 +219,6 @@ macro_rules! __declare_registration_image {
                 &[$(&$graph_node),*],
                 &[$(&$node_function),*],
                 &[$(&$process_node),*],
-                &[$(&$binary_api_method),*],
                 &[$(&$stats_registration),*],
             );
     };
@@ -249,7 +233,6 @@ macro_rules! __declare_registration_image {
         graph_nodes = [$($graph_node:path),* $(,)?];
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
-        binary_api_methods = [$($binary_api_method:path),* $(,)?];
     ) => {
         $crate::__declare_registration_image!(
             init_functions = [$($init),*];
@@ -262,7 +245,6 @@ macro_rules! __declare_registration_image {
             graph_nodes = [$($graph_node),*];
             node_functions = [$($node_function),*];
             process_nodes = [$($process_node),*];
-            binary_api_methods = [$($binary_api_method),*];
             stats_registrations = [];
         );
     };

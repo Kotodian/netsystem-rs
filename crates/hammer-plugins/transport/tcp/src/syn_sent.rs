@@ -7,7 +7,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 use super::TcpError;
 use super::TcpNodeError;
 use super::segment::tcp_packet;
-use hammer_service::session::runtime::{RxDelivery, session_main};
+use hammer_service::session::{ApplicationMain, RxDelivery, SessionEventType, SessionHandle, SessionState};
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -177,8 +177,9 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let session_main = hammer_service::session::SessionMain::global()?;
     // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let sessions = unsafe { session_main.worker_mut(runtime) }?;
     let mut tcp = main.worker(runtime.thread_index())?;
     let (keep_current, control_segment, connection_index) = {
         let sessions = &mut *sessions;
@@ -188,8 +189,13 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
             TcpNodeError::SynSentSessionRouteMissing
         })?;
+        let handle = SessionHandle {
+            worker_index: sessions.worker_index(),
+            session_index: session_id,
+        };
         let connection_index = sessions
-            .transport_connection_index(session_id)
+            .session_from_handle(handle)
+            .map(|session| session.connection_index())
             .ok_or(TcpNodeError::SynSentSessionMissing)?;
         let (control, acked_tx_len, established, established_with_payload) = {
             let crate::worker::TcpWorker {
@@ -225,7 +231,11 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             )
         };
         if acked_tx_len != 0 {
-            sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
+            let tx = sessions
+                .session_from_handle(handle)
+                .and_then(|session| session.tx_fifo())
+                .ok_or(TcpNodeError::SynSentSessionMissing)?;
+            assert_eq!(tx.drop_dequeue(acked_tx_len as usize), acked_tx_len as usize);
         }
         if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
             tcp.lookup.remember_fast_open_cookie(
@@ -241,9 +251,9 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
                 buffer.advance(packet.payload_offset as isize);
                 buffer.truncate(packet.payload_len)?;
             }
-            let enqueue = sessions.enqueue_rx(runtime, session_id, index, 0)?;
+            let enqueue = sessions.enqueue_rx(runtime, handle, index, 0)?;
             if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                sessions.mark_ready(session_id);
+                sessions.enqueue_ready(handle, main.protocol())?;
             }
             keep_current = false;
         };
@@ -257,7 +267,17 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
                 .get(connection_index)
                 .ok_or(TcpNodeError::SynSentSessionMissing)?;
             assert!(!lookup.publish_connection(session_id, connection));
-            sessions.complete_stream_connect(session_id)?;
+            let session = sessions
+                .session_from_handle(handle)
+                .ok_or(TcpNodeError::SynSentSessionMissing)?;
+            session.store_state(SessionState::Ready);
+            if let Some(app_worker_index) = session.app_worker_index() {
+                let applications = ApplicationMain::global()
+                    .expect("Application Main initializes before TCP input");
+                let app_worker = unsafe { applications.worker(app_worker_index) }
+                    .expect("connected Session retains its Application Worker");
+                app_worker.add_event(session, SessionEventType::Connected);
+            }
         }
         (keep_current, control, connection_index)
     };

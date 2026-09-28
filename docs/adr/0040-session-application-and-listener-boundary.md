@@ -24,7 +24,7 @@ VPP 把 application sublayer 放在 session 子系统中，而不是 TCP、UDP �
 - `application_t` 只拥有 application flags、callback table、segment-manager properties、
   worker mapping、name、namespace identity 和 RX MQ segment（`application.h:119-161`）。本 ADR
   将 namespace pool index 接到 Application；namespace 的 generic owner 仍是 ADR-0036 的
-  `hammer-app`，IP/FIB binding 仍是 `hammer-plugin-session` 的 concrete state。
+  `hammer-service::session::namespace`，IP/FIB binding 仍是 `hammer-plugin-session` 的 concrete state。
 - `app_worker_t` 拥有 application worker identity、connect segment-manager index、listener table、
   half-open handles、per-worker application events 和 MQ congestion state；event queue 是其所
   属 segment 的非拥有引用
@@ -54,6 +54,7 @@ composition，不是 application 抽象。
 hammer-service::session
   SessionMain / SessionWorker / Session
   ApplicationMain / Application / AppWorker / ApplicationListener
+  AppNamespace<B> / AppNamespaceMain<B> generic namespace storage
   application-owned per-event Rust fn callbacks and app/session events
   generic CtMain<E, O> / CtWorker<E, O> / CtConnection<E, O> contracts
   SVM FIFO, SVM message queue, listener segment ownership
@@ -72,11 +73,10 @@ hammer-plugin-tcp / hammer-plugin-udp
   protocol timers, headers, packet nodes and protocol state
 ```
 
-`hammer-app` remains the client SDK and generic namespace owner from ADR-0036. It may hold the
-client-side App Session/FIFO handles returned by attach and supplies a raw namespace pool index
-(`u32`) to the service attach request, but it does not own `ApplicationMain`, `AppWorker`,
-`ApplicationListener` or cut-through state; those are server-side session state in
-`hammer-service`.
+`hammer-service::session::namespace` owns the generic namespace pool from ADR-0036 and supplies
+its raw `u32` index to the service attach request. Client-side App Session/FIFO handles belong to
+external client bindings, not to the server namespace owner. IP/FIB binding remains in
+`hammer-plugin-session`.
 
 依赖方向固定为：
 
@@ -156,7 +156,7 @@ impl ApplicationMain {
 
     // VPP application_t.ns_index, application.h:139-151. The service keeps
     // the raw namespace pool index; generic namespace ownership remains in
-    // hammer-app and IP binding validation remains in plugin-session.
+    // service::session::namespace and IP binding validation remains in plugin-session.
     #[inline(always)]
     pub fn namespace(&self, application: u32) -> Option<u32>;
 
@@ -208,7 +208,7 @@ worker，builtin app 不在业务插件内重复执行首个 worker 的建立。
 
 `Application` 保存 VPP 的 application-level facts，并保存所选 namespace 的 raw `u32` pool
 index。它不保存 namespace object、socket、IP endpoint、FIB 或 protocol connection。ADR-0036
-的 `hammer-app::AppNamespaceMain<B>` 仍拥有 generic namespace record，
+的 `hammer-service::session::namespace::AppNamespaceMain<B>` 仍拥有 generic namespace record，
 `hammer-plugin-session::IpNamespaceMain` 仍拥有 IP concrete binding；这里仅保存 Application
 到 namespace 的归属关系。VPP 在 `application.c:298-329` 调用的是不复制 key 的
 `hash_set_mem`，不是显式分配并复制 key 的 `hash_set_mem_alloc`
@@ -1422,7 +1422,7 @@ IP lookup methods reuse the existing service `SessionError` categories: `Invalid
 `IpSessionMain` may call the service `ApplicationMain`/`SessionMain` directly by their concrete
 owner APIs, but service never imports `IpSessionMain`. The IP plugin is therefore the only layer that
 knows both `IpTransportConnectionId` and the generic `ApplicationListener` index. Attach order is:
-`hammer-app` resolves/creates the namespace and supplies its `u32` index, service stores that index on
+`hammer-service::session::namespace` owns the namespace and supplies its `u32` index, service stores that index on
 `Application`, and plugin-session validates that the index has an IP binding before any IP listener
 or session-table operation. The Application record never receives `ip4_fib_id`, `ip6_fib_id`, a
 socket path or a namespace binding object.
@@ -1439,7 +1439,7 @@ application-level `listen` API.
 The concrete operation order is:
 
 Before allocating anything, `vnet_listen` semantics are preserved: the caller supplies the raw
-namespace index selected by `hammer-app`, `IpSessionMain::validate_application_namespace` verifies
+namespace index selected from `hammer-service::session::namespace`, `IpSessionMain::validate_application_namespace` verifies
 that the application has an IP binding, then `IpSessionMain::lookup_listener` checks the concrete
 endpoint identity and `ApplicationMain::listener_for_session` resolves the generic listener. An
 existing listener owned by the same application only attaches another app worker; an existing listener
@@ -1498,7 +1498,7 @@ Session 操作。Hammer 的 IP application 对外 attach/detach 入口属于
 `hammer-plugin-session::IpSessionMain`；
 `hammer-service` 只提供通用 Application/Session owner 操作，TCP/UDP 只提供具体
 `Transport<IpTransportEndpointConfig>`。builtin app 本身仍是独立插件，不放到
-`hammer-plugin-session` 或 `hammer-app`。
+`hammer-plugin-session` 或 `hammer-service::session::namespace`。
 
 ```rust
 // VPP: vnet_application_attach/detach, application.c:1112-1219;
@@ -1949,7 +1949,7 @@ does not preserve a second dispatch path.
 3. Remove any duplicate application/listener pool or application callback storage from
    `hammer-plugin-session`; its only application-facing state is a raw `u32` listener/application
    identity passed to service APIs.
-4. Keep namespace records and generic namespace CRUD under ADR-0036: `hammer-app` owns the generic
+4. Keep namespace records and generic namespace CRUD under ADR-0036: `hammer-service::session::namespace` owns the generic
    namespace and supplies raw `u32`; this ADR adds that index to `Application` and validates its IP
    binding through `IpSessionMain`. Namespace socket work remains a later ADR. Do not add
    `ApplicationNamespaceIndex`, FIB fields, `ip4_fib_id + ip6_fib_id`, socket handles or a binding
