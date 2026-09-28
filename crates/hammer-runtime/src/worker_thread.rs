@@ -1,8 +1,10 @@
-use std::sync::atomic::AtomicU64;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use hammer_core::data_plane::NodeId;
 use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 
 use crate::config::WorkerScheduler;
@@ -29,6 +31,7 @@ pub struct WorkerThread {
     entry: fn(u32) -> RuntimeResult<()>,
     no_data_structure_clone: bool,
     join_handle: OnceLock<JoinHandle<RuntimeResult<()>>>,
+    node_interrupts: UnsafeCell<Option<Box<[AtomicU64]>>>,
     cacheline2: CacheLineAlignMark,
     main_loop_count: AtomicU64,
     cacheline3: CacheLineAlignMark,
@@ -47,6 +50,11 @@ const _: () = {
     assert!(core::mem::offset_of!(WorkerThread, main_loop_count) % CACHE_LINE == 0);
     assert!(core::mem::offset_of!(WorkerThread, loops_per_second) % CACHE_LINE == 0);
 };
+
+// SAFETY: node_interrupts is installed once before any worker launch or
+// producer publication. Its allocation is never replaced afterward; only the
+// contained atomics are accessed concurrently.
+unsafe impl Sync for WorkerThread {}
 
 impl WorkerThread {
     #[allow(clippy::too_many_arguments)]
@@ -84,6 +92,7 @@ impl WorkerThread {
             entry: entry.unwrap_or(data_worker_entry),
             no_data_structure_clone,
             join_handle: OnceLock::new(),
+            node_interrupts: UnsafeCell::new(None),
             cacheline2: CacheLineAlignMark,
             main_loop_count: AtomicU64::new(0),
             cacheline3: CacheLineAlignMark,
@@ -132,6 +141,51 @@ impl WorkerThread {
 
     pub(crate) fn install_barrier(&self, barrier: crate::WorkerBarrier) {
         assert!(self.barrier.set(barrier).is_ok(), "barrier installs once");
+    }
+
+    pub(crate) fn install_node_interrupts(&self, node_count: usize) {
+        // SAFETY: start_workers calls this before launching any worker. No
+        // producer has a published Session queue NodeId at this point.
+        let interrupts = unsafe { &mut *self.node_interrupts.get() };
+        assert!(interrupts.is_none(), "Data Worker node interrupts install once");
+        *interrupts = Some(
+            (0..node_count.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        );
+    }
+
+    #[inline]
+    pub(crate) fn interrupt_node(&self, node: NodeId) {
+        // SAFETY: the allocation was installed before worker launch and is
+        // immutable for the rest of the process; only its atomics change.
+        let pending = unsafe { &*self.node_interrupts.get() }
+            .as_ref()
+            .expect("Data Worker node interrupts install before event publication");
+        let bit = pending
+            .get(node.slot() as usize / 64)
+            .expect("published node is within the worker graph");
+        bit.fetch_or(1_u64 << (node.slot() % 64), Ordering::Release);
+        if let Some(thread) = self.join_handle.get() {
+            thread.thread().unpark();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn take_node_interrupts(&self, word: usize) -> Option<u64> {
+        // SAFETY: the allocation remains immutable after prelaunch install.
+        unsafe { &*self.node_interrupts.get() }
+            .as_ref()
+            .expect("Data Worker node interrupts install before dispatch")
+            .get(word)
+            .map(|pending| pending.swap(0, Ordering::Acquire))
+    }
+
+    #[inline]
+    pub(crate) fn is_current(&self) -> bool {
+        self.join_handle
+            .get()
+            .is_some_and(|thread| thread.thread().id() == std::thread::current().id())
     }
 
     pub(crate) fn launch(
@@ -201,11 +255,7 @@ impl WorkerThread {
                 if refork_required {
                     barrier.refork(&mut main.nodes);
                 }
-                if let Err(error) =
-                    crate::init::run_worker_init_functions(&mut main, &init_functions)
-                {
-                    tracing::error!(worker = thread_index, %error, "worker initialization failed");
-                }
+                crate::init::run_worker_init_functions(&mut main, &init_functions)?;
                 let exit_status = crate::main_loop::data_plane_main_loop(&mut main, idle_slice);
                 if exit_status == 0 {
                     Ok(())

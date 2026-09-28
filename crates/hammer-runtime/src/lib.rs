@@ -96,6 +96,8 @@ pub use process::Process;
 pub use main_loop::enqueue_main_thread_future;
 pub use thread_main::ThreadMain;
 pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
+pub use thread_main::interrupt_worker_node;
+pub use thread_main::is_current_worker;
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
     TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,

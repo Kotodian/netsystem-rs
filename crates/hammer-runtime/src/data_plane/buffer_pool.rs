@@ -133,6 +133,7 @@ impl DataPlaneMain {
             main_loop_exit_now: false,
             main_loop_exit_status: 0,
             last_time_stamp: hammer_infra::time::cpu_time_now(),
+            max_internal_frame_vectors: 0,
             worker_init_functions_called: hammer_infra::bitmap::Bitmap::new(),
         })
     }

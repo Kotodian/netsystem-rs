@@ -71,6 +71,12 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         worker_mains.push(Box::new(worker_main));
     }
 
+    for worker_slot in 0..worker_count {
+        threads
+            .thread_by_index(worker_slot + 1)
+            .expect("configured Data Worker descriptor exists")
+            .install_node_interrupts(main.nodes().node_count());
+    }
     let barrier = barrier::install(worker_count, participant_count);
     for thread_index in 1..threads.thread_count() {
         threads

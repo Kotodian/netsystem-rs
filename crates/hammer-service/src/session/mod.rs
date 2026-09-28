@@ -3,11 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hammer_core::data_plane::NodeState;
 use hammer_infra::svm::fifo_segment::{FifoSegmentError, SvmFifoSegment, SvmFifoSegmentConfig};
 use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQError, SvmMsgQRingConfig};
 use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
-use hammer_runtime::{DataPlaneMain, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 
 pub mod app;
 pub mod core;
@@ -27,7 +26,8 @@ pub use core::{
     SessionEventEnqueue, SessionEventType, SessionFlags, SessionHandle, SessionMain,
     SessionMigrationRequest, SessionMigrationState, SessionRxSegment, SessionState,
     SessionTxContext, SessionWorker, SessionWorkerFlags, SessionWorkerState,
-    enqueue_notify, program_transport_io_event, program_tx_io_event,
+    enqueue_notify, program_transport_io_event, program_tx_io_event, send_control_event,
+    send_rpc_event, send_rpc_event_force,
 };
 pub use endpoint::{SessionEndpoint, SessionEndpointConfig, SessionEndpointFlags};
 pub use error::{SessionError, SessionQueueError};
@@ -103,40 +103,6 @@ fn init_application() -> RuntimeResult<()> {
     app::ApplicationMain::init(
         u32::try_from(hammer_runtime::config::worker::worker_count())
             .expect("configured worker count fits u32"),
-    )?;
-    Ok(())
-}
-
-#[hammer_component_macros::worker_init_function(name = "session_worker_init")]
-fn init_session_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let session_main = core::SessionMain::global()
-        .expect("Session Main initializes before session worker graph setup");
-    let enabled = session_main.is_enabled();
-    let session_input = engine
-        .node_by_name("session-input")
-        .ok_or(error::SessionQueueError::NodeMissing)?;
-    engine.nodes().set_node_state(
-        session_input,
-        if enabled {
-            NodeState::Interrupt
-        } else {
-            NodeState::Disabled
-        },
-    )?;
-    let worker = unsafe { session_main.worker_mut(engine) }
-        .expect("session worker graph setup runs on a configured Data Worker");
-    worker.install_input_node(session_input);
-    let session_queue = engine
-        .node_by_name("session-queue")
-        .ok_or(error::SessionQueueError::NodeMissing)?;
-    worker.install_queue_node(session_queue);
-    engine.nodes().set_node_state(
-        session_queue,
-        if enabled {
-            NodeState::Polling
-        } else {
-            NodeState::Disabled
-        },
     )?;
     Ok(())
 }

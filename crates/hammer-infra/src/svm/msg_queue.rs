@@ -783,6 +783,22 @@ impl SvmMsgQ {
 }
 
 impl SvmMsgQProducerGuard<'_> {
+    /// Borrows the allocated ring slot while this guard owns the producer lock.
+    /// VPP: `svm_msg_q_msg_data`, message_queue.c:275-280.
+    ///
+    /// # Safety
+    /// `message` must be allocated by this guard and not yet submitted or
+    /// released. No other reference may access its bytes during this borrow.
+    pub unsafe fn message_bytes_mut(
+        &mut self,
+        message: SvmMsgQDescriptor,
+    ) -> Result<&mut [u8], SvmMsgQError> {
+        let (ring_index, _) = self.queue.validate_descriptor(message)?;
+        let stored = self.queue.ring(ring_index)?.elsize as usize;
+        let target = unsafe { self.queue.message_data(message)? };
+        Ok(unsafe { std::slice::from_raw_parts_mut(target.as_ptr(), stored) })
+    }
+
     pub fn alloc_msg(&mut self, nbytes: usize) -> Result<SvmMsgQDescriptor, SvmMsgQError> {
         if nbytes
             > self
@@ -988,6 +1004,23 @@ impl<T> SvmMsgQElement for T where
 }
 
 impl SvmMsgQ {
+    /// Borrows the complete ring slot while its dequeued descriptor remains
+    /// owned by the caller. VPP: `svm_msg_q_msg_data`, message_queue.c:275-280.
+    ///
+    /// # Safety
+    /// The caller must exclusively own this dequeued descriptor, keep it
+    /// allocated until the returned slice is no longer used, and prevent any
+    /// writer from mutating the slot during the borrow.
+    pub unsafe fn message_bytes(
+        &self,
+        message: SvmMsgQDescriptor,
+    ) -> Result<&[u8], SvmMsgQError> {
+        let (ring_index, _) = self.validate_descriptor(message)?;
+        let stored = self.ring(ring_index)?.elsize as usize;
+        let source = unsafe { self.message_data(message)? };
+        Ok(unsafe { std::slice::from_raw_parts(source.as_ptr(), stored) })
+    }
+
     pub fn read<T: SvmMsgQElement>(&self, message: SvmMsgQDescriptor) -> Result<T, SvmMsgQError> {
         let (ring_index, _) = self.validate_descriptor(message)?;
         let stored = self.ring(ring_index)?.elsize as usize;
