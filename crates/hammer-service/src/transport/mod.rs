@@ -134,6 +134,7 @@ impl Default for Pacer {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct TransportConnection<E, O = u32> {
     pub session: crate::session::SessionHandle,
     pub connection_index: u32,
@@ -142,6 +143,7 @@ pub struct TransportConnection<E, O = u32> {
     pub endpoint: E,
     pub pacer: Pacer,
     pub opaque: O,
+    pub cacheline_end: hammer_infra::align::CacheLineAlignMark,
 }
 
 impl<E, O> TransportConnection<E, O> {

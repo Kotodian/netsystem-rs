@@ -228,7 +228,7 @@ impl QuicMain {
                 Ok(listener) => listener,
                 Err(error) => {
                     applications
-                        .remove_listener(self.inner_application, inner_application_listener)
+                        .remove_listener_legacy(self.inner_application, inner_application_listener)
                         .expect("failed QUIC inner listen leaves Application listener available");
                     return Err(error.into());
                 }
@@ -283,7 +283,7 @@ impl QuicMain {
 
         session_main().unlisten(listener.inner_session_listener)?;
         application_main()
-            .remove_listener(self.inner_application, listener.inner_application_listener)
+            .remove_listener_legacy(self.inner_application, listener.inner_application_listener)
             .expect("validated QUIC inner Application listener remains during unlisten");
         self.contexts
             .get_mut()
@@ -445,7 +445,9 @@ fn init_quic() -> RuntimeResult<()> {
         QUIC_MAIN.get().is_none(),
         "QUIC initialization callback executes once"
     );
-    let inner_application = application_main().attach().map_err(RuntimeError::from)?;
+    let inner_application = application_main()
+        .attach_legacy()
+        .map_err(RuntimeError::from)?;
     let session_app = match hammer_service::session::register_session_app(
         inner_application,
         crate::session_app::VFT,

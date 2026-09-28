@@ -5,12 +5,12 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::runtime::SessionWorker;
 
-/// Concrete static callback table matching VPP `session_cb_vft_t`.
+/// Application callback table matching VPP `session_cb_vft_t`.
 ///
 /// All 19 VPP callbacks are present. Unimplemented callbacks remain `None`.
 #[deprecated(note = "Use direct event fields on ApplicationConfig for new applications")]
 #[derive(Debug, Clone, Copy)]
-pub struct SessionAppVft {
+pub struct ApplicationCallbacks {
     pub name: &'static str,
     pub add_segment: Option<fn(&mut SessionWorker, u64, u64) -> RuntimeResult<()>>,
     pub del_segment: Option<fn(&mut SessionWorker, u64, u64) -> RuntimeResult<()>>,
@@ -73,6 +73,6 @@ impl Default for SessionAppVft {
 #[allow(deprecated)]
 pub fn register_session_app(application: u32, vft: SessionAppVft) -> RuntimeResult<u32> {
     super::application_main()
-        .register_session_app(application, vft)
+        .register_session_app(application, callbacks)
         .map_err(RuntimeError::from)
 }

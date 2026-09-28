@@ -304,6 +304,7 @@ pub enum RxDelivery {
 impl SessionWorker {
     fn new(worker_index: u32, config: SessionConfig) -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             sessions: Pool::with_capacity(config.session_capacity as usize),
             event_queue_index: worker_index,
             last_time: 0.0,
@@ -1261,6 +1262,7 @@ impl Session {
             state: AtomicU8::new(u8::from(state)),
             session_type: protocol,
             flags: SessionFlags::default(),
+            app_worker_index: None,
             rx_fifo: None,
             tx_fifo: None,
             application_worker: SESSION_INDEX_INVALID,
@@ -1290,6 +1292,23 @@ impl Session {
     #[inline(always)]
     pub fn opaque_mut(&mut self) -> &mut u32 {
         &mut self.opaque
+    }
+
+    // VPP: session_t.app_wrk_index, session_types.h:264-271.
+    #[inline(always)]
+    pub const fn app_worker_index(&self) -> Option<u32> {
+        self.app_worker_index
+    }
+
+    // VPP: app_worker_init_accepted/app_worker_init_connected,
+    // application_worker.c:493-631. Only the owning worker mutates a Session.
+    pub fn attach_app_worker(&mut self, app_worker_index: u32) {
+        self.app_worker_index = Some(app_worker_index);
+    }
+
+    // VPP: segment_manager_del_sessions_filter, segment_manager.c:716-743.
+    pub fn detach_app_worker(&mut self) {
+        self.app_worker_index = None;
     }
 
     #[inline(always)]

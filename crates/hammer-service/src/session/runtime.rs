@@ -33,9 +33,9 @@ use crate::session::application::{ApplicationMain, application_main};
 use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::legacy_app::AppWorkerError;
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
-use crate::session::protocol::SessionAppVft;
+use crate::session::protocol::ApplicationCallbacks;
 use crate::session::state::SessionState;
-use crate::session::{AppWorker, SessionQueueNext};
+use crate::session::{AppSessionWorker, SessionQueueNext};
 use crate::transport::transport_vft;
 
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
@@ -473,7 +473,7 @@ pub struct SessionWorker {
     worker_count: usize,
     migration_queues: Arc<SessionMigrateQueues>,
     entries: Pool<SessionEntry>,
-    app: AppWorker,
+    app: AppSessionWorker,
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
     #[deprecated(note = "ADR-0039 removes transport callback tables from Session Worker")]
@@ -737,6 +737,7 @@ impl SessionMain {
         session_migrate_queues(self.workers.len()).pop_session_switch_pool_closed(worker)
     }
 
+    #[deprecated(note = "ADR-0040: use plugin-session listener composition")]
     pub fn listen(
         &self,
         application_listener: u32,
@@ -796,6 +797,7 @@ impl SessionMain {
         .map_err(|_| SessionError::ListenerControlWrongThread)?
     }
 
+    #[deprecated(note = "ADR-0040: use plugin-session listener composition")]
     pub fn unlisten(&self, listener: SessionHandle) -> Result<(), SessionError> {
         self.with_control_barrier(|| {
             let listener_entry = self
@@ -1849,7 +1851,7 @@ impl SessionWorker {
     /// ACCEPTED event is pushed to the App Session event queue and the
     /// ACCEPTED message rides the App Session publication. Queue-full
     /// retries are drained by [`SessionWorker::poll_app`] from
-    /// [`AppWorker::pending_accepted`] without scanning.
+    /// [`AppSessionWorker::pending_accepted`] without scanning.
     pub fn publish_accepted_transport_session(&mut self, session_id: u32) -> RuntimeResult<()> {
         let entry = self
             .entries
@@ -3801,7 +3803,7 @@ impl SessionWorker {
     }
 
     #[inline]
-    fn session_callbacks(&self, session_id: u32, app: u32) -> Option<SessionAppVft> {
+    fn session_callbacks(&self, session_id: u32, app: u32) -> Option<ApplicationCallbacks> {
         let application = match self.entries.get(session_id)?.application? {
             SessionApplication::External(application) => application,
         };
@@ -3818,7 +3820,7 @@ impl SessionWorker {
         publisher: Option<AppSessionPublisher>,
         session_evt_q: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Self> {
-        let app = AppWorker::new(pool_capacity, worker.slot(), publisher);
+        let app = AppSessionWorker::new(pool_capacity, worker.slot(), publisher);
         Ok(Self {
             worker,
             worker_count,

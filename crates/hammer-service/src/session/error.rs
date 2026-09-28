@@ -6,6 +6,8 @@ use hammer_runtime::app::{SessionControlError, SessionHandle};
 use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
 
+use super::application::ApplicationError;
+
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
 pub enum SessionQueueError {
@@ -67,6 +69,16 @@ pub enum SessionError {
     NoApplication,
     #[error("Application is already attached")]
     ApplicationAttached,
+    #[error("Application attach failed")]
+    ApplicationAttach {
+        #[source]
+        source: ApplicationError,
+    },
+    #[error("Application detach failed")]
+    ApplicationDetach {
+        #[source]
+        source: ApplicationError,
+    },
     #[error("local port is already in use")]
     PortInUse,
     #[error("IP address is already in use")]
@@ -250,6 +262,8 @@ impl From<SessionError> for SessionControlError {
             | SessionError::NoSession
             | SessionError::NoApplication
             | SessionError::ApplicationAttached
+            | SessionError::ApplicationAttach { .. }
+            | SessionError::ApplicationDetach { .. }
             | SessionError::PortInUse
             | SessionError::IpInUse
             | SessionError::AlreadyListening
