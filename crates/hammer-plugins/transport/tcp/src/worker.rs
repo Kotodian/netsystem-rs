@@ -1,13 +1,16 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::{TcpError, TcpSeq, TcpState};
+use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
+use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::Pool;
+use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::{DataPlaneMain, DataWorkerId};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::connection::TcpTimerAction;
 use super::lookup::TcpLookupState;
-use super::timers::{TcpTimerKind, TcpTimers};
+use super::timers::{TCP_TIMER_EXPIRY_BUDGET, TCP_TIMER_KIND_COUNT, TcpTimerKind, TcpTimerToken};
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
@@ -18,21 +21,74 @@ const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
 const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
 const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
+#[repr(C)]
 pub struct TcpWorker {
-    protocol: u8,
+    cacheline0: CacheLineAlignMark,
     pub(crate) connections: Pool<TcpConnection>,
+    pending_deq_acked: Vec<u32>,
+    pending_disconnects: Vec<u32>,
+    pending_resets: Vec<u32>,
+    pub(crate) time_us: f64,
+    pub(crate) time_tstamp: u32,
+    pub(crate) max_timers_per_loop: u32,
+    pub(super) pending_timers: FifoQueue<TcpTimerToken>,
+    cacheline1: CacheLineAlignMark,
+    cached_opts: [u8; 40],
+    tx_buffers: Vec<u32>,
+    pending_cleanups: FifoQueue<TcpCleanupRequest>,
+    pub(crate) tco_next_node: [SessionQueueNext; 2],
+    pub(super) timer_wheel: TimerWheel1t2w2048sl<u32>,
+    pub(super) expired_timers: Vec<u32>,
+    pub(super) last_timer_update: Instant,
+    pub(crate) time_origin: Instant,
+    pub(crate) time_origin_seconds: Option<f64>,
+    cacheline2: CacheLineAlignMark,
     pub(crate) lookup: TcpLookupState,
-    pub(super) timers: TcpTimers,
+    pub(crate) protocol: u8,
 }
+
+struct TcpCleanupRequest {
+    free_time: Instant,
+    connection_index: u32,
+}
+
+const _: () = {
+    assert!(core::mem::align_of::<TcpWorker>() == CACHE_LINE);
+    assert!(core::mem::offset_of!(TcpWorker, cacheline0) == 0);
+    assert!(core::mem::offset_of!(TcpWorker, cacheline1) % CACHE_LINE == 0);
+    assert!(core::mem::offset_of!(TcpWorker, cacheline2) % CACHE_LINE == 0);
+};
 
 impl TcpWorker {
     #[inline]
     pub fn new(worker: DataWorkerId, protocol: u8) -> Self {
+        let time_origin = Instant::now();
         Self {
-            protocol,
+            cacheline0: CacheLineAlignMark,
             connections: Pool::with_capacity(DEFAULT_TCP_CONNECTION_CAPACITY),
+            pending_deq_acked: Vec::with_capacity(256),
+            pending_disconnects: Vec::with_capacity(256),
+            pending_resets: Vec::with_capacity(256),
+            time_us: 0.0,
+            time_tstamp: 0,
+            max_timers_per_loop: 10,
+            pending_timers: FifoQueue::new(),
+            cacheline1: CacheLineAlignMark,
+            cached_opts: [0; 40],
+            tx_buffers: Vec::new(),
+            pending_cleanups: FifoQueue::new(),
+            tco_next_node: [SessionQueueNext::from_slot(0); 2],
+            timer_wheel: TimerWheel1t2w2048sl::with_timer_ids(
+                TCP_TIMER_EXPIRY_BUDGET,
+                TCP_TIMER_KIND_COUNT,
+            ),
+            expired_timers: Vec::new(),
+            last_timer_update: time_origin,
+            time_origin,
+            time_origin_seconds: None,
+            cacheline2: CacheLineAlignMark,
             lookup: TcpLookupState::new(worker),
-            timers: TcpTimers::new(Instant::now(), Duration::from_millis(10)),
+            protocol,
         }
     }
 
@@ -104,11 +160,11 @@ impl TcpWorker {
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
-        let (session_id, segment, has_pending_sack) = {
+        let (session_id, segment, has_pending_sack, is_ip4) = {
             let Self {
                 connections,
                 lookup,
-                timers,
+                timer_wheel: timers,
                 ..
             } = self;
             let connection = connections
@@ -121,11 +177,23 @@ impl TcpWorker {
                 .unwrap_or_default();
             let segment =
                 connection.on_tcp_ready(index, timers, has_pending_tx, capabilities, now)?;
-            (session_id, segment, connection.has_pending_sack_output())
+            (
+                session_id,
+                segment,
+                connection.has_pending_sack_output(),
+                connection.remote().is_ipv4(),
+            )
         };
         if let Some(segment) = segment {
             if segment.payload_len() == 0 {
-                enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
+                enqueue_tcp_segment(
+                    runtime,
+                    frame,
+                    self.tco_next_node[usize::from(!is_ip4)],
+                    output,
+                    index,
+                    segment,
+                )?;
             } else {
                 sessions.mark_ready(session_id);
             }
@@ -139,6 +207,8 @@ impl TcpWorker {
     }
 }
 
+/// Deprecated compatibility implementation for the old Session Queue path.
+/// New transport operations belong to `Transport<IpTransportEndpointConfig> for TcpMain`.
 impl SessionTransport for TcpWorker {
     type Tx = SessionPacketizedTx;
 
@@ -178,7 +248,14 @@ impl SessionTransport for TcpWorker {
             .ok_or(TcpNodeError::SessionMissing)?
             .clone();
         let segment = candidate.receive_window_update_segment(rx_available)?;
-        enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
+        enqueue_tcp_segment(
+            runtime,
+            frame,
+            self.tco_next_node[usize::from(!candidate.remote().is_ipv4())],
+            output,
+            index,
+            segment,
+        )?;
         *self
             .connections
             .get_mut(index)
@@ -195,13 +272,18 @@ impl SessionTransport for TcpWorker {
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
-        self.timers.advance(now, &mut self.connections);
-        while let Some(token) = self.timers.take_pending(&mut self.connections) {
-            let (session_id, outcome) = {
+        self.advance_timer_wheel(now);
+        let mut dispatched = 0;
+        while dispatched < self.max_timers_per_loop {
+            let Some(token) = self.take_pending_timer() else {
+                break;
+            };
+            dispatched += 1;
+            let (session_id, outcome, is_ip4) = {
                 let Self {
                     connections,
                     lookup,
-                    timers,
+                    timer_wheel: timers,
                     ..
                 } = self;
                 let connection = connections
@@ -218,7 +300,7 @@ impl SessionTransport for TcpWorker {
                     capabilities,
                     now,
                 )?;
-                (session_id, outcome)
+                (session_id, outcome, connection.remote().is_ipv4())
             };
             if let Some(action) = outcome.action {
                 let counter = match action {
@@ -232,7 +314,14 @@ impl SessionTransport for TcpWorker {
             }
             if let Some(segment) = outcome.segment {
                 if segment.payload_len() == 0 {
-                    enqueue_tcp_segment(runtime, frame, output_next, output, segment)?;
+                    enqueue_tcp_segment(
+                        runtime,
+                        frame,
+                        self.tco_next_node[usize::from(!is_ip4)],
+                        output,
+                        token.index,
+                        segment,
+                    )?;
                 } else {
                     sessions.mark_ready(session_id);
                 }
@@ -266,12 +355,14 @@ impl SessionTransport for TcpWorker {
                 .connections
                 .get_mut(index)
                 .ok_or(TcpNodeError::SessionMissing)?;
-            connection.on_session_close(index, &mut self.timers);
+            connection.on_session_close(index, &mut self.timer_wheel);
         }
         self.control_output(sessions, index, runtime, output_next, frame, output, now)
     }
 }
 
+/// Deprecated compatibility implementation for the old packetized Session Queue.
+/// Its trait is marked `#[deprecated]` in service; do not add new callers.
 impl SessionPacketizedTransport for TcpWorker {
     #[inline]
     fn control_tx(
@@ -356,6 +447,6 @@ impl SessionPacketizedTransport for TcpWorker {
             segment.write_to_buffer(&mut *runtime.buffer_mut(entry.index))?;
             connection.commit_payload_tx(entry.payload_len, now)?;
         }
-        connection.sync_payload_tx_timers(index, &mut self.timers, now)
+        connection.sync_payload_tx_timers(index, &mut self.timer_wheel, now)
     }
 }

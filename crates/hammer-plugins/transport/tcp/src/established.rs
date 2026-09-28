@@ -1,64 +1,92 @@
-use crate::{publish_tcp_connection, read_session_id};
+use crate::read_session_id;
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::runtime::{RxDelivery, session_main};
+use hammer_service::session::{RxDelivery, SessionHandle};
 
+use super::TcpError;
 use super::TcpNodeError;
 use super::segment::tcp_packet;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
-    #[next("tcp-output")]
+    #[next("tcp4-output")]
     Output,
     Drop,
 }
 
 #[hammer_component_macros::graph_node(
     graph = tcp_worker,
-    init = crate::established::register_tcp_established,
-    name = "tcp-established",
+    init = crate::established::register_tcp4_established,
+    name = "tcp4-established",
     next = TcpEstablishedNext,
     role = internal,
 )]
-pub struct TcpEstablishedNode {}
+pub struct Tcp4EstablishedNode {}
 
-pub fn register_tcp_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+#[hammer_component_macros::graph_node(
+    graph = tcp_worker,
+    init = crate::established::register_tcp6_established,
+    name = "tcp6-established",
+    next = TcpEstablishedNext,
+    role = internal,
+)]
+pub struct Tcp6EstablishedNode {}
+
+pub fn register_tcp4_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    if let Some(node) = runtime.nodes().node_by_name("tcp-established") {
+    if let Some(node) = runtime.nodes().node_by_name("tcp4-established") {
         return Ok(node);
     }
     runtime.nodes().try_register_internal_with_next_names(
-        TcpEstablishedNode::new(),
+        Tcp4EstablishedNode::new(),
         &TcpEstablishedNext::NEXT_NAMES,
     )
 }
 
-impl Node for TcpEstablishedNode {
+pub fn register_tcp6_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(Tcp6EstablishedNode::new(), &["tcp6-output", "drop"])
+}
+
+impl Node for Tcp4EstablishedNode {
     #[inline(always)]
     fn process(
         runtime: &mut DataPlaneMain,
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_established_process;
+        let process: NodeProcessFn = tcp_established_process::<true>;
         process(runtime, node_runtime, frame)
     }
 }
 
-pub(crate) fn tcp_established_process(
+impl Node for Tcp6EstablishedNode {
+    #[inline(always)]
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_established_process::<false>;
+        process(runtime, node_runtime, frame)
+    }
+}
+
+pub(crate) fn tcp_established_process<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_established_frame(runtime, node_runtime, frame);
+    tcp_established_frame::<IS_IP4>(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_established_frame(
+fn tcp_established_frame<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
@@ -68,7 +96,7 @@ fn tcp_established_frame(
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
     for &index in frame.vector_args() {
-        if tcp_established_index(
+        if tcp_established_index::<IS_IP4>(
             runtime,
             node_runtime,
             index,
@@ -92,6 +120,15 @@ fn tcp_established_frame(
     if out_len != 0 {
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
+    let session_main = hammer_service::session::SessionMain::global()
+        .expect("Session Main initializes before TCP established input");
+    let sessions = unsafe { session_main.worker_mut(runtime) }
+        .expect("TCP established input runs on its Session worker");
+    let protocol = crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before established input")
+        .protocol();
+    sessions.flush_enqueue_events(runtime, protocol);
     ()
 }
 
@@ -121,34 +158,39 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_established_index(
+fn tcp_established_index<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
-    node_runtime: &mut hammer_runtime::NodeRuntime,
+    _: &mut hammer_runtime::NodeRuntime,
     index: u32,
-    out_frame: &mut Frame,
-    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
-    out_len: &mut usize,
+    _: &mut Frame,
+    _: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    _: &mut usize,
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
+    if packet.local.is_ipv4() != IS_IP4 {
+        return Err(TcpError::SegmentInvalid.into());
+    }
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let ip_session = hammer_plugin_session::IpSessionMain::global()?;
     // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let sessions = unsafe { ip_session.session().worker_mut(runtime)? };
     let mut tcp = main.worker(runtime.thread_index())?;
-    let tx_segment = {
+    let (tx_segment, connection_index) = {
         let sessions = &mut *sessions;
         let tcp = &mut *tcp;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing);
             TcpNodeError::EstablishedSessionRouteMissing
         })?;
-        // Warm the session pool slot cacheline before the `session_mut`
-        // borrow; the `receive_established`/`accept_payload` work below gives
-        // the prefetch lead time.
-        sessions.prefetch_session(session_id);
+        let handle = SessionHandle {
+            worker_index: sessions.worker_index(),
+            session_index: session_id,
+        };
         let connection_index = sessions
-            .transport_connection_index(session_id)
+            .session_from_handle(handle)
+            .map(|session| session.connection_index())
             .ok_or(TcpNodeError::EstablishedSessionMissing)?;
         let (
             control,
@@ -160,7 +202,7 @@ fn tcp_established_index(
         ) = {
             let crate::worker::TcpWorker {
                 connections,
-                timers,
+                timer_wheel: timers,
                 ..
             } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
@@ -186,10 +228,22 @@ fn tcp_established_index(
             )
         };
         if acked_tx_len != 0 {
-            sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
+            let tx = sessions
+                .session_from_handle(handle)
+                .and_then(|session| session.tx_fifo())
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
+            assert_eq!(
+                tx.drop_dequeue(acked_tx_len as usize),
+                acked_tx_len as usize
+            );
         }
-        if ack_advanced && sessions.pending_send_len(session_id)?.is_some() {
-            sessions.mark_ready(session_id);
+        if ack_advanced
+            && sessions
+                .session_from_handle(handle)
+                .and_then(|session| session.tx_fifo())
+                .is_some_and(|fifo| fifo.max_dequeue() != 0)
+        {
+            sessions.enqueue_ready(handle, tcp.protocol)?;
         }
         let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
@@ -199,7 +253,7 @@ fn tcp_established_index(
                 buffer.advance(packet.payload_offset.saturating_add(trim) as isize);
                 buffer.truncate(accepted_len as usize)?;
             }
-            let delivery = sessions.enqueue_rx(runtime, session_id, index, offset)?;
+            let delivery = sessions.enqueue_rx(runtime, handle, index, offset)?;
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
                 | RxDelivery::InOrder { rx_available, .. }
@@ -218,7 +272,7 @@ fn tcp_established_index(
             immediate_ack = {
                 let crate::worker::TcpWorker {
                     connections,
-                    timers,
+                    timer_wheel: timers,
                     ..
                 } = tcp;
                 let connection = connections.get_mut(connection_index).ok_or_else(|| {
@@ -233,9 +287,6 @@ fn tcp_established_index(
                     true
                 }
             };
-            if matches!(delivery, RxDelivery::InOrder { .. }) {
-                sessions.mark_ready(session_id);
-            }
             match delivery {
                 RxDelivery::NotAccepted { .. } => {}
                 RxDelivery::InOrder {
@@ -275,7 +326,7 @@ fn tcp_established_index(
             connection.process_fin_after_payload(&packet)?
         };
         if fin_control.is_some() {
-            sessions.notify_transport_closing(Some(runtime), session_id, connection_index)?;
+            sessions.transport_closing(runtime, handle, connection_index)?;
         }
 
         let tx_segment = if immediate_ack {
@@ -295,8 +346,7 @@ fn tcp_established_index(
         }
         .or(fin_control)
         .or(control);
-        publish_tcp_connection(sessions, tcp, session_id)?;
-        tx_segment
+        (tx_segment, connection_index)
     };
     if let Some(segment) = tx_segment {
         let mut allocated = 0;
@@ -306,16 +356,20 @@ fn tcp_established_index(
             )
             .into());
         }
-        segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
-        emit_local(
+        if let Err(source) = segment.write_to_buffer(&mut *runtime.buffer_mut(allocated)) {
+            runtime.buffer_free_one(allocated);
+            return Err(source);
+        }
+        let worker_index = runtime.data_worker_id()?.slot() as u32;
+        let egress = hammer_core::buffer_opaque!(mut runtime.buffer_mut(allocated) => crate::TcpSecondaryOpaque)
+            .egress_mut();
+        egress.connection_index = connection_index;
+        egress.worker_index = worker_index;
+        sessions.add_pending_tx_buffer(
             runtime,
-            node_runtime,
-            out_frame,
-            nexts,
-            out_len,
-            TcpEstablishedNext::Output,
             allocated,
-        )?;
+            tcp.tco_next_node[usize::from(!packet.local.is_ipv4())],
+        );
     }
     Ok(())
 }

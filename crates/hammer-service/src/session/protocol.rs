@@ -8,6 +8,7 @@ use super::runtime::SessionWorker;
 /// Application callback table matching VPP `session_cb_vft_t`.
 ///
 /// All 19 VPP callbacks are present. Unimplemented callbacks remain `None`.
+#[deprecated(note = "Use direct event fields on ApplicationConfig for new applications")]
 #[derive(Debug, Clone, Copy)]
 pub struct ApplicationCallbacks {
     pub name: &'static str,
@@ -32,7 +33,8 @@ pub struct ApplicationCallbacks {
     pub crypto_async: Option<fn(&mut SessionWorker, u32, u64) -> RuntimeResult<()>>,
 }
 
-impl ApplicationCallbacks {
+#[allow(deprecated)]
+impl SessionAppVft {
     pub const fn all_none(name: &'static str) -> Self {
         Self {
             name,
@@ -59,21 +61,17 @@ impl ApplicationCallbacks {
     }
 }
 
-impl Default for ApplicationCallbacks {
+#[allow(deprecated)]
+impl Default for SessionAppVft {
     fn default() -> Self {
         Self::all_none("")
     }
 }
 
-#[deprecated(note = "use ApplicationCallbacks; the old VFT name is a compatibility alias")]
-pub type SessionAppVft = ApplicationCallbacks;
-
-/// Registers one owner-defined callback table on its Application.
-#[deprecated(note = "ADR-0040: supply ApplicationCallbacks during attach")]
-pub fn register_session_app(
-    application: u32,
-    callbacks: ApplicationCallbacks,
-) -> RuntimeResult<u32> {
+/// Registers one owner-defined Session App VFT on its owning Application.
+#[deprecated(note = "Use direct event fields on ApplicationConfig for new applications")]
+#[allow(deprecated)]
+pub fn register_session_app(application: u32, vft: SessionAppVft) -> RuntimeResult<u32> {
     super::application_main()
         .register_session_app(application, callbacks)
         .map_err(RuntimeError::from)

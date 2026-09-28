@@ -1,166 +1,173 @@
-use crate::{TcpCapabilities, TcpError, TcpHeader, TcpSegmentFlags, TcpSegmentHeader, tcp_header};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use crate::{TcpCapabilities, TcpSegmentFlags, tcp_header};
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
-use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
-use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
-use zerocopy::FromBytes;
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
+use hammer_service::opaque::{NetworkFlags, NetworkOpaque};
+
+use super::output::{tcp_output_push_ipv4, tcp_output_push_ipv6};
+use super::segment::TcpSegment;
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
     Drop,
     #[next("ip4-lookup")]
-    LookupV4,
-    #[next("ip6-lookup")]
-    LookupV6,
+    Lookup,
 }
 
 #[hammer_component_macros::graph_node(
     graph = service,
-    init = crate::reset::register_tcp_reset,
+    init = crate::reset::register_tcp4_reset,
     next = TcpResetNext,
     role = internal,
+    name = "tcp4-reset",
 )]
 #[derive(Clone, Copy)]
-pub struct TcpResetNode;
+pub struct Tcp4ResetNode;
 
-pub fn register_tcp_reset(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+#[hammer_component_macros::graph_node(
+    graph = service,
+    init = crate::reset::register_tcp6_reset,
+    next = TcpResetNext,
+    role = internal,
+    name = "tcp6-reset",
+)]
+#[derive(Clone, Copy)]
+pub struct Tcp6ResetNode;
+
+pub fn register_tcp4_reset(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
-        .try_register_internal_with_next_names(TcpResetNode::new(), &TcpResetNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(Tcp4ResetNode::new(), &TcpResetNext::NEXT_NAMES)
 }
 
-impl Node for TcpResetNode {
+pub fn register_tcp6_reset(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(Tcp6ResetNode::new(), &["drop", "ip6-lookup"])
+}
+
+impl Node for Tcp4ResetNode {
     #[inline(always)]
     fn process(
         runtime: &mut DataPlaneMain,
-        node_runtime: &mut hammer_runtime::NodeRuntime,
+        node_runtime: &mut NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_reset_process;
+        let process: NodeProcessFn = tcp_reset_process::<true>;
         process(runtime, node_runtime, frame)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
-        Ok(NodeRuntime::default())
     }
 }
 
-fn tcp_reset_process(
+impl Node for Tcp6ResetNode {
+    #[inline(always)]
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_reset_process::<false>;
+        process(runtime, node_runtime, frame)
+    }
+}
+
+fn tcp_reset_process<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_reset_process_frame(runtime, node_runtime, frame);
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+        tcp_reset_next_for_index::<IS_IP4>(runtime, index).unwrap_or(TcpResetNext::Drop)
+    });
     processed_vectors
 }
 
-fn tcp_reset_process_frame(
-    runtime: &mut DataPlaneMain,
-    node_runtime: &mut hammer_runtime::NodeRuntime,
-    frame: &mut Frame,
-) -> () {
-    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        tcp_reset_next_for_index(runtime, index).unwrap_or(TcpResetNext::Drop)
-    })
-}
-
 #[inline(always)]
-fn tcp_reset_next_for_index(
+fn tcp_reset_next_for_index<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
 ) -> RuntimeResult<TcpResetNext> {
-    let reset = {
+    let Some((segment, tcp_offset, source, destination, fib_index, input_interface)) = ({
         let buffer = runtime.buffer(index);
-        tcp_reset_prepare_from_current(
-            buffer.current(),
-            hammer_core::buffer_opaque!(buffer => hammer_service::opaque::NetworkOpaque)
-                .packet_cursor(),
+        let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+        let Some(fib_index) = network.ip().fib_index() else {
+            return Ok(TcpResetNext::Drop);
+        };
+        tcp_reset_segment(buffer.current(), network.packet_cursor()).map(
+            |(segment, tcp_offset, source, destination)| {
+                (
+                    segment,
+                    tcp_offset,
+                    source,
+                    destination,
+                    fib_index,
+                    network.sw_if_index[0],
+                )
+            },
         )
-    };
-    let next = match reset.map(|reset| reset.7) {
-        Some(4) => TcpResetNext::LookupV4,
-        Some(6) => TcpResetNext::LookupV6,
-        _ => return Ok(TcpResetNext::Drop),
-    };
-    let Some(reply_len) = tcp_reset_write_reply(runtime, index, reset)? else {
+    }) else {
         return Ok(TcpResetNext::Drop);
     };
-    refresh_reset_metadata(runtime, index, reply_len)?;
-    Ok(next)
-}
+    if source.is_ipv4() != IS_IP4 {
+        return Ok(TcpResetNext::Drop);
+    }
 
-#[inline(always)]
-fn tcp_reset_write_reply(
-    runtime: &mut DataPlaneMain,
-    index: u32,
-    reset: Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)>,
-) -> RuntimeResult<Option<usize>> {
-    let Some((
-        source,
-        destination,
-        source_port,
-        destination_port,
-        sequence,
-        acknowledgment,
-        flags,
-        version,
-    )) = reset
-    else {
-        return Ok(None);
-    };
-    let reply_len = match version {
-        4 => 20 + 20,
-        6 => 40 + 20,
-        _ => return Ok(None),
-    };
-    let reply_len = {
+    let next_buffer = runtime.buffer(index).next_buffer_slot();
+    if let Some(next_buffer) = next_buffer {
+        runtime.buffer_mut(index).set_next_buffer(None);
+        runtime.buffer_free_one(next_buffer);
+    }
+    {
         let buffer = runtime.buffer_mut(index);
+        buffer.set_total_len_not_including_first(0)?;
+        buffer.advance(tcp_offset as isize);
         buffer.truncate(0)?;
-        if buffer.space_left_at_end() < reply_len {
-            return Ok(None);
+        let header = buffer.push_uninit(segment.header_len() as u8);
+        segment.write_header(header)?;
+        buffer.clear_node_error();
+    }
+    match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) if IS_IP4 => {
+            tcp_output_push_ipv4::<1>(runtime, index, source, destination, 40, fib_index)?;
+            let buffer = runtime.buffer_mut(index);
+            let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
+            network.sw_if_index[0] = input_interface;
+            network.flags.insert(NetworkFlags::LOCALLY_ORIGINATED);
+            Ok(TcpResetNext::Lookup)
         }
-        let writable = buffer.put_uninit(reply_len as u16);
-        let Some(reply_len) = tcp_reset_write_current_reply(
-            writable,
-            source,
-            destination,
-            source_port,
-            destination_port,
-            sequence,
-            acknowledgment,
-            flags,
-            version,
-        ) else {
-            buffer.truncate(0)?;
-            return Ok(None);
-        };
-        reply_len
-    };
-    Ok(Some(reply_len))
+        (IpAddr::V6(source), IpAddr::V6(destination)) if !IS_IP4 => {
+            tcp_output_push_ipv6::<1>(runtime, index, source, destination, 20, fib_index)?;
+            let buffer = runtime.buffer_mut(index);
+            let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
+            network.sw_if_index[0] = input_interface;
+            network.flags.insert(NetworkFlags::LOCALLY_ORIGINATED);
+            Ok(TcpResetNext::Lookup)
+        }
+        _ => unreachable!("TCP reset source and destination share the incoming IP family"),
+    }
 }
 
+/// VPP: tcp_output.c:570-650, tcp_buffer_make_reset; 2502-2538, tcp46_reset_inline.
 #[inline(always)]
-fn tcp_reset_prepare_from_current(
+fn tcp_reset_segment(
     packet: &[u8],
     cursor: BufferPacketCursor,
-) -> Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)> {
-    let available_len = packet.len().min(cursor.packet_len());
-    if cursor.transport_header_offset() > available_len
-        || cursor.transport_payload_offset() > available_len
-        || cursor.network_header_offset() > available_len
+) -> Option<(TcpSegment, usize, IpAddr, IpAddr)> {
+    let transport_offset = cursor.transport_header_offset();
+    let header_end = transport_offset.checked_add(20)?;
+    if cursor.network_header_offset() > transport_offset
+        || header_end > packet.len()
+        || header_end > cursor.packet_len()
+        || cursor.transport_payload_offset() > cursor.packet_len()
     {
         return None;
     }
-    let version = packet.get(cursor.network_header_offset()).copied()? >> 4;
-    let tcp_bytes = packet.get(cursor.transport_header_offset()..available_len)?;
-    let tcp = tcp_header(tcp_bytes).ok()?;
-    let tcp_header_len = tcp.header_len();
-    if cursor.transport_payload_offset()
-        != cursor
-            .transport_header_offset()
-            .checked_add(tcp_header_len)?
+    let version = packet.get(cursor.network_header_offset())? >> 4;
+    let network_header = packet.get(cursor.network_header_offset()..transport_offset)?;
+    let tcp = tcp_header(packet.get(transport_offset..)?).ok()?;
+    if transport_offset.checked_add(tcp.header_len())? != cursor.transport_payload_offset()
+        || cursor.transport_payload_offset() > packet.len()
     {
         return None;
     }
@@ -168,297 +175,59 @@ fn tcp_reset_prepare_from_current(
     if flags.contains(TcpSegmentFlags::RST) {
         return None;
     }
-    let payload_len = available_len.checked_sub(cursor.transport_payload_offset())?;
-    let sequence_len = u32::try_from(
-        payload_len
-            .checked_add(usize::from(flags.contains(TcpSegmentFlags::SYN)))?
-            .checked_add(usize::from(flags.contains(TcpSegmentFlags::FIN)))?,
-    )
-    .ok()?;
-    let (response_sequence, response_acknowledgment, response_flags) =
-        if flags.contains(TcpSegmentFlags::ACK) {
-            (tcp.acknowledgment_number(), 0, 0x04)
-        } else {
-            (
-                0,
-                tcp.sequence_number().wrapping_add(sequence_len),
-                0x04 | 0x10,
-            )
-        };
-    let mut source = [0u8; 16];
-    let mut destination = [0u8; 16];
-    match version {
+    let (source, destination) = match version {
         4 => {
-            if cursor.network_header_len() < 20
-                || cursor
-                    .network_header_offset()
-                    .checked_add(cursor.network_header_len())?
-                    > available_len
-                || usize::from(packet.get(cursor.network_header_offset())? & 0x0f) * 4 < 20
-            {
-                return None;
-            }
-            read_bytes(
-                packet.get(
-                    cursor.network_header_offset() + 16..cursor.network_header_offset() + 20,
-                )?,
-                &mut source[..4],
-            );
-            read_bytes(
-                packet.get(
-                    cursor.network_header_offset() + 12..cursor.network_header_offset() + 16,
-                )?,
-                &mut destination[..4],
-            );
+            let source = network_header.get(12..16)?;
+            let destination = network_header.get(16..20)?;
+            (
+                IpAddr::V4(Ipv4Addr::new(source[0], source[1], source[2], source[3])),
+                IpAddr::V4(Ipv4Addr::new(
+                    destination[0],
+                    destination[1],
+                    destination[2],
+                    destination[3],
+                )),
+            )
         }
         6 => {
-            if cursor.network_header_len() < 40
-                || cursor
-                    .network_header_offset()
-                    .checked_add(cursor.network_header_len())?
-                    > available_len
-            {
-                return None;
-            }
-            read_bytes(
-                packet.get(
-                    cursor.network_header_offset() + 24..cursor.network_header_offset() + 40,
-                )?,
-                &mut source,
-            );
-            read_bytes(
-                packet
-                    .get(cursor.network_header_offset() + 8..cursor.network_header_offset() + 24)?,
-                &mut destination,
-            );
+            let source: [u8; 16] = network_header.get(8..24)?.try_into().ok()?;
+            let destination: [u8; 16] = network_header.get(24..40)?.try_into().ok()?;
+            (
+                IpAddr::V6(Ipv6Addr::from(source)),
+                IpAddr::V6(Ipv6Addr::from(destination)),
+            )
         }
         _ => return None,
-    }
-    Some((
-        source,
-        destination,
-        tcp.destination_port(),
-        tcp.source_port(),
-        response_sequence,
-        response_acknowledgment,
-        response_flags,
-        version,
-    ))
-}
-
-#[inline(always)]
-fn tcp_reset_write_current_reply(
-    output: &mut [u8],
-    source: [u8; 16],
-    destination: [u8; 16],
-    source_port: u16,
-    destination_port: u16,
-    sequence: u32,
-    acknowledgment: u32,
-    flags: u8,
-    version: u8,
-) -> Option<usize> {
-    match version {
-        4 => tcp_reset_write_ipv4_reply(
-            output,
-            source,
-            destination,
-            source_port,
-            destination_port,
-            sequence,
-            acknowledgment,
-            flags,
-        ),
-        6 => tcp_reset_write_ipv6_reply(
-            output,
-            source,
-            destination,
-            source_port,
-            destination_port,
-            sequence,
-            acknowledgment,
-            flags,
-        ),
-        _ => None,
-    }
-}
-
-fn tcp_reset_write_ipv4_reply(
-    output: &mut [u8],
-    source: [u8; 16],
-    destination: [u8; 16],
-    source_port: u16,
-    destination_port: u16,
-    sequence: u32,
-    acknowledgment: u32,
-    flags: u8,
-) -> Option<usize> {
-    const IPV4_HEADER_LEN: usize = 20;
-    const TCP_HEADER_LEN: usize = 20;
-    let total_len = IPV4_HEADER_LEN + TCP_HEADER_LEN;
-    let reset = output.get_mut(..total_len)?;
-    reset.fill(0);
-    reset[0] = 0x45;
-    write_be_u16(reset, 2, total_len as u16);
-    if crate::active_tcp_policy().pmtu_enabled {
-        let flags = u16::from_be_bytes([reset[6], reset[7]]) | 0x4000;
-        reset[6..8].copy_from_slice(&flags.to_be_bytes());
-    }
-    reset[8] = 64;
-    reset[9] = 6;
-    write_bytes(reset, 12, &source[..4]);
-    write_bytes(reset, 16, &destination[..4]);
-    write_reset_header(
-        &mut reset[IPV4_HEADER_LEN..],
-        source_port,
-        destination_port,
-        sequence,
-        acknowledgment,
-        flags,
-    )?;
-    let tcp_len_bytes = be_u16(TCP_HEADER_LEN as u16);
-    let tcp_checksum = internet_checksum_parts(&[
-        &source[..4],
-        &destination[..4],
-        &[0, 6],
-        &tcp_len_bytes,
-        &reset[IPV4_HEADER_LEN..],
-    ]);
-    let (tcp, _) = TcpHeader::mut_from_prefix(&mut reset[IPV4_HEADER_LEN..]).ok()?;
-    tcp.set_checksum(tcp_checksum);
-    let ip_checksum = internet_checksum(&reset[..IPV4_HEADER_LEN]);
-    write_be_u16(reset, 10, ip_checksum);
-    Some(total_len)
-}
-
-fn tcp_reset_write_ipv6_reply(
-    output: &mut [u8],
-    source: [u8; 16],
-    destination: [u8; 16],
-    source_port: u16,
-    destination_port: u16,
-    sequence: u32,
-    acknowledgment: u32,
-    flags: u8,
-) -> Option<usize> {
-    const IPV6_HEADER_LEN: usize = 40;
-    const TCP_HEADER_LEN: usize = 20;
-    let total_len = IPV6_HEADER_LEN + TCP_HEADER_LEN;
-    let reset = output.get_mut(..total_len)?;
-    reset.fill(0);
-    reset[0] = 0x60;
-    write_be_u16(reset, 4, TCP_HEADER_LEN as u16);
-    reset[6] = 6;
-    reset[7] = 64;
-    write_bytes(reset, 8, &source);
-    write_bytes(reset, 24, &destination);
-    write_reset_header(
-        &mut reset[IPV6_HEADER_LEN..],
-        source_port,
-        destination_port,
-        sequence,
-        acknowledgment,
-        flags,
-    )?;
-    let tcp_len_bytes = be_u32(TCP_HEADER_LEN as u32);
-    let tcp_checksum = internet_checksum_parts(&[
-        &source,
-        &destination,
-        &tcp_len_bytes,
-        &[0, 0, 0, 6],
-        &reset[IPV6_HEADER_LEN..],
-    ]);
-    let (tcp, _) = TcpHeader::mut_from_prefix(&mut reset[IPV6_HEADER_LEN..]).ok()?;
-    tcp.set_checksum(tcp_checksum);
-    Some(total_len)
-}
-
-#[inline(always)]
-fn write_reset_header(
-    output: &mut [u8],
-    source_port: u16,
-    destination_port: u16,
-    sequence: u32,
-    acknowledgment: u32,
-    flags: u8,
-) -> Option<()> {
-    let written = TcpSegmentHeader {
-        source_port,
-        destination_port,
-        sequence_number: sequence,
-        acknowledgment_number: acknowledgment,
-        flags: TcpSegmentFlags::from_bits_retain(u16::from(flags)),
-        advertised_window: 0,
-        urgent_pointer: 0,
-        capabilities: TcpCapabilities::default(),
-        timestamp: None,
-        fast_open_cookie: None,
-    }
-    .write_to_buffer(output, None)
-    .ok()?;
-    (written == 20).then_some(())
-}
-
-#[inline(always)]
-fn write_bytes(output: &mut [u8], offset: usize, bytes: &[u8]) {
-    let mut index = 0usize;
-    while index < bytes.len() {
-        output[offset + index] = bytes[index];
-        index += 1;
-    }
-}
-
-#[inline(always)]
-fn read_bytes(input: &[u8], output: &mut [u8]) {
-    let mut index = 0usize;
-    while index < input.len() {
-        output[index] = input[index];
-        index += 1;
-    }
-}
-
-#[inline(always)]
-fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
-    output[offset] = (value >> 8) as u8;
-    output[offset + 1] = value as u8;
-}
-
-#[inline(always)]
-fn be_u16(value: u16) -> [u8; 2] {
-    [(value >> 8) as u8, value as u8]
-}
-
-#[inline(always)]
-fn be_u32(value: u32) -> [u8; 4] {
-    [
-        (value >> 24) as u8,
-        (value >> 16) as u8,
-        (value >> 8) as u8,
-        value as u8,
-    ]
-}
-
-fn refresh_reset_metadata(
-    runtime: &mut DataPlaneMain,
-    index: u32,
-    packet_len: usize,
-) -> RuntimeResult<()> {
-    const TCP_HEADER_LEN: usize = 20;
-
-    let buffer = runtime.buffer_mut(index);
-    let network_header_len = match buffer.current().first().copied().map(|byte| byte >> 4) {
-        Some(4) => 20,
-        Some(6) => 40,
-        _ => return Err(TcpError::SegmentInvalid.into()),
     };
-    buffer.clear_node_error();
-    hammer_core::buffer_opaque!(mut buffer => hammer_service::opaque::NetworkOpaque)
-        .set_packet_cursor(
-            BufferPacketCursor::new()
-                .with_packet_len(packet_len)
-                .with_network_header(0, network_header_len)
-                .with_transport_header(network_header_len, TCP_HEADER_LEN)
-                .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
-        );
-    Ok(())
+    let (sequence, acknowledgment, reset_flags) = if flags.contains(TcpSegmentFlags::ACK) {
+        (tcp.acknowledgment_number(), 0, TcpSegmentFlags::RST)
+    } else {
+        let payload_len = cursor
+            .packet_len()
+            .checked_sub(cursor.transport_payload_offset())?;
+        let sequence_len = payload_len
+            .checked_add(usize::from(flags.contains(TcpSegmentFlags::SYN)))?
+            .checked_add(usize::from(flags.contains(TcpSegmentFlags::FIN)))?;
+        let sequence_len = u32::try_from(sequence_len).ok()?;
+        (
+            0,
+            tcp.sequence_number().wrapping_add(sequence_len),
+            TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+        )
+    };
+    let segment = TcpSegment::new(
+        SocketAddr::new(destination, tcp.destination_port()),
+        SocketAddr::new(source, tcp.source_port()),
+        sequence,
+        acknowledgment,
+        0,
+        reset_flags,
+        TcpCapabilities::default(),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
+    Some((segment, header_end, destination, source))
 }

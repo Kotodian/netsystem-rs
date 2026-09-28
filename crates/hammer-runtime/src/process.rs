@@ -405,41 +405,6 @@ impl DataPlaneMain {
         self.nodes.process_wait(node, deadline)
     }
 
-    pub fn run_main_until<F>(&mut self, future: F) -> RuntimeResult<F::Output>
-    where
-        F: Future,
-    {
-        crate::ensure_main_thread()?;
-        if self.thread_index() != 0 {
-            return Err(RuntimeError::MainProcessRuntimeUnavailable);
-        }
-        if self.nodes.process_runtime.is_none() {
-            return Err(RuntimeError::MainProcessRuntimeUnavailable);
-        }
-        let runtime = self
-            .nodes
-            .process_runtime
-            .take()
-            .expect("validated thread-zero Process runtime remains installed");
-        let output = runtime.block_on(async {
-            tokio::pin!(future);
-            loop {
-                self.nodes.restore_processes(Instant::now())?;
-                tokio::select! {
-                    output = &mut future => break Ok(output),
-                    readiness = self.next_file_readiness() => {
-                        readiness?;
-                    }
-                }
-            }
-        });
-        assert!(
-            self.nodes.process_runtime.replace(runtime).is_none(),
-            "thread-zero Process runtime has one NodeMain owner"
-        );
-        output
-    }
-
     pub fn stop_processes(&mut self) -> RuntimeResult<()> {
         self.nodes.stop_processes()
     }

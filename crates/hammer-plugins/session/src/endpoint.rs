@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-use hammer_service::session::SessionEndpoint;
+use hammer_service::session::{SessionEndpoint, SessionEndpointConfig};
 
 pub const ENDPOINT_INVALID_INDEX: u32 = u32::MAX;
 
@@ -24,6 +24,7 @@ pub struct IpTransportEndpointConfig {
 }
 
 pub type IpSessionEndpoint = SessionEndpoint<IpTransportEndpointConfig>;
+pub type IpSessionEndpointConfig = SessionEndpointConfig<IpTransportEndpointConfig>;
 
 impl From<IpSessionEndpoint> for IpTransportEndpointConfig {
     #[inline(always)]

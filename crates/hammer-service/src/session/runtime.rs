@@ -29,9 +29,9 @@ use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Deadline, FILE_MAIN, File, FileFunctions, NodeMain, NodeRuntime,
 };
 
-use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, application_main};
 use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::legacy_app::AppWorkerError;
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::ApplicationCallbacks;
 use crate::session::state::SessionState;
@@ -1390,12 +1390,7 @@ impl SessionWorker {
         };
         let reset_stream = transport_vft(transport)
             .and_then(|vft| vft.reset_stream)
-            .ok_or(SessionError::TransportOpFailed {
-                source: crate::transport::TransportError::OperationUnsupported {
-                    operation: "reset_stream",
-                }
-                .into(),
-            })?;
+            .ok_or(SessionError::NotSupported)?;
         if !self.entry_app_close_guard(session_id)? {
             return Ok(());
         }
@@ -1419,12 +1414,7 @@ impl SessionWorker {
         };
         let stop_sending = transport_vft(transport)
             .and_then(|vft| vft.stop_sending)
-            .ok_or(SessionError::TransportOpFailed {
-                source: crate::transport::TransportError::OperationUnsupported {
-                    operation: "stop_sending",
-                }
-                .into(),
-            })?;
+            .ok_or(SessionError::NotSupported)?;
         let active = matches!(
             self.entries
                 .get(session_id)
@@ -1467,12 +1457,7 @@ impl SessionWorker {
         };
         let close_connection = transport_vft(transport)
             .and_then(|vft| vft.close_connection)
-            .ok_or(SessionError::TransportOpFailed {
-                source: crate::transport::TransportError::OperationUnsupported {
-                    operation: "close_connection",
-                }
-                .into(),
-            })?;
+            .ok_or(SessionError::NotSupported)?;
         if !self.entry_app_close_guard(connection)? {
             return Ok(());
         }
@@ -1530,7 +1515,7 @@ impl SessionWorker {
         for buffer in runtime.chain(index) {
             source_len = source_len
                 .checked_add(buffer.current_len())
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("packet chain length fits usize");
         }
         if payload_end > source_len {
             return Err(SessionError::DatagramLengthMismatch {
@@ -3722,7 +3707,7 @@ impl SessionWorker {
         for buffer in runtime.chain(index) {
             let chunk = buffer.current();
             let chunk_len = u32::try_from(chunk.len())
-                .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
+                .expect("a packet buffer's current length fits the Session FIFO index");
             if accepted == total {
                 let rx_available_before = entry.rx_fifo.max_enqueue();
                 if chunk.len() >= rx_available_before {
@@ -3733,14 +3718,14 @@ impl SessionWorker {
                 let promoted_now = wrote.saturating_sub(accepted_now);
                 accepted = accepted
                     .checked_add(accepted_now as u32)
-                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                    .expect("RX packet chain length fits u32");
                 promoted = promoted
                     .checked_add(promoted_now as u32)
-                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                    .expect("promoted RX FIFO bytes fit u32");
             }
             total = total
                 .checked_add(chunk_len)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("RX packet chain length fits u32");
         }
         self.publish_rx_enqueue(session_id, accepted as usize + promoted as usize)?;
         Ok((accepted, promoted))
@@ -3781,10 +3766,10 @@ impl SessionWorker {
                 })?;
             accepted = accepted
                 .checked_add(result.accepted)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("RX packet chain length fits u32");
             delivered = delivered
                 .checked_add(result.delivered)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("promoted RX FIFO bytes fit u32");
             if let Some(start) = result.start {
                 let end = start
                     .checked_add(result.len)
@@ -3794,7 +3779,7 @@ impl SessionWorker {
             }
             total_len = total_len
                 .checked_add(current.len() as u32)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("RX packet chain length fits u32");
         }
         let newest = match (newest_start, newest_end) {
             (Some(start), Some(end)) => Some((

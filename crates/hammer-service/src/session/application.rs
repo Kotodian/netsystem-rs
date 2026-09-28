@@ -1027,7 +1027,7 @@ impl ApplicationMain {
     /// The callback policy belongs to the Application authority, matching
     /// VPP's application callback table. Session workers only resolve the
     /// selected numeric slot while dispatching an exact Session.
-    #[deprecated(note = "ADR-0040: supply ApplicationCallbacks during attach")]
+    #[deprecated(note = "Use direct event fields on ApplicationConfig for new applications")]
     pub fn register_session_app(
         &self,
         application: u32,

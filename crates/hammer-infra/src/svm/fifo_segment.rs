@@ -92,8 +92,8 @@ impl FifoSlicePrivate {
 pub struct SvmFifoSegment {
     pub ssvm: Arc<SsvmPrivate>,
     pub h: *mut FifoSegmentHeader,
-    slices: Vec<FifoSlicePrivate>,
-    pub mqs: Vec<SvmMsgQ>,
+    pub slices: Vec<FifoSlicePrivate>,
+    pub mqs: Vec<Arc<SvmMsgQ>>,
     mq_offsets: Vec<u64>,
     pub max_byte_index: u64,
     pub sm_index: u32,
@@ -964,7 +964,7 @@ impl SvmFifoSegment {
         let offset = self.allocate_block(size, 8)?;
         let base = unsafe { NonNull::new_unchecked(self.h.cast::<u8>().add(offset as usize)) };
         let queue = unsafe { SvmMsgQ::init(base, config) }?;
-        self.mqs.push(queue);
+        self.mqs.push(Arc::new(queue));
         self.mq_offsets.push(offset);
         self.header_mut().n_mqs = self.mqs.len() as u8;
         self.header_mut()
@@ -972,6 +972,7 @@ impl SvmFifoSegment {
             .fetch_add(size as u32, Ordering::Relaxed);
         self.mqs
             .get_mut(index)
+            .and_then(Arc::get_mut)
             .ok_or(FifoSegmentError::InvalidFifo { fifo: index as u32 })
     }
 
@@ -994,10 +995,11 @@ impl SvmFifoSegment {
         if let Some(eventfd) = eventfd {
             queue.install_eventfd(eventfd);
         }
-        self.mqs.push(queue);
+        self.mqs.push(Arc::new(queue));
         self.mq_offsets.push(offset);
         self.mqs
             .get_mut(index)
+            .and_then(Arc::get_mut)
             .ok_or(FifoSegmentError::InvalidFifo { fifo: index as u32 })
     }
 
@@ -1032,11 +1034,11 @@ impl SvmFifoSegment {
     }
 
     pub fn message_queue(&self, index: u32) -> Option<&SvmMsgQ> {
-        self.mqs.get(index as usize)
+        self.mqs.get(index as usize).map(Arc::as_ref)
     }
 
     pub fn message_queue_mut(&mut self, index: u32) -> Option<&mut SvmMsgQ> {
-        self.mqs.get_mut(index as usize)
+        self.mqs.get_mut(index as usize).and_then(Arc::get_mut)
     }
 
     #[inline(always)]

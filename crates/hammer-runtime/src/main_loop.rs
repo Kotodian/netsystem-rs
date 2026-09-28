@@ -1,6 +1,105 @@
 use crate::DataPlaneMain;
 use std::future::Future;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
+
+use hammer_infra::sync::SpinLock;
+use tokio::sync::Notify;
+
+type MainThreadFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+static PENDING_MAIN_THREAD_FUTURES: SpinLock<Vec<MainThreadFuture>> = SpinLock::new(Vec::new());
+static MAIN_THREAD_FUTURES_READY: Notify = Notify::const_new();
+static MAIN_THREAD_FUTURE_WAKER: OnceLock<Waker> = OnceLock::new();
+
+struct MainThreadFutureWake;
+
+impl Wake for MainThreadFutureWake {
+    fn wake(self: Arc<Self>) {
+        MAIN_THREAD_FUTURES_READY.notify_one();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        MAIN_THREAD_FUTURES_READY.notify_one();
+    }
+}
+
+/// Queues control-plane work for the next thread-zero main-loop dispatch.
+/// VPP: `vlib_rpc_call_main_thread_inline`, threads.c:1663-1693.
+#[inline]
+pub fn enqueue_main_thread_future<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    PENDING_MAIN_THREAD_FUTURES
+        .lock()
+        .push(Box::pin(future));
+    MAIN_THREAD_FUTURES_READY.notify_one();
+}
+
+/// VPP: `vlib_rpc_call_main_thread_process`, threads.c:1709-1737. Swap the
+/// pending batch under the lock, then poll it once under one WorkerBarrier.
+/// A suspended future returns to pending; its waker requests a later pass.
+fn poll_main_thread_futures(processing: &mut Vec<MainThreadFuture>) {
+    {
+        let mut pending = PENDING_MAIN_THREAD_FUTURES.lock();
+        std::mem::swap(&mut *pending, processing);
+    }
+    if processing.is_empty() {
+        return;
+    }
+    let waker = MAIN_THREAD_FUTURE_WAKER
+        .get_or_init(|| Waker::from(Arc::new(MainThreadFutureWake)));
+    let mut context = Context::from_waker(waker);
+    crate::worker_thread_barrier_sync!({
+        processing.retain_mut(|future| {
+            matches!(future.as_mut().poll(&mut context), Poll::Pending)
+        });
+    });
+    if !processing.is_empty() {
+        PENDING_MAIN_THREAD_FUTURES.lock().append(processing);
+    }
+}
+
+impl DataPlaneMain {
+    pub fn run_main_until<F>(&mut self, future: F) -> crate::RuntimeResult<F::Output>
+    where
+        F: Future,
+    {
+        crate::ensure_main_thread()?;
+        if self.thread_index() != 0 || self.nodes.process_runtime.is_none() {
+            return Err(crate::RuntimeError::MainProcessRuntimeUnavailable);
+        }
+        let runtime = self
+            .nodes
+            .process_runtime
+            .take()
+            .expect("validated thread-zero runtime remains installed");
+        let output = runtime.block_on(async {
+            tokio::pin!(future);
+            let mut processing = Vec::new();
+            loop {
+                // VPP main.c:1497-1512: main-thread RPCs run once before File.
+                poll_main_thread_futures(&mut processing);
+                self.nodes.restore_processes(Instant::now())?;
+                tokio::select! {
+                    _ = MAIN_THREAD_FUTURES_READY.notified() => {}
+                    output = &mut future => break Ok(output),
+                    readiness = self.next_file_readiness() => {
+                        readiness?;
+                    }
+                }
+            }
+        });
+        assert!(
+            self.nodes.process_runtime.replace(runtime).is_none(),
+            "thread-zero runtime has one NodeMain owner"
+        );
+        output
+    }
+}
 
 /// Runs the thread-zero graph lifecycle and Tokio executor.
 ///

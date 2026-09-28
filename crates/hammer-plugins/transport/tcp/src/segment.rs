@@ -9,7 +9,7 @@ use crate::{
 use hammer_core::data_plane::BufferPacketCursor;
 use hammer_runtime::DataPlaneMain;
 use hammer_runtime::RuntimeResult;
-use hammer_service::opaque::NetworkOpaque;
+use hammer_service::opaque::{NetworkFlags, NetworkOpaque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSegment {
@@ -114,6 +114,7 @@ impl TcpSegment {
         {
             let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
             network.ip_mut().set_ip_ecn(self.ip_ecn.map(Into::into));
+            network.flags.insert(NetworkFlags::LOCALLY_ORIGINATED);
         }
         // Stamp L3 endpoints for tcp-output (VPP stamps connection_index; push_ip reads c_lcl/c_rmt).
         crate::write_tcp_egress_endpoints(

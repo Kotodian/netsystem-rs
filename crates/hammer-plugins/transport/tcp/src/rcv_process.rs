@@ -1,65 +1,93 @@
-use crate::{publish_tcp_connection, read_session_id};
+use crate::read_session_id;
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::session::runtime::{RxDelivery, session_main};
+use hammer_service::session::SessionHandle;
 
+use super::TcpError;
 use super::TcpNodeError;
 use super::segment::tcp_packet;
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
-    #[next("tcp-output")]
+    #[next("tcp4-output")]
     Output,
     Drop,
 }
 
 #[hammer_component_macros::graph_node(
     graph = tcp_worker,
-    init = crate::rcv_process::register_tcp_rcv_process,
-    name = "tcp-rcv-process",
+    init = crate::rcv_process::register_tcp4_rcv_process,
+    name = "tcp4-rcv-process",
     next = TcpRcvProcessNext,
     role = internal,
 )]
-pub struct TcpRcvProcessNode {}
+pub struct Tcp4RcvProcessNode {}
 
-pub fn register_tcp_rcv_process(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+#[hammer_component_macros::graph_node(
+    graph = tcp_worker,
+    init = crate::rcv_process::register_tcp6_rcv_process,
+    name = "tcp6-rcv-process",
+    next = TcpRcvProcessNext,
+    role = internal,
+)]
+pub struct Tcp6RcvProcessNode {}
+
+pub fn register_tcp4_rcv_process(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    if let Some(node) = runtime.nodes().node_by_name("tcp-rcv-process") {
+    if let Some(node) = runtime.nodes().node_by_name("tcp4-rcv-process") {
         return Ok(node);
     }
     runtime.nodes().try_register_internal_with_next_names(
-        TcpRcvProcessNode::new(),
+        Tcp4RcvProcessNode::new(),
         &TcpRcvProcessNext::NEXT_NAMES,
     )
 }
 
-impl Node for TcpRcvProcessNode {
+pub fn register_tcp6_rcv_process(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(Tcp6RcvProcessNode::new(), &["tcp6-output", "drop"])
+}
+
+impl Node for Tcp4RcvProcessNode {
     #[inline(always)]
     fn process(
         runtime: &mut DataPlaneMain,
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_rcv_process_process;
+        let process: NodeProcessFn = tcp_rcv_process_process::<true>;
         process(runtime, node_runtime, frame)
     }
 }
 
-pub(crate) fn tcp_rcv_process_process(
+impl Node for Tcp6RcvProcessNode {
+    #[inline(always)]
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_rcv_process_process::<false>;
+        process(runtime, node_runtime, frame)
+    }
+}
+
+pub(crate) fn tcp_rcv_process_process<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_rcv_process_frame(runtime, node_runtime, frame);
+    tcp_rcv_process_frame::<IS_IP4>(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_rcv_process_frame(
+fn tcp_rcv_process_frame<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
@@ -69,7 +97,7 @@ fn tcp_rcv_process_frame(
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
     for &index in frame.vector_args() {
-        if tcp_rcv_process_index(
+        if tcp_rcv_process_index::<IS_IP4>(
             runtime,
             node_runtime,
             index,
@@ -93,6 +121,15 @@ fn tcp_rcv_process_frame(
     if out_len != 0 {
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
+    let session_main = hammer_service::session::SessionMain::global()
+        .expect("Session Main initializes before TCP receive processing");
+    let sessions = unsafe { session_main.worker_mut(runtime) }
+        .expect("TCP receive processing runs on its Session worker");
+    let protocol = crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before receive processing")
+        .protocol();
+    sessions.flush_enqueue_events(runtime, protocol);
     ()
 }
 
@@ -122,39 +159,44 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_rcv_process_index(
+fn tcp_rcv_process_index<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
-    node_runtime: &mut hammer_runtime::NodeRuntime,
+    _: &mut hammer_runtime::NodeRuntime,
     index: u32,
-    out_frame: &mut Frame,
-    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
-    out_len: &mut usize,
+    _: &mut Frame,
+    _: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    _: &mut usize,
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
+    if packet.local.is_ipv4() != IS_IP4 {
+        return Err(TcpError::SegmentInvalid.into());
+    }
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let ip_session = hammer_plugin_session::IpSessionMain::global()?;
     // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
-    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let sessions = unsafe { ip_session.session().worker_mut(runtime)? };
     let mut tcp = main.worker(runtime.thread_index())?;
-    let control = {
+    let (control, connection_index) = {
         let sessions = &mut *sessions;
         let tcp = &mut *tcp;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing);
             TcpNodeError::RcvProcessSessionRouteMissing
         })?;
-        // Warm the session pool slot cacheline before the `session_mut`
-        // borrow; the `receive_close_side` work below gives the prefetch
-        // lead time.
-        sessions.prefetch_session(session_id);
+        let handle = SessionHandle {
+            worker_index: sessions.worker_index(),
+            session_index: session_id,
+        };
         let connection_index = sessions
-            .transport_connection_index(session_id)
+            .session_from_handle(handle)
+            .map(|session| session.connection_index())
             .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
         let (control, ack_advanced, acked_tx_len, established_with_payload) = {
             let crate::worker::TcpWorker {
                 connections,
-                timers,
+                timer_wheel: timers,
                 ..
             } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
@@ -180,10 +222,22 @@ fn tcp_rcv_process_index(
             )
         };
         if acked_tx_len != 0 {
-            sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
+            let tx = sessions
+                .session_from_handle(handle)
+                .and_then(|session| session.tx_fifo())
+                .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
+            assert_eq!(
+                tx.drop_dequeue(acked_tx_len as usize),
+                acked_tx_len as usize
+            );
         }
-        if ack_advanced && sessions.pending_send_len(session_id)?.is_some() {
-            sessions.mark_ready(session_id);
+        if ack_advanced
+            && sessions
+                .session_from_handle(handle)
+                .and_then(|session| session.tx_fifo())
+                .is_some_and(|fifo| fifo.max_dequeue() != 0)
+        {
+            sessions.enqueue_ready(handle, tcp.protocol)?;
         }
         if established_with_payload {
             {
@@ -191,13 +245,9 @@ fn tcp_rcv_process_index(
                 buffer.advance(packet.payload_offset as isize);
                 buffer.truncate(packet.payload_len)?;
             }
-            let enqueue = sessions.enqueue_rx(runtime, session_id, index, 0)?;
-            if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                sessions.mark_ready(session_id);
-            }
+            sessions.enqueue_rx(runtime, handle, index, 0)?;
         }
-        publish_tcp_connection(sessions, tcp, session_id)?;
-        control
+        (control, connection_index)
     };
     if let Some(segment) = control {
         let mut allocated = 0;
@@ -207,16 +257,20 @@ fn tcp_rcv_process_index(
             )
             .into());
         }
-        segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
-        emit_local(
+        if let Err(source) = segment.write_to_buffer(&mut *runtime.buffer_mut(allocated)) {
+            runtime.buffer_free_one(allocated);
+            return Err(source);
+        }
+        let worker_index = runtime.data_worker_id()?.slot() as u32;
+        let egress = hammer_core::buffer_opaque!(mut runtime.buffer_mut(allocated) => crate::TcpSecondaryOpaque)
+            .egress_mut();
+        egress.connection_index = connection_index;
+        egress.worker_index = worker_index;
+        sessions.add_pending_tx_buffer(
             runtime,
-            node_runtime,
-            out_frame,
-            nexts,
-            out_len,
-            TcpRcvProcessNext::Output,
             allocated,
-        )?;
+            tcp.tco_next_node[usize::from(!packet.local.is_ipv4())],
+        );
     }
     Ok(())
 }

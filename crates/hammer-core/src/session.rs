@@ -44,6 +44,7 @@ impl From<u64> for SessionHandle {
 /// explicit fields so the shared-memory codec never packs an identity into an
 /// unrelated integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(note = "legacy Session event; use hammer-service::session::SessionEvent")]
 pub struct SessionEvt {
     pub evt_type: SessionEvtType,
     pub postponed: bool,
@@ -77,6 +78,7 @@ impl SessionEvt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(note = "legacy Session event; use hammer-service::session::SessionEventType")]
 pub enum SessionEvtType {
     RxEnq = 0,
     TxDeq = 1,

@@ -28,7 +28,7 @@ use hammer_service::session::{
 };
 use hammer_service::transport::{
     Transport, TransportMain, TransportOptions, TransportSendParams, TransportServiceType,
-    TransportTxMode, TransportVft, register_transport,
+    TransportTxMode,
 };
 
 use crate::UdpIpVersion;
@@ -1210,20 +1210,9 @@ fn init_udp() -> RuntimeResult<()> {
         UDP_MAIN.get().is_none(),
         "UDP initialization callback executes once"
     );
-    let protocol = register_transport(TransportVft::new(
-        Some(start_listen),
-        Some(stop_listen),
-        Some(connect),
-        None,
-        None,
-        None,
-        None,
-        None,
-    ))
-    .map_err(RuntimeError::from)?;
-    IpSessionMain::global()
+    let protocol = IpSessionMain::global()
         .map_err(|source| UdpTransportError::SessionTransportRegistration { source })?
-        .register_transport_type(protocol, TransportTxMode::Datagram, u32::MAX)
+        .register_transport_type(TransportTxMode::Datagram, u32::MAX)
         .map_err(|source| UdpTransportError::SessionTransportRegistration { source })?;
     let main = UdpMain::new(protocol, hammer_runtime::config::worker::worker_count());
     assert!(

@@ -7,6 +7,7 @@ use hammer_infra::pool::Pool;
 use hammer_infra::sync::SpinLock;
 use hammer_service::session::{SessionEndpoint, SessionError};
 use hammer_service::transport::{TransportConnection, TransportMain};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::endpoint::{IpSessionEndpoint, IpTransportConnectionId, IpTransportEndpoint};
 
@@ -17,6 +18,55 @@ const LOCAL_ENDPOINT_CLEANUP_THRESHOLD: usize = 32;
 type IpLocalEndpoint = SessionEndpoint<IpTransportEndpoint>;
 
 pub type IpTransportConnection = TransportConnection<IpTransportConnectionId>;
+
+/// VPP: application_interface.h:266-273, app_session_transport_t.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, KnownLayout, FromBytes, Immutable, IntoBytes)]
+pub struct AppSessionTransport {
+    remote_ip: [u8; 16],
+    local_ip: [u8; 16],
+    remote_port: [u8; 2],
+    local_port: [u8; 2],
+    is_ip4: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<AppSessionTransport>() == 37);
+
+impl From<IpTransportConnectionId> for AppSessionTransport {
+    #[inline(always)]
+    fn from(connection: IpTransportConnectionId) -> Self {
+        match connection {
+            IpTransportConnectionId::Ip4 {
+                remote_address,
+                local_address,
+                remote_port,
+                local_port,
+                ..
+            } => {
+                let mut transport = Self::default();
+                transport.remote_ip[..4].copy_from_slice(&remote_address.octets());
+                transport.local_ip[..4].copy_from_slice(&local_address.octets());
+                transport.remote_port = remote_port.to_ne_bytes();
+                transport.local_port = local_port.to_ne_bytes();
+                transport.is_ip4 = 1;
+                transport
+            }
+            IpTransportConnectionId::Ip6 {
+                remote_address,
+                local_address,
+                remote_port,
+                local_port,
+                ..
+            } => Self {
+                remote_ip: remote_address.octets(),
+                local_ip: local_address.octets(),
+                remote_port: remote_port.to_ne_bytes(),
+                local_port: local_port.to_ne_bytes(),
+                is_ip4: 0,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -182,7 +232,10 @@ impl TransportMain for IpTransportMain {
             config.local_endpoint_memory
         };
         Ok(Self {
-            local_endpoints_table: Bihash::with_memory_size(buckets, memory),
+            local_endpoints_table: Bihash::with_memory_size(
+                buckets,
+                u32::try_from(memory).map_err(|_| SessionError::Invalid)?,
+            ),
             local_endpoints: UnsafeCell::new(Pool::new()),
             port_allocator_seed: AtomicU32::new(0),
             port_allocator_min_src_port: config.min_source_port,
@@ -261,7 +314,9 @@ impl TransportMain for IpTransportMain {
         let previous = endpoint.references.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(previous, 0, "local endpoint reference count underflowed");
         if previous != 1 {
-            return Err(SessionError::AddressNotInUse);
+            // VPP transport.c:711-714 returns -1 here only to report that
+            // the endpoint was not deleted; the reference was released.
+            return Ok(());
         }
         let removed = self
             .local_endpoints_table

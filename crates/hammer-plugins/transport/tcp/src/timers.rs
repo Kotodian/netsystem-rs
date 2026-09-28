@@ -1,16 +1,15 @@
 use std::time::{Duration, Instant};
 
-use hammer_infra::fifo_queue::FifoQueue;
-use hammer_infra::pool::Pool;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::RuntimeResult;
 
 use super::TcpNodeError;
-use super::connection::TcpConnection;
+use super::worker::TcpWorker;
 
-const TCP_TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
-const TCP_TIMER_EXPIRY_BUDGET: usize = 256;
+pub(super) const TCP_TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
+pub(super) const TCP_TIMER_EXPIRY_BUDGET: usize = 256;
 const TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = 2048 * 2048 - 1;
+pub(super) const TCP_TIMER_RESOLUTION: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -52,7 +51,7 @@ impl TcpTimerKind {
     }
 }
 
-const TCP_TIMER_KIND_COUNT: usize = TcpTimerKind::Pacing.id() as usize + 1;
+pub(super) const TCP_TIMER_KIND_COUNT: usize = TcpTimerKind::Pacing.id() as usize + 1;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,102 +107,98 @@ pub(super) struct TcpTimerToken {
     pub(super) kind: TcpTimerKind,
 }
 
-pub(super) struct TcpTimers {
-    wheel: TimerWheel1t2w2048sl<u32>,
-    expired: Vec<u32>,
-    pending: FifoQueue<TcpTimerToken>,
-    last_update: Instant,
-    resolution: Duration,
+/// VPP: tcp_timer.h:25-58. Timer handles live in the worker wheel; the
+/// connection owns the armed/pending bits used to cancel stale expirations.
+#[inline]
+pub(super) fn set(
+    wheel: &mut TimerWheel1t2w2048sl<u32>,
+    index: u32,
+    state: &mut TcpTimerState,
+    kind: TcpTimerKind,
+    interval: Duration,
+) -> RuntimeResult<()> {
+    if state.is_armed(kind) {
+        return Ok(());
+    }
+    wheel
+        .arm_timer(index, 0, kind.id(), duration_ticks(interval))
+        .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
+    state.arm(kind);
+    Ok(())
 }
 
-impl TcpTimers {
-    pub(super) fn new(last_update: Instant, resolution: Duration) -> Self {
-        assert!(
-            !resolution.is_zero(),
-            "TCP timer resolution must be non-zero"
-        );
-        Self {
-            wheel: TimerWheel1t2w2048sl::with_timer_ids(
-                TCP_TIMER_EXPIRY_BUDGET,
-                TCP_TIMER_KIND_COUNT,
-            ),
-            expired: Vec::new(),
-            pending: FifoQueue::new(),
-            last_update,
-            resolution,
-        }
+pub(super) fn validate_interval(
+    wheel: &TimerWheel1t2w2048sl<u32>,
+    interval: Duration,
+) -> RuntimeResult<()> {
+    let ticks = duration_ticks(interval);
+    if ticks > TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS
+        || wheel.current_tick().checked_add(ticks).is_none()
+    {
+        return Err(TcpNodeError::TimerUpdateFailed.into());
     }
+    Ok(())
+}
 
-    pub(super) fn set(
-        &mut self,
-        index: u32,
-        state: &mut TcpTimerState,
-        kind: TcpTimerKind,
-        interval: Duration,
-    ) -> RuntimeResult<()> {
-        if state.is_armed(kind) {
-            return Ok(());
-        }
-        self.wheel
-            .arm_timer(index, 0, kind.id(), self.duration_ticks(interval))
-            .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
-        state.arm(kind);
-        Ok(())
-    }
+#[inline]
+pub(super) fn reset(
+    wheel: &mut TimerWheel1t2w2048sl<u32>,
+    index: u32,
+    state: &mut TcpTimerState,
+    kind: TcpTimerKind,
+) {
+    let _ = wheel.cancel_timer(index, 0, kind.id());
+    state.reset(kind);
+}
 
-    pub(super) fn validate_interval(&self, interval: Duration) -> RuntimeResult<()> {
-        let ticks = self.duration_ticks(interval);
-        if ticks > TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS
-            || self.wheel.current_tick().checked_add(ticks).is_none()
-        {
-            return Err(TcpNodeError::TimerUpdateFailed.into());
-        }
-        Ok(())
-    }
+#[inline]
+pub(super) fn update(
+    wheel: &mut TimerWheel1t2w2048sl<u32>,
+    index: u32,
+    state: &mut TcpTimerState,
+    kind: TcpTimerKind,
+    interval: Duration,
+) -> RuntimeResult<()> {
+    wheel
+        .update_timer(index, 0, kind.id(), duration_ticks(interval))
+        .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
+    state.arm(kind);
+    Ok(())
+}
 
-    pub(super) fn reset(&mut self, index: u32, state: &mut TcpTimerState, kind: TcpTimerKind) {
-        let _ = self.wheel.cancel_timer(index, 0, kind.id());
-        state.reset(kind);
-    }
-
-    pub(super) fn update(
-        &mut self,
-        index: u32,
-        state: &mut TcpTimerState,
-        kind: TcpTimerKind,
-        interval: Duration,
-    ) -> RuntimeResult<()> {
-        self.wheel
-            .update_timer(index, 0, kind.id(), self.duration_ticks(interval))
-            .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
-        state.arm(kind);
-        Ok(())
-    }
-
-    pub(super) fn advance(&mut self, now: Instant, connections: &mut Pool<TcpConnection>) {
-        let elapsed_ticks = self.elapsed_ticks(now);
+impl TcpWorker {
+    /// VPP: tcp.c:1462-1509, `tcp_expired_timers_dispatch`.
+    pub(super) fn advance_timer_wheel(&mut self, now: Instant) {
+        let elapsed_ticks = now
+            .saturating_duration_since(self.last_timer_update)
+            .as_nanos()
+            / TCP_TIMER_RESOLUTION.as_nanos();
         if elapsed_ticks == 0 {
             return;
         }
-        if self.wheel.is_empty() {
-            self.fast_forward_empty_wheel(elapsed_ticks);
+        if self.timer_wheel.is_empty() {
+            let elapsed_nanos = elapsed_ticks * TCP_TIMER_RESOLUTION.as_nanos();
+            let seconds = (elapsed_nanos / 1_000_000_000) as u64;
+            let nanos = (elapsed_nanos % 1_000_000_000) as u32;
+            self.last_timer_update += Duration::new(seconds, nanos);
             return;
         }
         let requested_ticks = elapsed_ticks.min(u128::from(TCP_TIMER_MAX_TICKS_PER_UPDATE)) as u32;
-        self.expired.clear();
-        let tick_before = self.wheel.current_tick();
-        self.wheel.expire(requested_ticks, &mut self.expired);
-        let consumed_ticks = u32::try_from(self.wheel.current_tick() - tick_before)
+        self.expired_timers.clear();
+        let tick_before = self.timer_wheel.current_tick();
+        self.timer_wheel
+            .expire(requested_ticks, &mut self.expired_timers);
+        let consumed_ticks = u32::try_from(self.timer_wheel.current_tick() - tick_before)
             .expect("TCP timer wheel consumes no more than the requested u32 ticks");
-        self.last_update += self.resolution * consumed_ticks;
-        for payload in self.expired.as_slice() {
-            let Some((index, _, kind_id)) = self.wheel.take_expired_timer(*payload) else {
+        self.last_timer_update += TCP_TIMER_RESOLUTION * consumed_ticks;
+        for payload in self.expired_timers.as_slice() {
+            let Some((index, _, kind_id)) = self.timer_wheel.take_expired_timer(*payload) else {
                 continue;
             };
             let Some(kind) = TcpTimerKind::from_id(kind_id) else {
                 continue;
             };
-            let Some(connection) = connections.get_mut(index) else {
+            let Some(connection) = self.connections.get_mut(index) else {
                 continue;
             };
             let state = connection.timer_state_mut();
@@ -212,16 +207,14 @@ impl TcpTimers {
             }
             state.armed.remove(kind.flag());
             state.pending.insert(kind.flag());
-            self.pending.push_back(TcpTimerToken { index, kind });
+            self.pending_timers.push_back(TcpTimerToken { index, kind });
         }
     }
 
-    pub(super) fn take_pending(
-        &mut self,
-        connections: &mut Pool<TcpConnection>,
-    ) -> Option<TcpTimerToken> {
-        while let Some(token) = self.pending.pop_front() {
-            let Some(connection) = connections.get_mut(token.index) else {
+    /// VPP: tcp.c:1293-1335, `tcp_dispatch_pending_timers`.
+    pub(super) fn take_pending_timer(&mut self) -> Option<TcpTimerToken> {
+        while let Some(token) = self.pending_timers.pop_front() {
+            let Some(connection) = self.connections.get_mut(token.index) else {
                 continue;
             };
             let state = connection.timer_state_mut();
@@ -236,26 +229,13 @@ impl TcpTimers {
         }
         None
     }
+}
 
-    #[inline]
-    fn duration_ticks(&self, duration: Duration) -> u64 {
-        let resolution = self.resolution.as_nanos();
-        duration
-            .as_nanos()
-            .div_ceil(resolution)
-            .max(1)
-            .min(u64::MAX as u128) as u64
-    }
-
-    fn elapsed_ticks(&self, now: Instant) -> u128 {
-        let elapsed = now.saturating_duration_since(self.last_update);
-        elapsed.as_nanos() / self.resolution.as_nanos()
-    }
-
-    fn fast_forward_empty_wheel(&mut self, elapsed_ticks: u128) {
-        let elapsed_nanos = elapsed_ticks * self.resolution.as_nanos();
-        let seconds = (elapsed_nanos / 1_000_000_000) as u64;
-        let nanos = (elapsed_nanos % 1_000_000_000) as u32;
-        self.last_update += Duration::new(seconds, nanos);
-    }
+#[inline]
+fn duration_ticks(duration: Duration) -> u64 {
+    duration
+        .as_nanos()
+        .div_ceil(TCP_TIMER_RESOLUTION.as_nanos())
+        .max(1)
+        .min(u64::MAX as u128) as u64
 }
