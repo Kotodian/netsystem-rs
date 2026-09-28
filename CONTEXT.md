@@ -736,9 +736,8 @@ _Avoid_: region heap, mandatory payload allocator, fallback heap
 
 These are target domain terms. The SVM owner modules live in one subtree,
 `crates/hammer-infra/src/svm.rs` plus `crates/hammer-infra/src/svm/`
-(`ssvm`, `region`, `queue`, `msg_queue`, `fifo`, `fifo_segment`); the legacy
-`Segment` and `MultiRingMsgQueue` remain at the crate root until they are
-deleted. The current offset-based region owner in `svm/region.rs`,
+(`ssvm`, `region`, `queue`, `msg_queue`, `fifo`, `fifo_segment`). The current
+offset-based region owner in `svm/region.rs`,
 `svm/region_heap.rs`, and `svm/hash_map.rs` is a rejected implementation and
 must not be extended. ADR-0011 still owns queue, FIFO, multiarch, and SSVM
 decisions; ADR-0012 supersedes its entire region-heap section with fixed-VA

@@ -19,7 +19,6 @@ pub mod pool;
 pub mod prefetch;
 pub mod rbtree;
 pub mod ring;
-pub mod segment;
 pub mod simd;
 pub mod sparse_vec;
 pub mod stack;

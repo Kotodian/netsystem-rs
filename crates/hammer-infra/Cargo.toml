@@ -18,7 +18,6 @@ posix-sync = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
 spinning_top = { workspace = true }
-talc = { workspace = true }
 thiserror = { workspace = true }
 zerocopy = { workspace = true }
 

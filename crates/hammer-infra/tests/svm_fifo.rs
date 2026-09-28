@@ -1,9 +1,42 @@
-use hammer_infra::svm::fifo::Fifo;
+#![cfg(target_os = "linux")]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use hammer_infra::svm::fifo_segment::{FifoSegmentFtype, SvmFifoSegment, SvmFifoSegmentConfig};
+use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
+
+fn allocated_fifo(capacity: usize) -> (SvmFifoSegment, u32) {
+    let mapping = Arc::new(
+        SsvmPrivate::server_init_fifo_segment(&SsvmConfig {
+            backend: SsvmSegmentBackend::Private,
+            name: "hammer-fifo-behavior".to_string(),
+            size: 1 << 20,
+            requested_va: 0,
+            huge_page: false,
+            attach_timeout: Duration::from_millis(100),
+        })
+        .expect("private FIFO segment mapping"),
+    );
+    let mut segment = SvmFifoSegment::new(
+        mapping,
+        SvmFifoSegmentConfig {
+            first_allocation_percent: 50,
+            ..SvmFifoSegmentConfig::default()
+        },
+    )
+    .expect("FIFO segment");
+    let index = segment
+        .allocate_fifo(0, capacity, FifoSegmentFtype::RxFifo)
+        .expect("FIFO allocation");
+    (segment, index)
+}
 
 #[test]
 fn fifo_round_trip_non_power_of_two_capacity() {
-    let fifo = Fifo::with_capacity(101).expect("fifo");
-    let payload: Vec<u8> = (0..90).map(|value| value as u8).collect();
+    let (mut segment, index) = allocated_fifo(4101);
+    let fifo = segment.fifo(0, index).expect("fifo");
+    let payload: Vec<u8> = (0..4090).map(|value| value as u8).collect();
 
     assert_eq!(fifo.enqueue(&payload), payload.len());
     assert_eq!(fifo.max_dequeue(), payload.len());
@@ -15,12 +48,13 @@ fn fifo_round_trip_non_power_of_two_capacity() {
     assert_eq!(fifo.dequeue(received.len(), &mut received), payload.len());
     assert_eq!(received, payload);
     assert!(fifo.is_empty());
-    assert_eq!(fifo.max_enqueue(), 101);
+    assert_eq!(fifo.max_enqueue(), 4101);
 }
 
 #[test]
 fn fifo_copies_across_chunks_and_preserves_segmented_enqueue() {
-    let fifo = Fifo::with_capacity(8192).expect("fifo");
+    let (mut segment, index) = allocated_fifo(8192);
+    let fifo = segment.fifo(0, index).expect("fifo");
     let first = vec![0x11; 4096];
     let second = vec![0x22; 2904];
 
@@ -36,7 +70,8 @@ fn fifo_copies_across_chunks_and_preserves_segmented_enqueue() {
 
 #[test]
 fn fifo_ooo_gap_overlap_and_wrap_are_ordered() {
-    let fifo = Fifo::with_capacity(101).expect("fifo");
+    let (mut segment, index) = allocated_fifo(4097);
+    let fifo = segment.fifo(0, index).expect("fifo");
     fifo.init_pointers(u32::MAX - 16, u32::MAX - 16);
 
     assert_eq!(
@@ -59,12 +94,13 @@ fn fifo_ooo_gap_overlap_and_wrap_are_ordered() {
 
 #[test]
 fn fifo_segmented_enqueue_failure_does_not_publish_partial_bytes() {
-    let fifo = Fifo::with_capacity(128).expect("fifo");
+    let (mut segment, index) = allocated_fifo(4096);
+    let fifo = segment.fifo(0, index).expect("fifo");
     let first = [1, 2, 3, 4];
     let second = [5];
     let result = fifo.enqueue_segments(4, [&first[..], &second[..]]);
 
     assert!(result.is_err());
     assert_eq!(fifo.max_dequeue(), 0);
-    assert_eq!(fifo.max_enqueue(), 128);
+    assert_eq!(fifo.max_enqueue(), 4096);
 }
