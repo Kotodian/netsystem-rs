@@ -25,7 +25,8 @@ pub use core::{
     SessionConfig, SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement,
     SessionEventEnqueue, SessionEventType, SessionFlags, SessionHandle, SessionMain,
     SessionMigrationRequest, SessionMigrationState, SessionRxSegment, SessionState,
-    SessionTxContext, SessionWorker, SessionWorkerFlags, SessionWorkerState,
+    SessionTxContext, SessionTxDispatch, SessionTxOutcome, SessionWorker,
+    SessionWorkerFlags, SessionWorkerState,
     enqueue_notify, program_transport_io_event, program_tx_io_event, send_control_event,
     send_rpc_event, send_rpc_event_force,
 };

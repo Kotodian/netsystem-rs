@@ -1,14 +1,8 @@
 use crate::session::error::SessionError;
+use crate::session::{SessionHandle, SessionWorker};
+use hammer_runtime::DataPlaneMain;
 
 pub mod congestion;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportTxMode {
-    Peek,
-    Dequeue,
-    Internal,
-    Datagram,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportServiceType {
@@ -18,22 +12,13 @@ pub enum TransportServiceType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportOptions {
-    pub tx_mode: TransportTxMode,
     pub service_type: TransportServiceType,
 }
 
 impl TransportOptions {
     #[inline(always)]
-    pub const fn new(tx_mode: TransportTxMode, service_type: TransportServiceType) -> Self {
-        Self {
-            tx_mode,
-            service_type,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn tx_mode(self) -> TransportTxMode {
-        self.tx_mode
+    pub const fn new(service_type: TransportServiceType) -> Self {
+        Self { service_type }
     }
 
     #[inline(always)]
@@ -162,6 +147,13 @@ impl<E, O> TransportConnection<E, O> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportTxTarget {
+    Connection(u32),
+    Listener(u32),
+    Session(SessionHandle),
+}
+
 /// Static transport capability contract. The VFT below is retained only as a
 /// migration shim and is not part of the ADR-0038 target path.
 pub trait Transport<T> {
@@ -185,27 +177,61 @@ pub trait Transport<T> {
         session: crate::session::SessionHandle,
     ) -> Result<u32, SessionError>;
     fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
-    fn half_close(&self, connection_index: u32, worker_index: u32);
-    fn close(&self, connection_index: u32, worker_index: u32);
-    fn reset(&self, connection_index: u32, worker_index: u32);
+    fn half_close(
+        &self,
+        runtime: &mut DataPlaneMain,
+        worker: &mut SessionWorker,
+        connection_index: u32,
+        worker_index: u32,
+    );
+    fn close(
+        &self,
+        runtime: &mut DataPlaneMain,
+        worker: &mut SessionWorker,
+        connection_index: u32,
+        worker_index: u32,
+    );
+    fn reset(
+        &self,
+        runtime: &mut DataPlaneMain,
+        worker: &mut SessionWorker,
+        connection_index: u32,
+        worker_index: u32,
+    );
     fn cleanup(&self, connection_index: u32, worker_index: u32);
     fn cleanup_half_open(&self, connection_index: u32);
     fn push_header(
         &self,
-        connection_index: u32,
-        worker_index: u32,
-        buffers: &mut [u32],
+        runtime: &mut DataPlaneMain,
+        worker: &SessionWorker,
+        target: TransportTxTarget,
+        buffers: &[u32],
         available_bytes: u32,
-    ) -> u32;
-    fn send_params(&self, connection_index: u32, worker_index: u32) -> TransportSendParams;
+    );
+    fn send_params(
+        &self,
+        runtime: &DataPlaneMain,
+        worker: &SessionWorker,
+        target: TransportTxTarget,
+        params: &mut TransportSendParams,
+    );
     fn update_time(&self, now: f64, worker_index: u32);
-    fn flush_data(&self, connection_index: u32, worker_index: u32);
+    fn flush_data(&self, _: &SessionWorker, _: TransportTxTarget) {}
     fn custom_tx(
         &self,
-        session: crate::session::SessionHandle,
+        runtime: &mut DataPlaneMain,
+        worker: &mut SessionWorker,
+        target: TransportTxTarget,
         params: &mut TransportSendParams,
     ) -> usize;
-    fn app_rx_event(&self, connection_index: u32, worker_index: u32) -> Result<(), SessionError>;
+    fn app_rx_event(&self, _: &mut DataPlaneMain, _: &mut SessionWorker, _: u32) {}
+    fn is_descheduled(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> bool;
+    fn deschedule(&self, runtime: &DataPlaneMain, target: TransportTxTarget);
+    fn clear_descheduled(&self, runtime: &DataPlaneMain, target: TransportTxTarget);
+    fn is_tx_paced(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> bool;
+    fn tx_pacer_burst(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> u32;
+    fn tx_pacer_update_bytes(&self, runtime: &DataPlaneMain, target: TransportTxTarget, bytes: u32);
+    fn tx_pacer_reset_bucket(&self, runtime: &DataPlaneMain, target: TransportTxTarget, bucket: u32);
     fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection>;
     fn listener(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn half_open(&self, connection_index: u32) -> Option<&Self::Connection>;

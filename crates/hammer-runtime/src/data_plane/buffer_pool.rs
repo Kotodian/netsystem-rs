@@ -151,12 +151,22 @@ impl DataPlaneMain {
         );
     }
 
+    #[inline(always)]
+    pub fn prefetch_header_write(&self, index: u32) {
+        hammer_infra::prefetch::prefetch_write_l1(
+            std::ptr::from_ref(self.buffer(index)).cast::<u8>(),
+        );
+    }
+
     #[inline]
     pub fn prefetch_read(&self, index: u32) {
         self.prefetch_header(index);
         let data = self.buffer(index).current();
-        if !data.is_empty() {
-            hammer_infra::prefetch::prefetch_read_l1(data.as_ptr());
+        if let Some(byte) = data.first() {
+            hammer_infra::prefetch::prefetch_read_l1(std::ptr::from_ref(byte));
+        }
+        if let Some(byte) = data.get(hammer_infra::align::CACHE_LINE) {
+            hammer_infra::prefetch::prefetch_read_l1(std::ptr::from_ref(byte));
         }
     }
 
@@ -164,8 +174,12 @@ impl DataPlaneMain {
     pub fn prefetch_write(&self, index: u32) {
         let buffer = self.buffer(index);
         hammer_infra::prefetch::prefetch_write_l1(std::ptr::from_ref(buffer).cast::<u8>());
-        if !buffer.current().is_empty() {
-            hammer_infra::prefetch::prefetch_write_l1(buffer.current().as_ptr());
+        let data = buffer.current();
+        if let Some(byte) = data.first() {
+            hammer_infra::prefetch::prefetch_write_l1(std::ptr::from_ref(byte));
+        }
+        if let Some(byte) = data.get(hammer_infra::align::CACHE_LINE) {
+            hammer_infra::prefetch::prefetch_write_l1(std::ptr::from_ref(byte));
         }
     }
 
@@ -241,6 +255,12 @@ impl DataPlaneMain {
         let mut caches = self.borrow_buffer_caches();
         let main = hammer_core::buffer::BufferMain::global();
         main.alloc_from_pool(&mut caches, indices, pool_index)
+    }
+
+    /// VPP: session_node.c:1299-1302, default Buffer Pool sizing for TX.
+    #[inline(always)]
+    pub fn buffer_default_data_size(&self) -> usize {
+        hammer_core::buffer::BufferMain::global().default_data_size(self.active_numa_node)
     }
 
     pub fn buffer_alloc_on_numa(&mut self, indices: &mut [u32], numa_node: u32) -> usize {

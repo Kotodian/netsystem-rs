@@ -1,9 +1,13 @@
 use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, TcpHeader, tcp_header};
 use core::hash::Hasher;
-use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
+use hammer_core::data_plane::{
+    BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext,
+};
 use hammer_infra::checksum::InternetChecksum;
+use hammer_plugin_session::{IpSessionFamily, IpSessionMain};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
+use hammer_service::session::SessionMain;
 use hammer_service::session::node::SessionQueueNode;
 
 use super::{TCP_EGRESS_TAG, TCP_MAIN, TcpError, read_tcp_egress_endpoints};
@@ -47,14 +51,18 @@ pub fn register_tcp4_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(Tcp4OutputNode::new(), &TcpOutputNext::NEXT_NAMES)?;
+    runtime.register_node_errors(node, &crate::TCP_ERRORS)?;
     let session_queue = runtime
         .nodes()
         .node_by_name("session-queue")
         .expect("Session Queue Graph Node must be registered before TCP output");
-    SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
-    runtime
-        .nodes()
-        .set_node_state(session_queue, NodeState::Disabled)?;
+    let next = SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
+    IpSessionMain::global()?.register_transport(
+        TCP_MAIN.get().expect("TCP Main initializes before output graph").protocol(),
+        IpSessionFamily::Ip4,
+        next,
+        crate::tcp_session_tx,
+    );
     Ok(node)
 }
 
@@ -65,14 +73,18 @@ pub fn register_tcp6_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(Tcp6OutputNode::new(), &["drop", "ip6-lookup"])?;
+    runtime.register_node_errors(node, &crate::TCP_ERRORS)?;
     let session_queue = runtime
         .nodes()
         .node_by_name("session-queue")
         .expect("Session Queue Graph Node must be registered before TCP output");
-    SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
-    runtime
-        .nodes()
-        .set_node_state(session_queue, NodeState::Disabled)?;
+    let next = SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
+    IpSessionMain::global()?.register_transport(
+        TCP_MAIN.get().expect("TCP Main initializes before output graph").protocol(),
+        IpSessionFamily::Ip6,
+        next,
+        crate::tcp_session_tx,
+    );
     Ok(node)
 }
 
@@ -142,20 +154,109 @@ fn tcp_output_node_process_frame<const SIMD_BYTES: usize, const IS_IP4: bool>(
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
 ) -> () {
-    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(runtime, index)
-            .unwrap_or(TcpOutputNext::Drop)
-    })
+    // VPP tcp_output.c:2312 refreshes the worker clock before the output
+    // packet loop; only Session Queue advances and dispatches TCP timers.
+    let now = SessionMain::global()
+        .expect("Session Main initializes before TCP output")
+        .now();
+    let tcp = TCP_MAIN.get().expect("TCP Main initializes before TCP output");
+    {
+        let mut worker = tcp
+            .worker(runtime.thread_index())
+            .expect("TCP output executes on its owner Data Worker");
+        worker.time_us = now;
+        worker.time_tstamp = ((now * 1_000.0) as u64) as u32;
+    }
+    let mut error_counts = [0u16; crate::TCP_ERRORS.len()];
+    let mut error_codes = [None; crate::TCP_ERRORS.len()];
+    let mut error_mask = 0u64;
+    let indices = frame.vector_args();
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut position = 0;
+    while indices.len() - position >= 4 {
+        // VPP tcp_output.c:2314-2363 prefetches the next pair before
+        // constructing the current pair's IP headers.
+        prefetch_tcp_output(runtime, indices[position + 2]);
+        prefetch_tcp_output(runtime, indices[position + 3]);
+
+        let mut error0 = None;
+        let next0 = tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(
+            runtime, indices[position], &mut error0,
+        ).unwrap_or(TcpOutputNext::Drop);
+        nexts[position] = NodeNext::slot(next0);
+        if let Some(error) = error0 {
+            let code = error as usize;
+            error_counts[code] += 1;
+            error_codes[code] = Some(error);
+            error_mask |= 1u64 << code;
+        }
+
+        let mut error1 = None;
+        let next1 = tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(
+            runtime, indices[position + 1], &mut error1,
+        ).unwrap_or(TcpOutputNext::Drop);
+        nexts[position + 1] = NodeNext::slot(next1);
+        if let Some(error) = error1 {
+            let code = error as usize;
+            error_counts[code] += 1;
+            error_codes[code] = Some(error);
+            error_mask |= 1u64 << code;
+        }
+        position += 2;
+    }
+    while position < indices.len() {
+        // VPP tcp_output.c:2365-2393 prefetches the next packet in the tail.
+        if let Some(&next) = indices.get(position + 1) {
+            prefetch_tcp_output(runtime, next);
+        }
+        let mut error = None;
+        let next = tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(
+            runtime, indices[position], &mut error,
+        ).unwrap_or(TcpOutputNext::Drop);
+        nexts[position] = NodeNext::slot(next);
+        if let Some(error) = error {
+            let code = error as usize;
+            error_counts[code] += 1;
+            error_codes[code] = Some(error);
+            error_mask |= 1u64 << code;
+        }
+        position += 1;
+    }
+    let packet_count = indices.len();
+    // VPP tcp_output.c:2301-2393 stores only nonzero frame-local counters.
+    while error_mask != 0 {
+        let code = error_mask.trailing_zeros() as usize;
+        error_mask &= error_mask - 1;
+        runtime.record_current_node_error_count(
+            error_codes[code].expect("nonzero TCP error has its typed code"),
+            u64::from(error_counts[code]),
+        )
+        .expect("TCP output registers its error counters");
+    }
+    runtime.enqueue_to_next(node_runtime, frame, &nexts[..packet_count]);
+}
+
+#[inline(always)]
+fn prefetch_tcp_output(runtime: &DataPlaneMain, index: u32) {
+    // VPP tcp_output.c:2319-2323: STORE the header and two lines at b->data.
+    runtime.prefetch_header_write(index);
+    let buffer = runtime.buffer(index);
+    let data = buffer
+        .current()
+        .as_ptr()
+        .wrapping_offset(-isize::from(buffer.current_data_offset()));
+    hammer_infra::prefetch::prefetch_write_l1_bytes(data, 2 * hammer_infra::align::CACHE_LINE);
 }
 
 fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
+    error: &mut Option<TcpError>,
 ) -> RuntimeResult<TcpOutputNext> {
     let buffer = runtime.buffer(index);
     let header = buffer.current();
     if tcp_header(header).is_err() {
-        let _ = runtime.record_current_node_error(TcpError::Length);
+        *error = Some(TcpError::Length);
         return Ok(TcpOutputNext::Drop);
     }
     let tcp_len = buffer
@@ -164,12 +265,12 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
     let egress = *hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).egress();
 
     let Some(tcp_len) = tcp_len else {
-        let _ = runtime.record_current_node_error(TcpError::Length);
+        *error = Some(TcpError::Length);
         return Ok(TcpOutputNext::Drop);
     };
 
     if egress.tag != TCP_EGRESS_TAG {
-        let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+        *error = Some(TcpError::InvalidConnection);
         return Ok(TcpOutputNext::Drop);
     }
 
@@ -178,7 +279,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
     let (local, remote, fib_index) = if egress.connection_index != u32::MAX {
         let worker_index = runtime.data_worker_id()?.slot() as u32;
         if egress.worker_index != worker_index {
-            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            *error = Some(TcpError::InvalidConnection);
             return Ok(TcpOutputNext::Drop);
         }
         let main = TCP_MAIN
@@ -186,11 +287,11 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
             .expect("TCP output Node runs after TCP Main initialization");
         let tcp = main.worker(runtime.thread_index())?;
         let Some(connection) = tcp.connection(egress.connection_index) else {
-            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            *error = Some(TcpError::InvalidConnection);
             return Ok(TcpOutputNext::Drop);
         };
         let Some(local) = connection.local() else {
-            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            *error = Some(TcpError::InvalidConnection);
             return Ok(TcpOutputNext::Drop);
         };
         (
@@ -200,7 +301,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
         )
     } else {
         let Some((local, remote)) = read_tcp_egress_endpoints(&egress) else {
-            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            *error = Some(TcpError::InvalidConnection);
             return Ok(TcpOutputNext::Drop);
         };
         let fib_index = if egress.fib_index == u32::MAX {
@@ -217,7 +318,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
                 .checked_add(20)
                 .and_then(|length| u16::try_from(length).ok())
             else {
-                let _ = runtime.record_current_node_error(TcpError::Length);
+                *error = Some(TcpError::Length);
                 return Ok(TcpOutputNext::Drop);
             };
             tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len, fib_index)?;
@@ -225,14 +326,14 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) if !IS_IP4 => {
             let Ok(payload_len) = u16::try_from(tcp_len) else {
-                let _ = runtime.record_current_node_error(TcpError::Length);
+                *error = Some(TcpError::Length);
                 return Ok(TcpOutputNext::Drop);
             };
             tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len, fib_index)?;
             Ok(TcpOutputNext::Lookup)
         }
         _ => {
-            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            *error = Some(TcpError::InvalidConnection);
             Ok(TcpOutputNext::Drop)
         }
     }
@@ -443,11 +544,13 @@ mod opaque_tests {
             crate::write_session_route_opaque(
                 opaque.route_mut(),
                 17,
+                23,
                 hammer_runtime::DataWorkerId::new(0),
                 crate::TcpInputNext::Established,
             );
             let (session, worker, next) = crate::read_session_route_opaque(opaque.route()).unwrap();
             assert_eq!(session, 17);
+            assert_eq!(opaque.route().connection_index, 23);
             assert_eq!(worker.slot(), 0);
             assert!(matches!(next, crate::TcpInputNext::Established));
             assert_eq!(
@@ -470,10 +573,12 @@ mod opaque_tests {
             )
             .write_to_buffer(buffer)?;
         }
+        let mut error = None;
         assert!(matches!(
-            tcp_output_next_for_index::<1, true>(&mut runtime, index)?,
+            tcp_output_next_for_index::<1, true>(&mut runtime, index, &mut error)?,
             TcpOutputNext::Lookup
         ));
+        assert_eq!(error, None);
         {
             let buffer = runtime.buffer(index);
             assert_eq!(&buffer.current()[12..16], &[192, 0, 2, 1]);

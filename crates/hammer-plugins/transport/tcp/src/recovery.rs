@@ -11,103 +11,6 @@ use hammer_service::transport::congestion::{
 const TCP_MIN_TLP_TIMEOUT: Duration = Duration::from_millis(10);
 const TCP_DUPACK_THRESHOLD: u32 = 3;
 
-/// Inline capacity for per-ACK scoreboard key collection. SACK gap counts are
-/// bounded by the number of SACK blocks a receiver reports (RFC 2018 caps a
-/// single SACK option at 4 blocks, and pathological reordering rarely exceeds
-/// 8 distinct gaps). When this capacity is exceeded the collector falls back to
-/// a heap `Vec` via the `#[cold]` overflow path, preserving correctness.
-const SCOREBOARD_KEY_INLINE_CAP: usize = 8;
-
-/// Small-stack collector for `TcpSeq` keys used on the ACK hot path, replacing
-/// the per-ACK `Vec<TcpSeq>` allocations in `advance_scoreboard_for_ack` and
-/// `update_scoreboard_loss`. Holds up to `SCOREBOARD_KEY_INLINE_CAP` entries in
-/// a stack array; overflowing callers drain what fits and continue with a
-/// `#[cold]` heap fallback for the remainder, so behavior matches the old Vec
-/// exactly while keeping the common case allocation-free.
-struct ScoreboardKeyCollector {
-    inline: [TcpSeq; SCOREBOARD_KEY_INLINE_CAP],
-    len: usize,
-    overflow: Option<Vec<TcpSeq>>,
-}
-
-impl ScoreboardKeyCollector {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            inline: [TcpSeq::from(0); SCOREBOARD_KEY_INLINE_CAP],
-            len: 0,
-            overflow: None,
-        }
-    }
-
-    #[inline]
-    fn push(&mut self, key: TcpSeq) {
-        if let Some(buf) = &mut self.overflow {
-            buf.push(key);
-            return;
-        }
-        if self.len < SCOREBOARD_KEY_INLINE_CAP {
-            self.inline[self.len] = key;
-            self.len += 1;
-        } else {
-            // Spill: move inline contents to a heap Vec and continue there.
-            // #[cold] attribution is on `spill_to_overflow`.
-            self.spill_to_overflow(key);
-        }
-    }
-
-    #[cold]
-    fn spill_to_overflow(&mut self, key: TcpSeq) {
-        let mut buf = Vec::with_capacity(self.len.saturating_add(1).max(SCOREBOARD_KEY_INLINE_CAP));
-        for i in 0..self.len {
-            buf.push(self.inline[i]);
-        }
-        buf.push(key);
-        // Inline contents have been moved into the heap Vec; reset the inline
-        // view so drain operations do not visit them twice.
-        self.len = 0;
-        self.overflow = Some(buf);
-    }
-
-    #[inline]
-    fn pop_front(&mut self) -> Option<TcpSeq> {
-        if self.len != 0 {
-            let key = self.inline[0];
-            let mut index = 1usize;
-            while index < self.len {
-                self.inline[index - 1] = self.inline[index];
-                index += 1;
-            }
-            self.len -= 1;
-            return Some(key);
-        }
-        let buf = self.overflow.as_mut()?;
-        if buf.is_empty() {
-            self.overflow = None;
-            return None;
-        }
-        Some(buf.remove(0))
-    }
-
-    #[inline]
-    fn pop_back(&mut self) -> Option<TcpSeq> {
-        if let Some(buf) = self.overflow.as_mut() {
-            if let Some(key) = buf.pop() {
-                if buf.is_empty() {
-                    self.overflow = None;
-                }
-                return Some(key);
-            }
-            self.overflow = None;
-        }
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        Some(self.inline[self.len])
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TcpSentSample {
     pub(crate) packet_number: PacketNumber,
@@ -117,6 +20,7 @@ pub(crate) struct TcpSentSample {
     pub(crate) payload_len: u32,
     pub(crate) retransmitted: bool,
     pub(crate) lost: bool,
+    pub(crate) tx_lost: bool,
     pub(crate) rack_deadline: Option<Instant>,
     pub(crate) sent_at: Instant,
     pub(crate) prev: Option<u32>,
@@ -234,12 +138,21 @@ pub struct TcpRecoveryState {
     ack_floor: TcpSeq,
     scoreboard: TcpScoreboard,
     rack_deadline: Option<Instant>,
-    rack_timer_armed: bool,
+    rack_reference_sent_at: Option<Instant>,
+    rack_reference_end: TcpSeq,
+    rack_rtt: Option<Duration>,
+    rack_reordered: bool,
+    pub(crate) rack_enabled: bool,
+    snd_nxt: TcpSeq,
     tlp_timer_armed: bool,
+    tlp_probe_end: Option<TcpSeq>,
+    tlp_rtt_fresh: bool,
     recovery_active: bool,
+    no_sack_first_pending: bool,
     recovery_window: u32,
     recovery_prev_window: u32,
     recovery_delivered: u32,
+    recovery_prev_delivered: u32,
     recovery_retransmitted: u32,
     recovery_new_data: u32,
     recovery_end_sequence: TcpSeq,
@@ -257,12 +170,21 @@ impl TcpRecoveryState {
             ack_floor: 0u32.into(),
             scoreboard: TcpScoreboard::new(),
             rack_deadline: None,
-            rack_timer_armed: false,
+            rack_reference_sent_at: None,
+            rack_reference_end: TcpSeq::from(0),
+            rack_rtt: None,
+            rack_reordered: false,
+            rack_enabled: false,
+            snd_nxt: TcpSeq::from(0),
             tlp_timer_armed: false,
+            tlp_probe_end: None,
+            tlp_rtt_fresh: false,
             recovery_active: false,
+            no_sack_first_pending: false,
             recovery_window: 0,
             recovery_prev_window: 0,
             recovery_delivered: 0,
+            recovery_prev_delivered: 0,
             recovery_retransmitted: 0,
             recovery_new_data: 0,
             recovery_end_sequence: TcpSeq::from(0),
@@ -297,6 +219,7 @@ impl TcpRecoveryState {
             payload_len,
             retransmitted: false,
             lost: false,
+            tx_lost: false,
             rack_deadline: None,
             sent_at,
             prev,
@@ -312,7 +235,8 @@ impl TcpRecoveryState {
         }
         self.sample_tail = Some(sample_index);
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(bytes);
-        self.tlp_timer_armed = true;
+        self.snd_nxt = end_sequence;
+        self.tlp_timer_armed = self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
     }
 
     pub fn bytes_in_flight(&self) -> u32 {
@@ -328,6 +252,34 @@ impl TcpRecoveryState {
         self.recovery_active
     }
 
+    /// VPP tcp_sack.h scoreboard sacked_bytes: bytes SACKed above the
+    /// cumulative ACK, excluding the currently tracked missing ranges.
+    #[inline]
+    pub(crate) fn sacked_bytes(&self) -> u32 {
+        let acknowledged_to_high = self.ack_floor.distance_to(self.scoreboard.high_sacked);
+        let mut missing = 0u32;
+        let mut cursor = self.scoreboard.holes.first().map(|(start, _)| *start);
+        while let Some(start) = cursor {
+            let hole = self
+                .scoreboard
+                .holes
+                .get(&start)
+                .expect("scoreboard traversal retains its current hole");
+            missing = missing.saturating_add(start.distance_to(hole.end));
+            cursor = self
+                .scoreboard
+                .holes
+                .successor(&start)
+                .map(|(next, _)| *next);
+        }
+        acknowledged_to_high.saturating_sub(missing)
+    }
+
+    #[inline]
+    pub(crate) fn reorder_threshold(&self) -> u32 {
+        self.scoreboard.reorder
+    }
+
     pub fn rack_timeout(&self, now: Instant) -> Option<Duration> {
         self.rack_deadline
             .map(|deadline| deadline.saturating_duration_since(now))
@@ -336,7 +288,13 @@ impl TcpRecoveryState {
     pub fn tlp_timeout(&self, srtt: Option<Duration>, rto: Duration) -> Option<Duration> {
         // A SACK-confirmed gap has a concrete RACK deadline. TLP remains the
         // fallback only while there is no stronger loss signal to service.
-        if !self.tlp_timer_armed || !self.has_unacked_data() || self.has_pending_rack_deadline() {
+        if !self.tlp_timer_armed
+            || !self.tlp_rtt_fresh
+            || self.tlp_probe_end.is_some()
+            || !self.has_unacked_data()
+            || self.has_pending_rack_deadline()
+            || self.recovery_active
+        {
             return None;
         }
         let srtt = srtt.unwrap_or(rto);
@@ -353,10 +311,27 @@ impl TcpRecoveryState {
         let (advanced, latest_rtt) = self.process_ack(ack, congestion);
         self.advance_scoreboard_for_ack(ack.acknowledgment, congestion.max_datagram_size());
         self.maybe_finish_recovery(ack.acknowledgment);
+        if self.rack_enabled && self.scoreboard.high_sacked > ack.acknowledgment {
+            self.mark_rack_candidates(
+                self.scoreboard.high_sacked,
+                ack.now,
+                ack.reordering_window,
+                congestion.max_datagram_size(),
+            );
+            self.on_rack_timeout(ack.now, self.snd_nxt, congestion);
+        }
         if self.recovery_active && advanced {
             self.queue_recovery_head(ack.now, ack.reordering_window);
+            self.no_sack_first_pending = true;
         }
-        self.tlp_timer_armed = self.has_unacked_data();
+        if latest_rtt.is_some() {
+            self.tlp_rtt_fresh = true;
+        }
+        if self.tlp_probe_end.is_some_and(|end| ack.acknowledgment >= end) {
+            self.tlp_probe_end = None;
+        }
+        self.tlp_timer_armed = self.has_unacked_data()
+            && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
         latest_rtt
     }
 
@@ -367,26 +342,116 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
-        let (mut acked, mut acked_bytes) = self.take_acked_segments(ack.acknowledgment);
-        acked.reserve(blocks.len());
-        let mut highest_sacked_right = ack.acknowledgment;
-        for block in blocks {
-            highest_sacked_right = highest_sacked_right.max(block.right_edge);
-            let (sacked, sacked_bytes) = self.take_sacked_segments(*block);
-            acked_bytes = acked_bytes.saturating_add(sacked_bytes);
-            acked.extend(sacked);
+        let mut latest_rtt = None;
+        let mut largest_acked = 0;
+        let mut any_acked = false;
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let Some(sample) = self.sent_sample(index) else {
+                break;
+            };
+            if ack.acknowledgment <= sample.sequence {
+                break;
+            }
+            cursor = sample.next;
+            let partial = ack.acknowledgment < sample.end_sequence;
+            let segment = if partial {
+                self.take_sample_prefix(index, ack.acknowledgment)
+            } else {
+                self.take_sent(index)
+            };
+            let Some(segment) = segment else {
+                break;
+            };
+            largest_acked = largest_acked.max(segment.packet_number);
+            any_acked = true;
+            latest_rtt = self
+                .deliver_sample(ack, segment, congestion)
+                .or(latest_rtt);
+            if partial {
+                break;
+            }
         }
-        let latest_rtt = self.deliver_acked_segments(ack, acked, acked_bytes, congestion);
+        let mut highest_sacked_right = self.scoreboard.high_sacked.max(ack.acknowledgment);
+        for block in blocks {
+            // VPP tcp_sack.c:1137-1149 excludes invalid ordinary SACK blocks.
+            if block.left_edge >= block.right_edge
+                || block.left_edge <= ack.acknowledgment
+                || block.left_edge >= self.snd_nxt
+                || block.right_edge > self.snd_nxt
+            {
+                continue;
+            }
+            highest_sacked_right = highest_sacked_right.max(block.right_edge);
+            let mut cursor = self.sample_at_or_after(block.left_edge, true);
+            while let Some(index) = cursor {
+                let Some(sample) = self.sent_sample(index) else {
+                    break;
+                };
+                if block.right_edge < sample.sequence {
+                    break;
+                }
+                cursor = self.next_sample(sample.sequence);
+                if !sample.overlaps(block.left_edge, block.right_edge) {
+                    continue;
+                }
+                let ack_start = sample.sequence.max(block.left_edge);
+                let ack_end = sample.end_sequence.min(block.right_edge);
+                if ack_start > sample.sequence && self.split_sample(index, ack_start).is_none() {
+                    continue;
+                }
+                let Some(current_index) = self.sample_at_or_after(ack_start, false) else {
+                    continue;
+                };
+                let Some(current) = self.sent_sample(current_index) else {
+                    continue;
+                };
+                let segment = if ack_end < current.end_sequence {
+                    self.take_sample_prefix(current_index, ack_end)
+                } else {
+                    self.take_sent(current_index)
+                };
+                let Some(segment) = segment else {
+                    continue;
+                };
+                largest_acked = largest_acked.max(segment.packet_number);
+                any_acked = true;
+                latest_rtt = self
+                    .deliver_sample(ack, segment, congestion)
+                    .or(latest_rtt);
+            }
+        }
+        if any_acked {
+            congestion.on_end_acks(
+                ack.now,
+                self.bytes_in_flight(),
+                ack.app_limited,
+                largest_acked,
+            );
+        }
         self.rebuild_scoreboard(
             ack.acknowledgment,
             highest_sacked_right,
             congestion.max_datagram_size(),
         );
         self.maybe_finish_recovery(ack.acknowledgment);
-        if highest_sacked_right != ack.acknowledgment {
-            self.mark_rack_candidates(highest_sacked_right, ack.now, ack.reordering_window);
+        if self.rack_enabled && highest_sacked_right != ack.acknowledgment {
+            self.mark_rack_candidates(
+                highest_sacked_right,
+                ack.now,
+                ack.reordering_window,
+                congestion.max_datagram_size(),
+            );
+            self.on_rack_timeout(ack.now, self.snd_nxt, congestion);
         }
-        self.tlp_timer_armed = self.has_unacked_data();
+        if latest_rtt.is_some() {
+            self.tlp_rtt_fresh = true;
+        }
+        if self.tlp_probe_end.is_some_and(|end| ack.acknowledgment >= end) {
+            self.tlp_probe_end = None;
+        }
+        self.tlp_timer_armed = self.has_unacked_data()
+            && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
         latest_rtt
     }
 
@@ -398,6 +463,7 @@ impl TcpRecoveryState {
     ) {
         let recovery_prev_window = congestion.congestion_window();
         let mut recovery_started = false;
+        let mut lost_any = false;
         let mut cursor = self.sample_head;
         while let Some(sample_index) = cursor {
             let Some(sample) = self.sent_sample(sample_index) else {
@@ -423,13 +489,20 @@ impl TcpRecoveryState {
             };
             current.rack_deadline = None;
             current.lost = true;
+            current.tx_lost = true;
+            lost_any = true;
             recovery_started |= !self.recovery_active;
         }
         if recovery_started {
             self.recovery_active = true;
+            self.scoreboard.high_rxt = self.scoreboard.holes.first()
+                .map(|(start, _)| (*start).max(self.ack_floor))
+                .unwrap_or(self.ack_floor);
+            self.no_sack_first_pending = true;
             self.recovery_prev_window = recovery_prev_window.max(1);
             self.recovery_window = congestion.congestion_window();
             self.recovery_delivered = 0;
+            self.recovery_prev_delivered = 0;
             self.recovery_retransmitted = 0;
             self.recovery_new_data = 0;
             self.recovery_end_sequence = snd_nxt;
@@ -438,8 +511,10 @@ impl TcpRecoveryState {
         }
         self.refresh_lost_bytes();
         self.rack_rescan_earliest();
-        self.rack_timer_armed = self.has_pending_rack_deadline();
-        self.tlp_timer_armed = self.has_unacked_data();
+        if lost_any {
+            self.tlp_timer_armed = false;
+            self.tlp_probe_end = None;
+        }
     }
 
     #[inline]
@@ -458,6 +533,32 @@ impl TcpRecoveryState {
         self.recovery_new_data = self.recovery_new_data.saturating_add(bytes);
     }
 
+    #[inline]
+    pub(crate) fn on_recovery_burst_sent(&mut self) {
+        self.recovery_prev_delivered = self.recovery_delivered;
+        self.no_sack_first_pending = false;
+    }
+
+    #[inline]
+    pub(crate) fn no_sack_first_pending(&self) -> bool {
+        self.no_sack_first_pending
+    }
+
+    #[inline]
+    pub(crate) fn recovery_end_sequence(&self) -> TcpSeq {
+        self.recovery_end_sequence
+    }
+
+    /// VPP tcp_output.c:1929-1932 advances HighRxt only after enqueue.
+    #[inline]
+    pub(crate) fn advance_high_rxt(&mut self, end: TcpSeq) {
+        self.scoreboard.high_rxt = if self.rack_enabled {
+            end
+        } else {
+            self.scoreboard.high_rxt.max(end)
+        };
+    }
+
     pub fn recovery_send_space(&self, bytes_in_flight: u32, max_datagram_size: u32) -> Option<u32> {
         if !self.recovery_active {
             return None;
@@ -474,9 +575,10 @@ impl TcpRecoveryState {
             let allowed = allowed.min(u128::from(u32::MAX)) as u32;
             allowed.saturating_sub(prr_out)
         } else {
-            let limit = self
-                .recovery_delivered
-                .saturating_sub(prr_out)
+            let conserved = self.recovery_delivered.saturating_sub(prr_out);
+            let delivered_since_send = self.recovery_delivered
+                .saturating_sub(self.recovery_prev_delivered);
+            let limit = conserved.max(delivered_since_send)
                 .saturating_add(max_datagram_size);
             self.recovery_window
                 .saturating_sub(bytes_in_flight)
@@ -488,59 +590,102 @@ impl TcpRecoveryState {
         Some(space)
     }
 
-    /// Retransmit the lowest lost, not-yet-retransmitted sample.
-    ///
-    /// Walks `sample_head` ascending (samples are linked in increasing sequence
-    /// order) and retransmits the first sample with `lost && !retransmitted`.
-    /// Ascending order matches VPP `scoreboard_next_rxt_hole` (walks forward from
-    /// the first hole) and RFC 6675 §4.3 ("retransmit the segment starting with
-    /// HighACK + 1"). Per-sample `lost` is the authoritative RACK-loss signal and
-    /// is also set by `update_scoreboard_loss` for SACK-gap-driven loss, giving a
-    /// single unified retransmit path.
-    pub(crate) fn take_rack_retransmit(&mut self) -> Option<TcpSentSample> {
+    /// VPP: tcp_bt.c:1710-1742. Selection does not spend retransmit
+    /// eligibility before a Buffer has entered Session pending output.
+    pub(crate) fn retransmit_candidate(&self) -> Option<TcpSentSample> {
         let mut cursor = self.sample_head;
-        while let Some(sample_index) = cursor {
-            let sample = self.sent_sample(sample_index)?;
+        while let Some(index) = cursor {
+            let sample = self.sent_sample(index)?;
             cursor = sample.next;
-            if !sample.lost || sample.retransmitted {
-                continue;
+            if sample.tx_lost {
+                return Some(sample);
             }
-            let start = sample.sequence;
-            let end = sample.end_sequence;
-            let bytes = sample.bytes;
-            let payload_len = sample.payload_len;
-            let cleared = sample.rack_deadline;
-            {
-                let current = self.sent_sample_mut(sample_index)?;
-                current.retransmitted = true;
-                current.rack_deadline = None;
-            }
-            self.rack_invalidate_cleared(cleared);
-            self.scoreboard.high_rxt = end;
-            self.rack_timer_armed = self.has_pending_rack_deadline();
-            return Some(TcpSentSample {
-                packet_number: sample.packet_number,
-                sequence: start,
-                end_sequence: end,
-                bytes,
-                payload_len,
-                retransmitted: true,
-                lost: false,
-                rack_deadline: None,
-                sent_at: sample.sent_at,
-                prev: sample.prev,
-                next: sample.next,
-            });
         }
         None
     }
 
-    pub(crate) fn take_tlp_probe(&mut self) -> Option<TcpSentSample> {
-        let index = self.sample_tail?;
-        let sample = self.sent_samples.get_mut(index)?;
-        sample.retransmitted = true;
+    #[inline]
+    pub(crate) fn oldest_unacked(&self) -> Option<TcpSentSample> {
+        self.sample_head.and_then(|index| self.sent_sample(index))
+    }
+
+    #[inline]
+    pub(crate) fn tail_loss_probe_candidate(&self) -> Option<TcpSentSample> {
+        self.sample_tail.and_then(|index| self.sent_sample(index))
+    }
+
+    pub(crate) fn sample_covering(&self, sequence: TcpSeq) -> Option<TcpSentSample> {
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let sample = self.sent_sample(index)?;
+            if sample.covers(sequence) {
+                return Some(sample);
+            }
+            cursor = sample.next;
+        }
+        None
+    }
+
+    /// VPP: tcp_output.c:1230-1264. Called only after the final Buffer
+    /// contains the retransmitted bytes and has entered Session pending TX.
+    pub(crate) fn commit_retransmit(&mut self, sequence: TcpSeq, sent_at: Instant) {
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let sample = *self.sent_sample(index)
+                .expect("retransmit sample remains in the connection pool");
+            cursor = sample.next;
+            if sample.sequence != sequence {
+                continue;
+            }
+            let deadline = sample.rack_deadline;
+            let current = self.sent_sample_mut(index)
+                .expect("retransmit sample remains in the connection pool");
+            current.retransmitted = true;
+            current.tx_lost = false;
+            current.rack_deadline = None;
+            current.sent_at = sent_at;
+            self.rack_invalidate_cleared(deadline);
+            self.scoreboard.high_rxt = if self.rack_enabled {
+                sample.end_sequence
+            } else {
+                self.scoreboard.high_rxt.max(sample.end_sequence)
+            };
+            self.refresh_lost_bytes();
+            return;
+        }
+        panic!("retransmitted TCP sequence retains a sent sample");
+    }
+
+    /// VPP tcp_tlp.c:15-20,50-68; tcp_output.c:1360-1378. Publish only
+    /// after the probe Buffer enters Session pending TX.
+    pub(crate) fn record_tlp_probe(
+        &mut self,
+        end: TcpSeq,
+        retransmitted: Option<(TcpSeq, TcpSeq)>,
+    ) {
+        if let Some((start, retransmit_end)) = retransmitted {
+            let mut cursor = self.sample_head;
+            while let Some(index) = cursor {
+                let sample = *self.sent_sample(index)
+                    .expect("TLP sample remains allocated during probe publication");
+                cursor = sample.next;
+                if sample.overlaps(start, retransmit_end) {
+                    let current = self.sent_sample_mut(index)
+                        .expect("TLP sample remains allocated during probe publication");
+                    current.retransmitted = true;
+                    current.rack_deadline = None;
+                }
+            }
+            self.rack_rescan_earliest();
+        }
+        self.tlp_probe_end = Some(end);
+        self.tlp_rtt_fresh = false;
         self.tlp_timer_armed = false;
-        Some(*sample)
+    }
+
+    #[inline]
+    pub(crate) fn disarm_tlp(&mut self) {
+        self.tlp_timer_armed = false;
     }
 
     pub(crate) fn on_retransmission_timeout<C: CongestionController>(
@@ -561,11 +706,20 @@ impl TcpRecoveryState {
             },
             true,
         );
+        let current = self.sent_sample_mut(head)
+            .expect("RTO retains the oldest outstanding sample");
+        current.tx_lost = true;
+        current.lost = true;
+        self.refresh_lost_bytes();
         if !self.recovery_active {
             self.recovery_active = true;
+            self.scoreboard.high_rxt = self.scoreboard.holes.first()
+                .map(|(start, _)| (*start).max(self.ack_floor))
+                .unwrap_or(self.ack_floor);
             self.recovery_prev_window = recovery_prev_window.max(1);
             self.recovery_window = congestion.congestion_window();
             self.recovery_delivered = 0;
+            self.recovery_prev_delivered = 0;
             self.recovery_retransmitted = 0;
             self.recovery_new_data = 0;
             self.recovery_end_sequence = snd_nxt;
@@ -575,13 +729,9 @@ impl TcpRecoveryState {
                 self.recovery_end_sequence = snd_nxt;
             }
         }
-        let current = self.sent_sample_mut(head)?;
-        current.retransmitted = true;
-        let cleared = current.rack_deadline;
-        current.rack_deadline = None;
-        self.rack_invalidate_cleared(cleared);
-        self.rack_timer_armed = false;
-        self.tlp_timer_armed = self.has_unacked_data();
+        self.no_sack_first_pending = true;
+        self.tlp_timer_armed = false;
+        self.tlp_probe_end = None;
         Some(sample)
     }
 
@@ -596,50 +746,45 @@ impl TcpRecoveryState {
         highest_sacked_right: TcpSeq,
         now: Instant,
         reordering_window: Duration,
+        max_datagram_size: u32,
     ) {
+        let (Some(reference_sent_at), Some(rtt)) =
+            (self.rack_reference_sent_at, self.rack_rtt)
+        else {
+            return;
+        };
+        let reordering_window = if !self.rack_reordered
+            && (self.recovery_active
+                || self.sacked_bytes()
+                    >= self.scoreboard.reorder.saturating_mul(max_datagram_size))
+        {
+            Duration::ZERO
+        } else {
+            reordering_window
+        };
         let mut cursor = self.sample_head;
-        let deadline = now + reordering_window;
-        let mut any_marked = false;
         while let Some(index) = cursor {
             let Some(sample) = self.sent_sample(index) else {
                 break;
             };
-            if sample.end_sequence < highest_sacked_right
+            if sample.end_sequence <= highest_sacked_right
+                && (sample.sent_at < reference_sent_at
+                    || (sample.sent_at == reference_sent_at
+                        && sample.end_sequence < self.rack_reference_end))
                 && !self.sample_is_lost(sample)
                 && sample.rack_deadline.is_none()
             {
+                let deadline = sample.sent_at + rtt + reordering_window;
                 if let Some(current) = self.sent_sample_mut(index) {
                     current.rack_deadline = Some(deadline);
                 }
-                any_marked = true;
+                self.rack_note_deadline(deadline.max(now));
             }
             cursor = sample.next;
         }
-        if any_marked {
-            self.rack_note_deadline(deadline);
-        }
-        self.rack_timer_armed = self.has_pending_rack_deadline();
     }
 
-    /// Fused ACK-path replacement for `take_acked_segments` + `deliver_acked_segments`.
-    ///
-    /// Walks `sample_head` once, taking each acked segment (full or partial
-    /// prefix) and feeding it straight to `deliver_acked_segment` inline, so no
-    /// intermediate `Vec<TcpSentSample>` is allocated on the ACK hot path.
-    ///
-    /// Equivalence with the pre-fuse path: `take_sent`/`take_sample_prefix`
-    /// decrement `bytes_in_flight` by `segment.bytes` before the inline
-    /// `deliver_acked_segment` call, so `self.bytes_in_flight()` read after the
-    /// take equals exactly `bif_before_ack - sum(seg[0..=i].bytes)`, which is the
-    /// `bytes_in_flight_after_ack` value the pre-fuse `deliver_acked_segments`
-    /// computed via its rollback (`bif_after_all + total - sum`). `recovery_delivered`
-    /// is credited by the accumulated acked bytes once at the end, matching the
-    /// pre-fuse one-shot `+= total_acked_bytes`. `on_end_acks` fires exactly once
-    /// when any segment was acked, matching the pre-fuse `any_acked` guard.
-    ///
-    /// Returns `(advanced, latest_rtt)` where `advanced` is true iff any segment
-    /// was acked (preserving the pre-fuse `!acked.is_empty()` signal) and
-    /// `latest_rtt` is the most recent non-retransmitted RTT sample.
+    /// Cumulative ACK samples are removed and delivered without staging them.
     fn process_ack<C: CongestionController>(
         &mut self,
         ack: TcpRecoveryAck,
@@ -648,7 +793,6 @@ impl TcpRecoveryState {
         let mut largest_acked = 0;
         let mut any_acked = false;
         let mut latest_rtt = None;
-        let mut total_acked_bytes = 0u32;
         let mut cursor = self.sample_head;
         let mut done = false;
         while let Some(index) = cursor {
@@ -663,32 +807,24 @@ impl TcpRecoveryState {
                 let Some(taken) = self.take_sent(index) else {
                     break;
                 };
-                total_acked_bytes = total_acked_bytes.saturating_add(taken.bytes);
                 taken
             } else {
                 // Partial prefix: the remaining suffix stays outstanding at
-                // `sequence == acknowledgment`, so no later sample can be acked
-                // by this cumulative ACK either. Match `take_acked_segments`
-                // which breaks after taking the prefix.
+                // `sequence == acknowledgment`, so no later sample is acked.
                 let Some(prefix) = self.take_sample_prefix(index, ack.acknowledgment) else {
                     break;
                 };
-                total_acked_bytes = total_acked_bytes.saturating_add(prefix.bytes);
                 done = true;
                 prefix
             };
             largest_acked = largest_acked.max(segment.packet_number);
             any_acked = true;
-            let bytes_in_flight_after_ack = self.bytes_in_flight();
-            latest_rtt = deliver_acked_segment(bytes_in_flight_after_ack, ack, segment, congestion)
+            latest_rtt = self.deliver_sample(ack, segment, congestion)
                 .or(latest_rtt);
             if done {
                 break;
             }
             cursor = next;
-        }
-        if self.recovery_active && total_acked_bytes != 0 {
-            self.recovery_delivered = self.recovery_delivered.saturating_add(total_acked_bytes);
         }
         if any_acked {
             congestion.on_end_acks(
@@ -701,116 +837,31 @@ impl TcpRecoveryState {
         (any_acked, latest_rtt)
     }
 
-    fn take_acked_segments(&mut self, acknowledgment: TcpSeq) -> (Vec<TcpSentSample>, u32) {
-        let mut acked = Vec::with_capacity(4);
-        let mut total_bytes = 0u32;
-        let mut cursor = self.sample_head;
-        while let Some(index) = cursor {
-            let Some(sample) = self.sent_sample(index) else {
-                break;
-            };
-            let next = sample.next;
-            if acknowledgment <= sample.sequence {
-                break;
-            }
-            if acknowledgment >= sample.end_sequence {
-                let Some(sample) = self.take_sent(index) else {
-                    break;
-                };
-                total_bytes = total_bytes.saturating_add(sample.bytes);
-                acked.push(sample);
-            } else {
-                let Some(sample) = self.take_sample_prefix(index, acknowledgment) else {
-                    break;
-                };
-                total_bytes = total_bytes.saturating_add(sample.bytes);
-                acked.push(sample);
-                break;
-            }
-            cursor = next;
-        }
-        (acked, total_bytes)
-    }
-
-    fn take_sacked_segments(&mut self, block: TcpSackBlock) -> (Vec<TcpSentSample>, u32) {
-        let mut matched = Vec::with_capacity(4);
-        let mut total_bytes = 0u32;
-        let left_edge = block.left_edge;
-        let right_edge = block.right_edge;
-        let mut cursor = self.sample_at_or_after(left_edge, true);
-        while let Some(index) = cursor {
-            let Some(sample) = self.sent_sample(index) else {
-                break;
-            };
-            if right_edge < sample.sequence {
-                break;
-            }
-            cursor = self.next_sample(sample.sequence);
-            if !sample.overlaps(left_edge, right_edge) {
-                continue;
-            }
-            let ack_start = sample.sequence.max(left_edge);
-            let ack_end = sample.end_sequence.min(right_edge);
-            if ack_start > sample.sequence && self.split_sample(index, ack_start).is_none() {
-                continue;
-            }
-            let Some(current_index) = self.sample_at_or_after(ack_start, false) else {
-                continue;
-            };
-            let Some(current) = self.sent_sample(current_index) else {
-                continue;
-            };
-            if ack_end < current.end_sequence {
-                let Some(sample) = self.take_sample_prefix(current_index, ack_end) else {
-                    continue;
-                };
-                total_bytes = total_bytes.saturating_add(sample.bytes);
-                matched.push(sample);
-            } else {
-                let Some(sample) = self.take_sent(current_index) else {
-                    continue;
-                };
-                total_bytes = total_bytes.saturating_add(sample.bytes);
-                matched.push(sample);
-            }
-        }
-        (matched, total_bytes)
-    }
-
-    fn deliver_acked_segments<C: CongestionController>(
+    fn deliver_sample<C: CongestionController>(
         &mut self,
         ack: TcpRecoveryAck,
-        acked: Vec<TcpSentSample>,
-        total_acked_bytes: u32,
+        segment: TcpSentSample,
         congestion: &mut C,
     ) -> Option<Duration> {
-        let mut largest_acked = 0;
-        let mut any_acked = false;
-        let mut latest_rtt = None;
-        let mut bytes_in_flight_after_ack = self.bytes_in_flight();
-        if self.recovery_active && total_acked_bytes != 0 {
-            self.recovery_delivered = self.recovery_delivered.saturating_add(total_acked_bytes);
+        if self.recovery_active {
+            self.recovery_delivered = self.recovery_delivered.saturating_add(segment.bytes);
         }
-        let mut bytes_in_flight_before_next_ack =
-            bytes_in_flight_after_ack.saturating_add(total_acked_bytes);
-        for segment in acked {
-            largest_acked = largest_acked.max(segment.packet_number);
-            any_acked = true;
-            bytes_in_flight_before_next_ack =
-                bytes_in_flight_before_next_ack.saturating_sub(segment.bytes);
-            bytes_in_flight_after_ack = bytes_in_flight_before_next_ack;
-            latest_rtt = deliver_acked_segment(bytes_in_flight_after_ack, ack, segment, congestion)
-                .or(latest_rtt);
+        if !segment.retransmitted {
+            let rtt = ack.now.saturating_duration_since(segment.sent_at);
+            if !rtt.is_zero() {
+                self.rack_reordered |= segment.end_sequence < self.scoreboard.high_sacked;
+                self.rack_rtt = Some(rtt);
+                if self.rack_reference_sent_at.is_none_or(|sent_at| {
+                    segment.sent_at > sent_at
+                        || (segment.sent_at == sent_at
+                            && segment.end_sequence > self.rack_reference_end)
+                }) {
+                    self.rack_reference_sent_at = Some(segment.sent_at);
+                    self.rack_reference_end = segment.end_sequence;
+                }
+            }
         }
-        if any_acked {
-            congestion.on_end_acks(
-                ack.now,
-                self.bytes_in_flight(),
-                ack.app_limited,
-                largest_acked,
-            );
-        }
-        latest_rtt
+        deliver_acked_segment(self.bytes_in_flight(), ack, segment, congestion)
     }
 
     fn sent_sample(&self, index: u32) -> Option<TcpSentSample> {
@@ -857,9 +908,11 @@ impl TcpRecoveryState {
             self.recovery_window = 0;
             self.recovery_prev_window = 0;
             self.recovery_delivered = 0;
+            self.recovery_prev_delivered = 0;
             self.recovery_retransmitted = 0;
             self.recovery_new_data = 0;
             self.recovery_end_sequence = TcpSeq::from(0);
+            self.no_sack_first_pending = false;
         }
     }
 
@@ -979,9 +1032,14 @@ impl TcpRecoveryState {
         high_sacked: TcpSeq,
         max_datagram_size: u32,
     ) {
+        let high_rxt = self.scoreboard.high_rxt;
         self.scoreboard.clear();
         self.scoreboard.high_sacked = high_sacked.max(acknowledgment);
-        self.scoreboard.high_rxt = acknowledgment;
+        self.scoreboard.high_rxt = if self.recovery_active {
+            high_rxt.max(acknowledgment)
+        } else {
+            acknowledgment
+        };
         if self.sample_head.is_none() || self.scoreboard.high_sacked <= acknowledgment {
             // No SACK-gap holes remain, but RACK-lost samples above high_sacked
             // still count toward lost_bytes - recompute from per-sample flags
@@ -992,7 +1050,7 @@ impl TcpRecoveryState {
         }
 
         let mut cursor = self.sample_head;
-        let mut hole_start = acknowledgment;
+        let mut pending_hole: Option<(TcpSeq, TcpSeq)> = None;
         while let Some(index) = cursor {
             let Some(sample) = self.sent_sample(index) else {
                 break;
@@ -1001,32 +1059,43 @@ impl TcpRecoveryState {
             if sample.end_sequence <= acknowledgment {
                 continue;
             }
-            if sample.sequence > hole_start {
-                let start = hole_start;
-                let end = sample.sequence.min(self.scoreboard.high_sacked);
-                if end > start {
-                    let _ = self
-                        .scoreboard
-                        .holes
-                        .insert(start, TcpScoreboardHole { end, lost: false });
-                }
-            }
-            hole_start = hole_start.max(sample.end_sequence);
-            if hole_start >= self.scoreboard.high_sacked {
+            if sample.sequence >= self.scoreboard.high_sacked {
                 break;
+            }
+            let start = sample.sequence.max(acknowledgment);
+            let end = sample.end_sequence.min(self.scoreboard.high_sacked);
+            if start >= end {
+                continue;
+            }
+            match pending_hole {
+                Some((hole_start, hole_end)) if start <= hole_end => {
+                    pending_hole = Some((hole_start, hole_end.max(end)));
+                }
+                Some((hole_start, hole_end)) => {
+                    let _ = self.scoreboard.holes.insert(
+                        hole_start,
+                        TcpScoreboardHole { end: hole_end, lost: false },
+                    );
+                    pending_hole = Some((start, end));
+                }
+                None => pending_hole = Some((start, end)),
             }
         }
 
-        if hole_start < self.scoreboard.high_sacked {
+        if let Some((hole_start, hole_end)) = pending_hole {
             let _ = self.scoreboard.holes.insert(
                 hole_start,
                 TcpScoreboardHole {
-                    end: self.scoreboard.high_sacked,
+                    end: hole_end,
                     lost: false,
                 },
             );
         }
-        self.update_scoreboard_loss(max_datagram_size.max(1));
+        if self.rack_enabled {
+            self.refresh_lost_bytes();
+        } else {
+            self.update_scoreboard_loss(max_datagram_size.max(1));
+        }
         self.rack_rescan_earliest();
     }
 
@@ -1042,21 +1111,16 @@ impl TcpRecoveryState {
     /// (which is where sacked-sample removal creates/merges holes).
     fn advance_scoreboard_for_ack(&mut self, acknowledgment: TcpSeq, max_datagram_size: u32) {
         self.scoreboard.high_sacked = self.scoreboard.high_sacked.max(acknowledgment);
-        // Match rebuild_scoreboard, which resets high_rxt to the cumulative ACK
-        // on every scoreboard update (take_rack_retransmit raises it again when
-        // it retransmits).
-        self.scoreboard.high_rxt = acknowledgment;
+        // VPP tcp_sack.c:273-288 initializes HighRxt on recovery entry;
+        // subsequent ACKs can advance it but cannot undo sent retransmits.
+        self.scoreboard.high_rxt = self.scoreboard.high_rxt.max(acknowledgment);
         if self.sample_head.is_none() || self.scoreboard.high_sacked <= acknowledgment {
             // No outstanding samples or everything up to high_sacked is now
             // acknowledged: no SACK-gap holes remain. Drop holes without a full
             // clear() of unrelated scoreboard state, then recompute lost_bytes
             // from per-sample flags (RACK-lost samples above high_sacked still
             // count).
-            let mut keys = ScoreboardKeyCollector::new();
-            for (start, _) in self.scoreboard.holes.iter() {
-                keys.push(*start);
-            }
-            while let Some(start) = keys.pop_front() {
+            while let Some(start) = self.scoreboard.holes.first().map(|(start, _)| *start) {
                 let _ = self.scoreboard.holes.remove(&start);
             }
             self.refresh_lost_bytes();
@@ -1064,64 +1128,39 @@ impl TcpRecoveryState {
             return;
         }
 
-        // Remove holes fully below the new ACK and trim the one it crosses.
-        // Collect first to avoid mutating while iterating.
-        let mut to_remove = ScoreboardKeyCollector::new();
-        let mut to_trim: Option<(TcpSeq, TcpSeq, bool)> = None;
-        for (start, hole) in self.scoreboard.holes.iter() {
+        // Holes are ordered and disjoint: remove the acknowledged prefix,
+        // then trim at most one hole crossing the new ACK.
+        while let Some((start, hole)) = self
+            .scoreboard
+            .holes
+            .first()
+            .map(|(start, hole)| (*start, *hole))
+        {
             if hole.end <= acknowledgment {
-                to_remove.push(*start);
-            } else if *start < acknowledgment {
-                to_trim = Some((*start, hole.end, hole.lost));
+                let _ = self.scoreboard.holes.remove(&start);
+                continue;
             }
-        }
-        while let Some(start) = to_remove.pop_front() {
-            let _ = self.scoreboard.holes.remove(&start);
-        }
-        if let Some((old_start, end, lost)) = to_trim {
-            let _ = self.scoreboard.holes.remove(&old_start);
-            let _ = self
-                .scoreboard
-                .holes
-                .insert(acknowledgment, TcpScoreboardHole { end, lost });
+            if start < acknowledgment {
+                let _ = self.scoreboard.holes.remove(&start);
+                let _ = self.scoreboard.holes.insert(
+                    acknowledgment,
+                    TcpScoreboardHole {
+                        end: hole.end,
+                        lost: hole.lost,
+                    },
+                );
+            }
+            break;
         }
 
-        // Ensure the leading SACK-gap hole exists. Full rebuild creates a hole
-        // `[ack, min(first_sample.seq, high_sacked))` whenever the lowest
-        // outstanding sample starts above snd_una. The trim above only shrinks
-        // existing holes; it cannot create this leading hole when the previous
-        // scoreboard had none (e.g. the last SACK ran while no samples were
-        // outstanding and early-returned, then a new sample was recorded above
-        // high_sacked). Recreate it from the first sample to match full rebuild.
-        if let Some(head) = self.sample_head {
-            if let Some(first) = self.sent_sample(head)
-                && first.sequence > acknowledgment
-                && acknowledgment < self.scoreboard.high_sacked
-            {
-                let leading_end = first.sequence.min(self.scoreboard.high_sacked);
-                match self.scoreboard.holes.get_mut(&acknowledgment) {
-                    Some(hole) => {
-                        if hole.end < leading_end {
-                            hole.end = leading_end;
-                        }
-                    }
-                    None => {
-                        let _ = self.scoreboard.holes.insert(
-                            acknowledgment,
-                            TcpScoreboardHole {
-                                end: leading_end,
-                                lost: false,
-                            },
-                        );
-                    }
-                }
-            }
+        if self.rack_enabled {
+            self.refresh_lost_bytes();
+        } else {
+            self.update_scoreboard_loss(max_datagram_size.max(1));
         }
-
-        self.update_scoreboard_loss(max_datagram_size.max(1));
         self.rack_rescan_earliest();
     }
-    ///
+
     /// Replaces the original O(holes^2) `should_mark_hole_lost` (which rescanned
     /// all successor holes per hole). A hole is declared lost when enough sacked
     /// bytes or sacked blocks accumulate in the holes ABOVE it. Walking holes
@@ -1136,23 +1175,21 @@ impl TcpRecoveryState {
         let mss = max_datagram_size.max(1);
         let byte_threshold = reorder_limit.saturating_sub(1).saturating_mul(mss);
 
-        // Collect holes ascending, then decide descending so each hole sees the
-        // sacked bytes/blocks accumulated above it.
-        let mut hole_starts = ScoreboardKeyCollector::new();
-        let mut cursor = self.scoreboard.holes.first().map(|(start, _)| *start);
+        // VPP tcp_sack.c:131-139 starts with the SACKed run after the
+        // highest unsacked hole; omitting it leaves that hole never lost.
+        let trailing_sacked = self.scoreboard.holes.last()
+            .map(|(_, hole)| hole.end.distance_to(self.scoreboard.high_sacked))
+            .unwrap_or(0);
+        let mut sacked_ahead = trailing_sacked;
+        let mut blocks_ahead = u32::from(trailing_sacked != 0);
+        let mut higher_start: Option<TcpSeq> = None;
+        let mut cursor = self.scoreboard.holes.last().map(|(start, _)| *start);
         while let Some(start) = cursor {
-            hole_starts.push(start);
             cursor = self
                 .scoreboard
                 .holes
-                .successor(&start)
-                .map(|(next_start, _)| *next_start);
-        }
-
-        let mut sacked_ahead: u32 = 0;
-        let mut blocks_ahead: u32 = 0;
-        let mut higher_start: Option<TcpSeq> = None;
-        while let Some(start) = hole_starts.pop_back() {
+                .predecessor(&start)
+                .map(|(previous, _)| *previous);
             let Some(hole) = self.scoreboard.holes.get(&start).copied() else {
                 continue;
             };
@@ -1163,10 +1200,8 @@ impl TcpRecoveryState {
                 h.lost = should_mark_lost;
             }
             if should_mark_lost {
-                // Unify: a SACK-gap hole declared lost also marks the samples it
-                // covers as lost so the single per-sample retransmit walk in
-                // take_rack_retransmit reaches them. RACK-driven loss sets
-                // sample.lost directly in on_rack_timeout / queue_recovery_head.
+                // A SACK-gap hole marks its active transmission eligible;
+                // RACK uses the same sample bits without the scoreboard path.
                 self.mark_samples_in_range_lost(start, hole_end);
             }
             // Accumulate the gap between this hole and the next-higher hole for
@@ -1198,6 +1233,7 @@ impl TcpRecoveryState {
                     break;
                 };
                 current.lost = true;
+                current.tx_lost = true;
             }
         }
     }
@@ -1217,9 +1253,9 @@ impl TcpRecoveryState {
         };
         current.rack_deadline = None;
         current.lost = true;
+        current.tx_lost = true;
         self.refresh_lost_bytes();
         self.rack_rescan_earliest();
-        self.rack_timer_armed = self.has_pending_rack_deadline();
     }
 
     fn refresh_lost_bytes(&mut self) {
@@ -1238,7 +1274,7 @@ impl TcpRecoveryState {
     }
 
     fn sample_is_lost(&self, sample: TcpSentSample) -> bool {
-        sample.lost
+        sample.tx_lost
     }
 
     fn has_pending_rack_deadline(&self) -> bool {
@@ -1295,12 +1331,21 @@ impl Clone for TcpRecoveryState {
             ack_floor: self.ack_floor,
             scoreboard: self.scoreboard.clone(),
             rack_deadline: self.rack_deadline,
-            rack_timer_armed: self.rack_timer_armed,
+            rack_reference_sent_at: self.rack_reference_sent_at,
+            rack_reference_end: self.rack_reference_end,
+            rack_rtt: self.rack_rtt,
+            rack_reordered: self.rack_reordered,
+            rack_enabled: self.rack_enabled,
+            snd_nxt: self.snd_nxt,
             tlp_timer_armed: self.tlp_timer_armed,
+            tlp_probe_end: self.tlp_probe_end,
+            tlp_rtt_fresh: self.tlp_rtt_fresh,
             recovery_active: self.recovery_active,
+            no_sack_first_pending: self.no_sack_first_pending,
             recovery_window: self.recovery_window,
             recovery_prev_window: self.recovery_prev_window,
             recovery_delivered: self.recovery_delivered,
+            recovery_prev_delivered: self.recovery_prev_delivered,
             recovery_retransmitted: self.recovery_retransmitted,
             recovery_new_data: self.recovery_new_data,
             recovery_end_sequence: self.recovery_end_sequence,

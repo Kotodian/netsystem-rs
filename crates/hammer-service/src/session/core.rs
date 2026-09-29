@@ -21,14 +21,15 @@ use hammer_infra::sync::SpinLock;
 #[cfg(target_os = "linux")]
 use hammer_runtime::{File, FileFunctions, FILE_MAIN};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, RuntimeResult, interrupt_worker_node, is_current_worker,
+    DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeResult, interrupt_worker_node,
+    is_current_worker,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::app::ApplicationMain;
 use super::error::{SessionError, SessionQueueError};
 use super::segment_manager::{SegmentManager, SegmentManagerError, SegmentManagerMain};
-use crate::transport::{Transport, TransportSendParams, TransportTxMode};
+use crate::transport::{Transport, TransportSendParams, TransportTxTarget};
 
 /// VPP: session_node.c:1858-1915. A registered protocol supplies one
 /// monomorphized entry; the service retains no transport object or VFT.
@@ -39,6 +40,23 @@ pub type SessionIoDispatch = fn(
     SessionEventType,
 ) -> Result<(usize, bool), SessionError>;
 
+/// VPP session.c:1827-1847; session_node.c:1858-1910. One TX entry per
+/// Session type; the protocol's RX/control/time entries remain separate.
+pub type SessionTxDispatch = fn(
+    &mut SessionWorker,
+    &mut DataPlaneMain,
+    &mut NodeRuntime,
+    u32,
+    &mut usize,
+) -> SessionTxOutcome;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTxOutcome {
+    Ok,
+    NoData,
+    NoBuffers,
+}
+
 /// VPP: session_node.c:2024-2031, session_update_time_subscribers.
 pub type SessionTimeDispatch =
     fn(&mut DataPlaneMain, &mut SessionWorker, f64) -> Result<(), SessionError>;
@@ -46,7 +64,7 @@ pub type SessionTimeDispatch =
 /// VPP: session_node.c:1756-1790 and session.c:1641-1709. A transport
 /// plugin monomorphizes its Transport trait calls at registration.
 pub type SessionControlDispatch =
-    fn(&mut SessionWorker, u32, SessionEventType) -> Result<(), SessionError>;
+    fn(&mut SessionWorker, &mut DataPlaneMain, u32, SessionEventType) -> Result<(), SessionError>;
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
 
@@ -134,18 +152,17 @@ pub struct SessionRxSegment {
     pub length: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct SessionDmaTransfer {
-    pub pending_tx_buffers: u32,
-    pub pending_tx_nexts: u16,
+    pub pending_tx_buffers: Vec<u32>,
+    pub pending_tx_nexts: Vec<u16>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+#[derive(Debug)]
 pub struct SessionTxContext {
-    pub session: SessionHandle,
-    pub connection_index: u32,
-    pub transport_protocol: u8,
-    pub tx_mode: TransportTxMode,
+    cacheline0: hammer_infra::align::CacheLineAlignMark,
+    pub session: Option<SessionHandle>,
     pub send_params: TransportSendParams,
     pub max_dequeue: u32,
     pub left_to_send: u32,
@@ -155,16 +172,16 @@ pub struct SessionTxContext {
     pub segments_per_event: u16,
     pub buffers_needed: u16,
     pub buffers_per_segment: u8,
-    pub datagram_header: [u8; 32],
+    cacheline1: hammer_infra::align::CacheLineAlignMark,
+    pub tx_buffers: Vec<u32>,
+    pub transport_pending_buffers: Vec<u32>,
 }
 
 impl Default for SessionTxContext {
     fn default() -> Self {
         Self {
-            session: SessionHandle::invalid(),
-            connection_index: SESSION_INDEX_INVALID,
-            transport_protocol: 0,
-            tx_mode: TransportTxMode::Internal,
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
+            session: None,
             send_params: TransportSendParams::default(),
             max_dequeue: 0,
             left_to_send: 0,
@@ -174,9 +191,64 @@ impl Default for SessionTxContext {
             segments_per_event: 0,
             buffers_needed: 0,
             buffers_per_segment: 0,
-            datagram_header: [0; 32],
+            cacheline1: hammer_infra::align::CacheLineAlignMark,
+            tx_buffers: Vec::new(),
+            transport_pending_buffers: Vec::new(),
         }
     }
+}
+
+/// VPP: session_node.c:1130-1237, `session_tx_fill_buffer` and chain tail.
+#[inline(always)]
+fn tx_fill_buffer(
+    runtime: &mut DataPlaneMain,
+    fifo: &SvmFifo,
+    context: &mut SessionTxContext,
+    buffer_position: &mut usize,
+    fifo_offset: &mut usize,
+    payload_len: usize,
+) -> u32 {
+    let head = context.tx_buffers[*buffer_position];
+    let mut previous = head;
+    let mut remaining = payload_len;
+    let mut tail_len = 0usize;
+    while remaining != 0 {
+        let index = context.tx_buffers[*buffer_position];
+        *buffer_position += 1;
+        if index == head {
+            runtime.buffer_mut(index).make_headroom(140);
+        }
+        let capacity = if index == head {
+            context.dequeue_per_first_buffer
+        } else {
+            context.dequeue_per_buffer
+        };
+        let length = remaining
+            .min(usize::from(capacity))
+            .min(runtime.buffer(index).space_left_at_end());
+        assert_ne!(length, 0, "allocated TX Buffer has payload capacity");
+        let payload = runtime.buffer_mut(index).put_uninit(length as u16);
+        assert_eq!(
+            fifo.peek(*fifo_offset, length, payload),
+            length,
+            "Session TX FIFO retains packetized bytes"
+        );
+        if index != head {
+            runtime.buffer_mut(previous).set_next_buffer(Some(index));
+            tail_len += length;
+        }
+        previous = index;
+        *fifo_offset += length;
+        remaining -= length;
+    }
+    if tail_len != 0 {
+        runtime
+            .buffer_mut(head)
+            .set_total_len_not_including_first(tail_len)
+            .expect("TX Buffer chain length fits its header");
+    }
+    context.left_to_send -= payload_len as u32;
+    head
 }
 
 #[repr(u8)]
@@ -299,8 +371,7 @@ pub enum RxDelivery {
     },
     OutOfOrder {
         accepted: NonZeroU32,
-        newest_start: u32,
-        newest_len: NonZeroU32,
+        newest: Option<(u32, NonZeroU32)>,
         rx_available: u32,
     },
 }
@@ -670,16 +741,18 @@ impl SessionWorker {
         self.app_workers_pending.clear(app_worker as usize);
     }
 
-    pub fn allocate(&mut self, state: SessionState, protocol: u8, opaque: u32) -> SessionHandle {
+    pub fn allocate(
+        &mut self,
+        state: SessionState,
+        session_type: u8,
+        transport_protocol: u8,
+        opaque: u32,
+    ) -> SessionHandle {
         let handle = SessionHandle {
             worker_index: self.worker_index,
             session_index: SESSION_INDEX_INVALID,
         };
-        let mut session = Session::new(handle, state, protocol, opaque);
-        session.flags.connectionless = SessionMain::global()
-            .expect("Session Main initializes before Session allocation")
-            .transport_tx_mode(protocol)
-            == Some(TransportTxMode::Datagram);
+        let session = Session::new(handle, state, session_type, transport_protocol, opaque);
         let session_index = self.sessions.insert(session);
         let handle = SessionHandle {
             session_index,
@@ -698,10 +771,11 @@ impl SessionWorker {
         &mut self,
         listener: SessionHandle,
         connection_index: u32,
-        protocol: u8,
+        session_type: u8,
+        transport_protocol: u8,
         opaque: u32,
     ) -> SessionHandle {
-        let handle = self.allocate(SessionState::Created, protocol, opaque);
+        let handle = self.allocate(SessionState::Created, session_type, transport_protocol, opaque);
         let session = self
             .session_mut(handle.session_index)
             .expect("new accepted Session remains in its worker pool");
@@ -784,26 +858,37 @@ impl SessionWorker {
         let mut accepted = 0u32;
         let mut promoted = 0u32;
         let mut buffered_len = 0u32;
-        let mut newest_start: Option<u32> = None;
-        let mut newest_end: Option<u32> = None;
+        let mut skip_promoted = 0usize;
+        let mut newest = None;
         for buffer in runtime.chain(buffer_index) {
             let bytes = buffer.current();
             let length = u32::try_from(bytes.len())
                 .expect("a packet buffer's current length fits the Session FIFO index");
             if offset == 0 {
-                if accepted == buffered_len {
-                    let available = fifo.max_enqueue();
-                    if bytes.len() >= available {
+                let skip = skip_promoted.min(bytes.len());
+                skip_promoted -= skip;
+                let bytes = &bytes[skip..];
+                if !bytes.is_empty() {
+                    if bytes.len() >= fifo.max_enqueue() {
                         fifo.want_deq_notification();
                     }
-                    let written = fifo.enqueue(bytes);
-                    let chunk_accepted = written.min(bytes.len()).min(available);
+                    let result = fifo.enqueue_ooo(0, bytes).map_err(|source| {
+                        SessionError::RxOutOfOrderEnqueue {
+                            session_id,
+                            offset: 0,
+                            source,
+                        }
+                    })?;
                     accepted = accepted
-                        .checked_add(chunk_accepted as u32)
+                        .checked_add(result.accepted)
                         .expect("RX packet chain length fits u32");
                     promoted = promoted
-                        .checked_add((written - chunk_accepted) as u32)
+                        .checked_add(result.delivered)
                         .expect("promoted RX FIFO bytes fit u32");
+                    skip_promoted += result.delivered as usize;
+                    if result.accepted as usize != bytes.len() {
+                        break;
+                    }
                 }
             } else {
                 let chunk_offset = offset.checked_add(buffered_len).ok_or(
@@ -813,26 +898,27 @@ impl SessionWorker {
                         buffered_len,
                     },
                 )?;
-                let result = fifo.enqueue_ooo(chunk_offset, bytes).map_err(|source| {
-                    SessionError::RxOutOfOrderEnqueue {
-                        session_id,
-                        offset: chunk_offset,
-                        source,
+                let result = match fifo.enqueue_ooo(chunk_offset, bytes) {
+                    Ok(result) => result,
+                    Err(hammer_infra::svm::fifo::FifoError::OutOfOrderCapacityExceeded { .. }
+                    | hammer_infra::svm::fifo::FifoError::SegmentExhausted) => break,
+                    Err(source) => {
+                        return Err(SessionError::RxOutOfOrderEnqueue {
+                            session_id,
+                            offset: chunk_offset,
+                            source,
+                        });
                     }
-                })?;
+                };
                 accepted = accepted
                     .checked_add(result.accepted)
                     .expect("RX packet chain length fits u32");
                 promoted = promoted
                     .checked_add(result.delivered)
                     .expect("promoted RX FIFO bytes fit u32");
-                if let Some(start) = result.start {
-                    let end = start
-                        .checked_add(result.len)
-                        .ok_or(SessionError::OooSpanInvalid { session_id })?;
-                    newest_start = Some(newest_start.map_or(start, |value| value.min(start)));
-                    newest_end = Some(newest_end.map_or(end, |value| value.max(end)));
-                }
+                newest = result
+                    .start
+                    .and_then(|start| NonZeroU32::new(result.len).map(|length| (start, length)));
             }
             buffered_len = buffered_len
                 .checked_add(length)
@@ -842,7 +928,7 @@ impl SessionWorker {
         if rx_available == 0 {
             fifo.want_deq_notification();
         }
-        if offset == 0 && (accepted != 0 || promoted != 0) {
+        if offset == 0 {
             let session = self
                 .session_mut(handle.session_index)
                 .expect("RX Session remains allocated during FIFO enqueue");
@@ -861,15 +947,9 @@ impl SessionWorker {
                 rx_available,
             })
         } else {
-            let start = newest_start.ok_or(SessionError::OooSpanMissing { session_id })?;
-            let len = newest_end
-                .and_then(|end| end.checked_sub(start))
-                .and_then(NonZeroU32::new)
-                .ok_or(SessionError::OooSpanInvalid { session_id })?;
             Ok(RxDelivery::OutOfOrder {
                 accepted,
-                newest_start: start,
-                newest_len: len,
+                newest,
                 rx_available,
             })
         }
@@ -993,7 +1073,7 @@ impl SessionWorker {
                                     SessionState::Ready | SessionState::TransportClosing
                                 ) => {
                                     if let Some(dispatch) = main.transport_control(protocol) {
-                                        dispatch(self, handle.session_index, event_type)
+                                        dispatch(self, runtime, handle.session_index, event_type)
                                     } else {
                                         Err(SessionError::TransportNotRegistered)
                                     }
@@ -1017,7 +1097,7 @@ impl SessionWorker {
                             SessionEventType::Close | SessionEventType::Reset => {
                                 if let Some(dispatch) = main.transport_control(protocol) {
                                     session.store_state(SessionState::AppClosed);
-                                    dispatch(self, handle.session_index, event_type)
+                                    dispatch(self, runtime, handle.session_index, event_type)
                                 } else {
                                     Err(SessionError::TransportNotRegistered)
                                 }
@@ -1094,6 +1174,7 @@ impl SessionWorker {
     pub(crate) fn dispatch_io_events(
         &mut self,
         runtime: &mut DataPlaneMain,
+        node: &mut NodeRuntime,
         main: &SessionMain,
     ) -> Result<usize, SessionError> {
         // VPP session_node.c:2046,2096: buffers already pending at entry
@@ -1137,7 +1218,20 @@ impl SessionWorker {
                             self.enqueue_notify(runtime, handle);
                         }
                     }
-                    SessionEventType::Tx | SessionEventType::TxFlush | SessionEventType::Rx => {
+                    SessionEventType::Tx | SessionEventType::TxFlush => {
+                        if let Some(session) = self.session(session_index) {
+                            let tx = main
+                                .session_tx(session.session_type())
+                                .expect("registered Session type retains its TX entry");
+                            tx(self, runtime, node, index, &mut packets);
+                        } else {
+                            self.event_elements
+                                .remove(index)
+                                .expect("orphaned TX event remains allocated");
+                        }
+                        continue;
+                    }
+                    SessionEventType::Rx => {
                         if let Some(session) = self.session(session_index) {
                             let dispatch = main
                                 .transport_io(session.transport_protocol())
@@ -1178,81 +1272,547 @@ impl SessionWorker {
         Ok(())
     }
 
-    /// VPP: session_node.c:1472-1684, session_tx_fifo_peek_and_snd. TCP
-    /// retains FIFO bytes until ACK; one packet is produced per visit.
-    #[inline(always)]
-    pub fn tx_fifo_peek_and_send<T, E>(
+    /// VPP: session_node.c:1696-1747, internal custom TX.
+    pub fn tx_fifo_dequeue_internal<T, E>(
         &mut self,
         runtime: &mut DataPlaneMain,
-        session_index: u32,
+        _: &mut NodeRuntime,
+        event_index: u32,
+        packets: &mut usize,
         transport: &T,
-        next: crate::session::node::SessionQueueNext,
-    ) -> Result<(usize, bool), SessionError>
+    ) -> usize
     where
         T: Transport<E>,
     {
-        let Some(session) = self.session(session_index) else {
-            return Ok((0, false));
+        let event = self.event_elements.get(event_index)
+            .expect("internal TX event remains allocated").event;
+        let session_index = event.session_index();
+        let Some(session) = self.sessions.get(session_index) else {
+            self.event_elements.remove(event_index);
+            return 0;
         };
-        if session.load_state() != SessionState::Ready {
-            return Ok((
-                0,
-                u8::from(session.load_state()) < u8::from(SessionState::TransportClosed),
-            ));
+        let state = session.load_state();
+        if u8::from(state) >= u8::from(SessionState::TransportClosed)
+            || (state == SessionState::Connecting && session.flags.half_open)
+        {
+            self.event_elements.remove(event_index);
+            return 0;
         }
+        let handle = session.handle();
+        self.sessions.get_mut(session_index)
+            .expect("internal TX retains its Session")
+            .flags.custom_tx = false;
+        let max_burst = crate::session::node::SESSION_QUEUE_IO_BUDGET
+            .saturating_sub(*packets)
+            .min(crate::transport::Pacer::MAX_BURST_PACKETS as usize);
+        let mut params = TransportSendParams {
+            max_burst_size: max_burst as u32,
+            ..TransportSendParams::default()
+        };
+        let sent = transport.custom_tx(runtime, self, TransportTxTarget::Session(handle), &mut params);
+        assert!(sent <= max_burst, "internal transport stays within Session frame budget");
+        *packets += sent;
+        let session = self.sessions.get(session_index)
+            .expect("internal custom TX retains its Session");
+        let custom_tx = session.flags.custom_tx;
+        let notify_dequeue = params.bytes_dequeued != 0
+            && session.tx_fifo()
+                .expect("internal custom TX retains its FIFO")
+                .needs_deq_notification(params.bytes_dequeued as usize);
+        if custom_tx {
+            self.old_events.push_back(event_index);
+        } else if !params.flags.deschedule {
+            let fifo = session.tx_fifo().expect("internal custom TX retains its FIFO");
+            fifo.unset_event();
+            if fifo.max_dequeue() != 0 && fifo.set_event() {
+                self.old_events.push_front(event_index);
+            } else {
+                self.event_elements.remove(event_index);
+            }
+        } else {
+            self.event_elements.remove(event_index);
+        }
+        if notify_dequeue {
+            self.notify_tx_dequeue(runtime, handle);
+        }
+        sent
+    }
+
+    /// VPP: session_node.c:1472-1684, session_tx_fifo_peek_and_snd. TCP
+    /// retains FIFO bytes until ACK; the event remains owned by this worker.
+    pub fn tx_fifo_peek_and_send<T, E>(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        node: &mut NodeRuntime,
+        event_index: u32,
+        packets: &mut usize,
+        transport: &T,
+    ) -> SessionTxOutcome
+    where
+        T: Transport<E>,
+    {
+        self.tx_fifo_read_and_send_i::<T, E, (), false>(
+            runtime, node, event_index, packets, true, transport,
+        )
+    }
+
+    /// VPP: session_node.c:1688-1694, ordinary stream dequeue TX.
+    pub fn tx_fifo_dequeue_and_send<T, E, M, const DGRAM: bool>(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        node: &mut NodeRuntime,
+        event_index: u32,
+        packets: &mut usize,
+        transport: &T,
+    ) -> SessionTxOutcome
+    where
+        T: Transport<E>,
+    {
+        self.tx_fifo_read_and_send_i::<T, E, M, DGRAM>(
+            runtime, node, event_index, packets, false, transport,
+        )
+    }
+
+    /// VPP: session_node.c:1472-1677, common peek/dequeue burst algorithm.
+    #[inline(always)]
+    fn tx_fifo_read_and_send_i<T, E, M, const DGRAM: bool>(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        _: &mut NodeRuntime,
+        event_index: u32,
+        packets: &mut usize,
+        peek_data: bool,
+        transport: &T,
+    ) -> SessionTxOutcome
+    where
+        T: Transport<E>,
+    {
+        let event = self
+            .event_elements
+            .get(event_index)
+            .expect("TX event remains in its owner worker pool")
+            .event;
+        let session_index = event.session_index();
+        let Some(session) = self.sessions.get(session_index) else {
+            self.event_elements.remove(event_index);
+            return SessionTxOutcome::NoData;
+        };
+        let state = session.load_state();
+        let custom_tx = session.flags.custom_tx;
+        let not_ready = if peek_data {
+            if u8::from(state) < u8::from(SessionState::Ready) {
+                state != SessionState::Accepting || !custom_tx
+            } else if u8::from(state) >= u8::from(SessionState::TransportClosed) {
+                state == SessionState::TransportDeleted || !custom_tx
+            } else {
+                false
+            }
+        } else {
+            state == SessionState::TransportDeleted || session.tx_fifo().is_none()
+        };
+        if not_ready {
+            if peek_data && u8::from(state) < u8::from(SessionState::Ready) {
+                self.old_events.push_back(event_index);
+            } else {
+                self.event_elements.remove(event_index);
+            }
+            return SessionTxOutcome::NoData;
+        }
+        self.tx_context.session = Some(session.handle());
+        let next = SessionMain::global()
+            .expect("Session Main owns the registered TX output edge")
+            .session_output_next(session.session_type())
+            .expect("registered Session type retains an output edge");
         let connection = session.connection_index();
-        let fifo = session
-            .tx_fifo()
-            .expect("ready Session retains its TX FIFO");
-        let params = transport.send_params(connection, self.worker_index);
+        // VPP session_node.c:1278-1290 selects the listener only for
+        // dequeue TX on a Listening Session; peek TX always uses a connection.
+        let target = if !peek_data && state == SessionState::Listening {
+            TransportTxTarget::Listener(connection)
+        } else {
+            TransportTxTarget::Connection(connection)
+        };
+        if SessionEventType::try_from(event.event_type)
+            .expect("TX event type remains valid")
+            == SessionEventType::TxFlush
+        {
+            transport.flush_data(self, target);
+            self.event_elements
+                .get_mut(event_index)
+                .expect("flush event remains allocated")
+                .event
+                .event_type = u8::from(SessionEventType::Tx);
+        }
+        let mut params = TransportSendParams::default();
+        let max_burst = crate::session::node::SESSION_QUEUE_IO_BUDGET.saturating_sub(*packets);
+        if max_burst == 0 {
+            self.old_events.push_back(event_index);
+            return SessionTxOutcome::NoData;
+        }
+        if self.sessions.get(session_index)
+            .expect("TX event retains its Session").flags.custom_tx
+        {
+            self.sessions.get_mut(session_index)
+                .expect("TX event retains its Session").flags.custom_tx = false;
+            params.max_burst_size = max_burst as u32;
+            let sent = transport.custom_tx(
+                runtime, self, target, &mut params,
+            );
+            assert!(sent <= max_burst, "transport custom TX stays within frame budget");
+            *packets += sent;
+            let session = self.sessions.get(session_index)
+                .expect("custom TX retains its Session");
+            if u8::from(session.load_state()) >= u8::from(SessionState::TransportClosed) {
+                session.tx_fifo().expect("custom TX retains TX FIFO").unset_event();
+                self.event_elements.remove(event_index);
+                return SessionTxOutcome::Ok;
+            }
+            if sent == max_burst || session.flags.custom_tx {
+                self.old_events.push_back(event_index);
+                return SessionTxOutcome::Ok;
+            }
+        }
+        if transport.is_descheduled(runtime, target) {
+            transport.clear_descheduled(runtime, target);
+        }
+        transport.send_params(runtime, self, target, &mut params);
         if params.send_space == 0 {
-            return Ok((0, !params.flags.deschedule));
+            if params.flags.deschedule {
+                transport.deschedule(runtime, target);
+                self.event_elements.remove(event_index);
+            } else if params.flags.postpone {
+                self.old_events.push_back(event_index);
+            } else {
+                self.old_events.push_front(event_index);
+            }
+            return SessionTxOutcome::NoData;
         }
-        let available = fifo.max_dequeue().saturating_sub(params.tx_offset as usize);
-        if available == 0 {
+        if transport.is_tx_paced(runtime, target) {
+            let burst = transport.tx_pacer_burst(runtime, target);
+            if burst < 1460 {
+                self.old_events.push_front(event_index);
+                return SessionTxOutcome::NoData;
+            }
+            let paced = params.send_space.min(burst);
+            let mss = u32::from(params.send_mss);
+            params.send_space = if paced >= mss {
+                paced - paced % mss
+            } else {
+                paced
+            };
+        }
+        let fifo = self.sessions.get(session_index)
+            .expect("send params retain Session")
+            .tx_fifo().expect("ready Session retains TX FIFO");
+        let tx_offset = if peek_data { params.tx_offset as usize } else { 0 };
+        let record_header_len = size_of::<SessionDatagramPrefix>() + size_of::<M>() + size_of::<u16>();
+        let mut datagram_length = 0usize;
+        let mut datagram_offset = 0usize;
+        let mut record_starts = [0usize; crate::session::node::SESSION_QUEUE_IO_BUDGET];
+        let mut record_lengths = [0usize; crate::session::node::SESSION_QUEUE_IO_BUDGET];
+        let mut record_offsets = [0usize; crate::session::node::SESSION_QUEUE_IO_BUDGET];
+        let mut record_count = 1usize;
+        let mut fifo_offset_start = tx_offset;
+        let available = if DGRAM {
+            assert!(!peek_data, "datagram TX uses the dequeue entry");
+            if fifo.max_dequeue() <= record_header_len {
+                fifo.unset_event();
+                if fifo.max_dequeue() != 0 && fifo.set_event() {
+                    self.old_events.push_front(event_index);
+                } else {
+                    self.event_elements.remove(event_index);
+                }
+                return SessionTxOutcome::NoData;
+            }
+            let mut prefix_bytes = [0u8; size_of::<SessionDatagramPrefix>()];
+            assert_eq!(fifo.peek(0, prefix_bytes.len(), &mut prefix_bytes), prefix_bytes.len());
+            let prefix = SessionDatagramPrefix::read_from_bytes(&prefix_bytes)
+                .expect("datagram prefix has its declared layout");
+            datagram_length = prefix.data_length as usize;
+            datagram_offset = prefix.data_offset as usize;
+            if datagram_length == 0 {
+                assert_eq!(fifo.drop_dequeue(record_header_len), record_header_len);
+                fifo.unset_event();
+                if fifo.max_dequeue() != 0 && fifo.set_event() {
+                    self.old_events.push_front(event_index);
+                } else {
+                    self.event_elements.remove(event_index);
+                }
+                return SessionTxOutcome::NoData;
+            }
+            assert!(datagram_offset < datagram_length,
+                "datagram offset stays within its payload");
+            let record_len = record_header_len.checked_add(datagram_length)
+                .expect("datagram record length fits usize");
+            if fifo.max_dequeue() < record_len {
+                self.old_events.push_front(event_index);
+                return SessionTxOutcome::NoData;
+            }
+            let mut gso_bytes = [0u8; size_of::<u16>()];
+            assert_eq!(fifo.peek(record_header_len - gso_bytes.len(), gso_bytes.len(), &mut gso_bytes),
+                gso_bytes.len());
+            let gso_size = u16::from_ne_bytes(gso_bytes);
+            if gso_size != 0 {
+                params.send_mss = params.send_mss.min(gso_size);
+            }
+            let first_remaining = datagram_length - datagram_offset;
+            params.send_mss = params.send_mss.min(first_remaining.min(u16::MAX as usize) as u16);
+            record_lengths[0] = datagram_length;
+            record_offsets[0] = datagram_offset;
+            fifo_offset_start = record_header_len + datagram_offset;
+            let mut total = first_remaining;
+            let data_size = runtime.buffer_default_data_size();
+            assert!(data_size > 140, "default Buffer Pool fits transport headers");
+            if datagram_length <= (data_size - 140).min(usize::from(params.send_mss)) {
+                let max_offset = fifo.max_dequeue().min(32 << 10);
+                let mut next_start = record_len;
+                while record_count < record_starts.len()
+                    && next_start + record_header_len <= max_offset
+                {
+                    let mut next_bytes = [0u8; size_of::<SessionDatagramPrefix>()];
+                    assert_eq!(
+                        fifo.peek(next_start, next_bytes.len(), &mut next_bytes),
+                        next_bytes.len(),
+                    );
+                    let next = SessionDatagramPrefix::read_from_bytes(&next_bytes)
+                        .expect("datagram prefix has its declared layout");
+                    let length = next.data_length as usize;
+                    let offset = next.data_offset as usize;
+                    if length == 0 || offset >= length
+                        || length - offset != first_remaining
+                        || next_start + record_header_len + length > fifo.max_dequeue()
+                    {
+                        break;
+                    }
+                    record_starts[record_count] = next_start;
+                    record_lengths[record_count] = length;
+                    record_offsets[record_count] = offset;
+                    record_count += 1;
+                    total += first_remaining;
+                    next_start += record_header_len + length;
+                }
+            }
+            total
+        } else {
+            fifo.max_dequeue().saturating_sub(tx_offset)
+        };
+        let mss = usize::from(params.send_mss);
+        assert_ne!(mss, 0, "sendable transport has a nonzero MSS");
+        let max_len = if available < params.send_space as usize {
+            if available > mss { available - available % mss } else { available }
+        } else {
+            params.send_space as usize
+        };
+        let burst = crate::session::node::SESSION_QUEUE_IO_BUDGET.saturating_sub(*packets);
+        let segments = max_len.div_ceil(mss).min(burst);
+        let send_len = max_len.min(segments * mss);
+        if send_len == 0 {
+            transport.tx_pacer_reset_bucket(runtime, target, 0);
             fifo.unset_event();
-            return Ok((
-                0,
-                fifo.max_dequeue() > params.tx_offset as usize && fifo.set_event(),
+            if fifo.max_dequeue() > if DGRAM { 0 } else { tx_offset } && fifo.set_event() {
+                self.old_events.push_front(event_index);
+            } else {
+                transport.deschedule(runtime, target);
+                self.event_elements.remove(event_index);
+            }
+            return SessionTxOutcome::NoData;
+        }
+        let data_size = runtime.buffer_default_data_size();
+        assert!(data_size > 140, "default Buffer Pool fits transport headers");
+        let full_segment_buffers = (140 + mss).div_ceil(data_size);
+        let final_segment_len = send_len - (segments - 1) * mss;
+        self.tx_context.send_params = params;
+        self.tx_context.max_dequeue = available.min(u32::MAX as usize) as u32;
+        self.tx_context.left_to_send = u32::try_from(send_len)
+            .expect("Session TX length fits its FIFO index");
+        self.tx_context.max_length_to_send = self.tx_context.left_to_send;
+        self.tx_context.dequeue_per_first_buffer = u16::try_from(mss.min(data_size - 140))
+            .expect("first Buffer payload capacity fits u16");
+        self.tx_context.dequeue_per_buffer = u16::try_from(mss.min(data_size))
+            .expect("tail Buffer payload capacity fits u16");
+        self.tx_context.segments_per_event = u16::try_from(segments)
+            .expect("Session frame segment count fits u16");
+        self.tx_context.buffers_per_segment = u8::try_from(full_segment_buffers)
+            .expect("one transport segment fits its Buffer chain count");
+        let buffers_needed = (segments - 1) * usize::from(self.tx_context.buffers_per_segment)
+            + (140 + final_segment_len).div_ceil(data_size);
+        self.tx_context.buffers_needed = u16::try_from(buffers_needed)
+            .expect("Session frame Buffer count fits u16");
+        let buffers_needed = usize::from(self.tx_context.buffers_needed);
+        self.tx_context.tx_buffers.resize(buffers_needed, 0);
+        let allocated = runtime.buffer_alloc(&mut self.tx_context.tx_buffers[..buffers_needed]);
+        if allocated != buffers_needed {
+            if allocated != 0 {
+                runtime.buffer_free(&self.tx_context.tx_buffers[..allocated]);
+            }
+            runtime.record_current_node_error(
+                crate::session::node::SessionQueueNodeError::NoBuffer,
+            ).expect("session-queue registers its Buffer exhaustion counter");
+            self.old_events.push_front(event_index);
+            return SessionTxOutcome::NoBuffers;
+        }
+        if transport.is_tx_paced(runtime, target) {
+            transport.tx_pacer_update_bytes(
+                runtime, target, self.tx_context.max_length_to_send,
+            );
+        }
+        let mut heads = core::mem::take(&mut self.tx_context.transport_pending_buffers);
+        heads.clear();
+        let mut allocated_index = 0;
+        let mut fifo_offset = if peek_data {
+            self.tx_context.send_params.tx_offset as usize
+        } else {
+            fifo_offset_start
+        };
+        let mut n_left = usize::from(self.tx_context.segments_per_event);
+        while n_left >= 4 {
+            // VPP session_node.c:1585-1594 prefetches the next two Buffer
+            // headers for store before filling the current pair.
+            runtime.prefetch_header_write(self.tx_context.tx_buffers[allocated_index + 2]);
+            runtime.prefetch_header_write(self.tx_context.tx_buffers[allocated_index + 3]);
+            if DGRAM && record_count > 1 {
+                let record = heads.len();
+                fifo_offset = record_starts[record] + record_header_len + record_offsets[record];
+            }
+            heads.push(tx_fill_buffer(
+                runtime, fifo, &mut self.tx_context,
+                &mut allocated_index, &mut fifo_offset, mss,
             ));
+            if DGRAM && record_count > 1 {
+                let record = heads.len();
+                fifo_offset = record_starts[record] + record_header_len + record_offsets[record];
+            }
+            heads.push(tx_fill_buffer(
+                runtime, fifo, &mut self.tx_context,
+                &mut allocated_index, &mut fifo_offset, mss,
+            ));
+            n_left -= 2;
         }
-        let mut buffers = [0u32; 1];
-        if runtime.buffer_alloc(&mut buffers) == 0 {
-            return Ok((0, true));
+        while n_left != 0 {
+            if n_left > 1 {
+                runtime.prefetch_header_write(self.tx_context.tx_buffers[allocated_index + 1]);
+            }
+            let payload_len = if n_left == 1 { final_segment_len } else { mss };
+            if DGRAM && record_count > 1 {
+                let record = heads.len();
+                fifo_offset = record_starts[record] + record_header_len + record_offsets[record];
+            }
+            heads.push(tx_fill_buffer(
+                runtime, fifo, &mut self.tx_context,
+                &mut allocated_index, &mut fifo_offset, payload_len,
+            ));
+            n_left -= 1;
         }
-        let buffer = runtime.buffer_mut(buffers[0]);
-        let capacity = buffer.make_headroom(60).len();
-        let length = available
-            .min(params.send_space as usize)
-            .min(params.send_mss as usize)
-            .min(capacity)
-            .min(u16::MAX as usize);
-        if length == 0 {
-            runtime.buffer_free_one(buffers[0]);
-            return Ok((0, false));
+        assert_eq!(allocated_index, buffers_needed, "TX budget matches Buffer chain lengths");
+        assert_eq!(self.tx_context.left_to_send, 0, "TX burst fills its planned FIFO length");
+        if DGRAM && self.sessions.get(session_index)
+            .expect("datagram TX retains its Session").flags.connectionless
+        {
+            let mut payload_offset = datagram_offset;
+            for (record, &head) in heads.iter().enumerate() {
+                let packet_len = runtime.buffer(head).current_len()
+                    + runtime.buffer(head).total_len_not_including_first();
+                let buffer = runtime.buffer_mut(head);
+                let header = buffer.push_uninit(
+                    u8::try_from(record_header_len)
+                        .expect("datagram metadata fits reserved Buffer headroom"),
+                );
+                let record_start = if record_count > 1 { record_starts[record] } else { 0 };
+                assert_eq!(fifo.peek(record_start, record_header_len, header), record_header_len,
+                    "complete datagram metadata remains in the Session FIFO");
+                let prefix = SessionDatagramPrefix {
+                    data_length: if record_count > 1 {
+                        record_lengths[record] as u32
+                    } else {
+                        datagram_length as u32
+                    },
+                    data_offset: if record_count > 1 {
+                        record_offsets[record] as u32
+                    } else {
+                        payload_offset as u32
+                    },
+                };
+                header[..size_of::<SessionDatagramPrefix>()].copy_from_slice(prefix.as_bytes());
+                buffer.advance(record_header_len as isize);
+                payload_offset += packet_len;
+            }
         }
-        let data = buffer.put_uninit(length as u16);
-        assert_eq!(
-            fifo.peek(params.tx_offset as usize, length, data),
-            length,
-            "sendable FIFO range remains readable while TCP owns the consumer"
-        );
         transport.push_header(
-            connection,
-            self.worker_index,
-            &mut buffers,
-            fifo.max_dequeue().min(u32::MAX as usize) as u32,
+            runtime,
+            self,
+            target,
+            &heads,
+            self.tx_context.max_dequeue,
         );
-        let next_params = transport.send_params(connection, self.worker_index);
-        let pending = fifo.max_dequeue() > next_params.tx_offset as usize;
-        if !pending {
+        let fifo = self.sessions.get(session_index)
+            .expect("sent Session retains its TX FIFO")
+            .tx_fifo().expect("sent Session retains its TX FIFO");
+        let notify_dequeue = if peek_data {
+            false
+        } else if DGRAM {
+            if record_count > 1 {
+                let complete = send_len / mss;
+                let partial = send_len % mss;
+                let completed_bytes = record_lengths[..complete]
+                    .iter()
+                    .fold(0usize, |total, length| total + record_header_len + length);
+                if completed_bytes != 0 {
+                    assert_eq!(fifo.drop_dequeue(completed_bytes), completed_bytes,
+                        "complete datagram records leave the Session FIFO");
+                }
+                if partial != 0 {
+                    let prefix = SessionDatagramPrefix {
+                        data_length: record_lengths[complete] as u32,
+                        data_offset: (record_offsets[complete] + partial) as u32,
+                    };
+                    assert_eq!(fifo.overwrite_head(prefix.as_bytes()), prefix.as_bytes().len(),
+                        "partial datagram retains its updated offset");
+                }
+            } else {
+                let new_offset = datagram_offset + send_len;
+                if new_offset == datagram_length {
+                    let record_len = record_header_len + datagram_length;
+                    assert_eq!(fifo.drop_dequeue(record_len), record_len,
+                        "complete datagram record leaves the Session FIFO");
+                } else {
+                    let prefix = SessionDatagramPrefix {
+                        data_length: datagram_length as u32,
+                        data_offset: new_offset as u32,
+                    };
+                    assert_eq!(fifo.overwrite_head(prefix.as_bytes()), prefix.as_bytes().len(),
+                        "partial datagram retains its updated offset");
+                }
+            }
+            fifo.needs_deq_notification(send_len + segments * record_header_len)
+        } else {
+            assert_eq!(fifo.drop_dequeue(send_len), send_len,
+                "dequeue TX consumes the packetized FIFO bytes");
+            fifo.needs_deq_notification(send_len)
+        };
+        *packets += segments;
+        if send_len == available {
             fifo.unset_event();
-            let rearmed = fifo.max_dequeue() > next_params.tx_offset as usize && fifo.set_event();
-            self.add_pending_tx_buffer(runtime, buffers[0], next);
-            return Ok((1, rearmed));
+            let recheck_offset = if DGRAM { 0 } else { tx_offset };
+            let rearmed = fifo.max_dequeue() > recheck_offset && fifo.set_event();
+            if rearmed {
+                self.old_events.push_front(event_index);
+            } else {
+                transport.deschedule(runtime, target);
+                self.event_elements.remove(event_index);
+            }
+        } else {
+            self.old_events.push_back(event_index);
         }
-        self.add_pending_tx_buffer(runtime, buffers[0], next);
-        Ok((1, true))
+        if notify_dequeue {
+            self.notify_tx_dequeue(
+                runtime,
+                self.tx_context.session.expect("TX context retains its Session"),
+            );
+        }
+        for &head in &heads {
+            self.add_pending_tx_buffer(runtime, head, next);
+        }
+        self.tx_context.transport_pending_buffers = heads;
+        SessionTxOutcome::Ok
     }
 
     pub fn allocate_control_event(&mut self, event: SessionEvent) -> u32 {
@@ -1314,7 +1874,7 @@ impl SessionWorker {
         let Some(session) = self.session_from_handle(handle) else {
             return Err(SessionError::NoSession);
         };
-        if session.session_type != protocol {
+        if session.transport_protocol != protocol {
             return Err(SessionError::Invalid);
         }
         self.allocate_new_event(SessionEvent::from((
@@ -1324,11 +1884,117 @@ impl SessionWorker {
         Ok(())
     }
 
+    /// VPP: session.c:172-202, session_add_self_custom_tx_evt.
+    pub fn add_self_custom_tx_event(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        priority: bool,
+        descheduled: bool,
+    ) {
+        assert_eq!(handle.worker_index, self.worker_index);
+        let should_enqueue = {
+            let session = self.sessions.get_mut(handle.session_index)
+                .expect("custom TX retains its owner-worker Session");
+            assert_ne!(session.load_state(), SessionState::TransportDeleted);
+            if session.flags.custom_tx {
+                return;
+            }
+            session.flags.custom_tx = true;
+            session.tx_fifo().expect("custom TX retains a TX FIFO").set_event()
+                || descheduled
+        };
+        if !should_enqueue {
+            return;
+        }
+        let event = SessionEvent::from((SessionEventType::Tx, handle.session_index));
+        if priority {
+            self.allocate_new_event(event);
+        } else {
+            self.allocate_old_event(event);
+        }
+        if self.state() == SessionWorkerState::Interrupt {
+            runtime.set_node_interrupt_pending(
+                self.queue_node.expect("session-queue installs before custom TX"),
+            ).expect("registered session-queue accepts an interrupt");
+        }
+    }
+
+    /// VPP: session.c:204-221, sesssion_reschedule_tx.
+    pub fn reschedule_tx(&mut self, runtime: &DataPlaneMain, handle: SessionHandle) {
+        assert_eq!(handle.worker_index, self.worker_index);
+        assert!(self.sessions.get(handle.session_index).is_some());
+        self.allocate_new_event(SessionEvent::from((
+            SessionEventType::Tx,
+            handle.session_index,
+        )));
+        if self.state() == SessionWorkerState::Interrupt {
+            runtime.set_node_interrupt_pending(
+                self.queue_node.expect("session-queue installs before reschedule"),
+            ).expect("registered session-queue accepts an interrupt");
+        }
+    }
+
+    /// VPP session.c:738-749. ACKed bytes leave Session ownership once per
+    /// input burst; notification follows the FIFO's dequeue request bit.
+    pub fn tx_fifo_dequeue_drop(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        max_bytes: u32,
+    ) -> u32 {
+        let session = self.session_from_handle(handle)
+            .expect("ACK retains its owner-worker Session");
+        let fifo = session.tx_fifo()
+            .expect("TCP data Session retains its TX FIFO");
+        let dropped = fifo.drop_dequeue(max_bytes as usize) as u32;
+        if fifo.needs_deq_notification(max_bytes as usize) {
+            self.notify_tx_dequeue(runtime, handle);
+        }
+        dropped
+    }
+
+    /// VPP: session.c:657-680, `session_dequeue_notify`.
+    fn notify_tx_dequeue(&mut self, runtime: &DataPlaneMain, handle: SessionHandle) {
+        let session = self.session_from_handle(handle)
+            .expect("dequeue notification retains its Session");
+        let Some(index) = session.application_worker() else {
+            return;
+        };
+        let fifo = session.tx_fifo().expect("attached Session retains its TX FIFO");
+        let applications = ApplicationMain::global()
+            .expect("attached Session retains Application Main");
+        // SAFETY: this Session worker exclusively writes its AppWorker event
+        // slot; detach synchronizes before removing the worker.
+        let app_worker = unsafe { applications.worker(index) }
+            .expect("attached Session retains Application Worker");
+        self.program_io_event(
+            app_worker,
+            session,
+            SessionEventType::Tx,
+            matches!(session.load_state(), SessionState::Listening | SessionState::Opened),
+        );
+        self.app_workers_pending.set(index as usize);
+        let application = unsafe { applications.application(app_worker.application()) }
+            .expect("attached AppWorker retains its Application");
+        for &subscriber in fifo.subscribers() {
+            let Some(worker_index) = application.worker(u32::from(subscriber)) else {
+                continue;
+            };
+            let Some(worker) = (unsafe { applications.worker(worker_index) }) else {
+                continue;
+            };
+            self.program_io_event(worker, session, SessionEventType::Tx, false);
+            self.app_workers_pending.set(worker_index as usize);
+        }
+        self.schedule_pending_app_events(runtime);
+    }
+
     /// VPP: `session_enqueue_notify`, session.c:626-648. RX coalescing is
     /// performed by the caller; this operation only queues the app event.
     pub fn enqueue_notify(&mut self, runtime: &DataPlaneMain, handle: SessionHandle) -> Option<()> {
-        let app_worker_index = self.queue_rx_notification(handle)?;
-        self.program_app_worker(runtime, app_worker_index);
+        self.queue_rx_notification(handle, false)?;
+        self.schedule_pending_app_events(runtime);
         Some(())
     }
 
@@ -1355,15 +2021,13 @@ impl SessionWorker {
         if u8::from(session.load_state()) >= u8::from(SessionState::TransportClosing) {
             return Ok(None);
         }
-        if let Some(app_worker_index) = self.queue_rx_notification(handle) {
-            self.app_workers_pending.set(app_worker_index as usize);
-        }
+        self.queue_rx_notification(handle, false);
         Ok(None)
     }
 
     /// VPP: `session_enqueue_notify_inline`, session.c:626-648.
     #[inline(always)]
-    fn queue_rx_notification(&mut self, handle: SessionHandle) -> Option<u32> {
+    fn queue_rx_notification(&mut self, handle: SessionHandle, is_connectionless: bool) -> Option<u32> {
         let session = self.session_from_handle(handle)?;
         let app_worker_index = session.application_worker()?;
         let application = ApplicationMain::global()
@@ -1379,8 +2043,24 @@ impl SessionWorker {
             app_worker,
             session,
             SessionEventType::Rx,
-            session.flags.connectionless,
+            is_connectionless,
         );
+        self.app_workers_pending.set(app_worker_index as usize);
+        let application_record = unsafe { application.application(app_worker.application()) }
+            .expect("attached AppWorker retains its Application");
+        for &subscriber in session.rx_fifo()
+            .expect("attached Session retains its RX FIFO")
+            .subscribers()
+        {
+            let Some(worker_index) = application_record.worker(u32::from(subscriber)) else {
+                continue;
+            };
+            let Some(worker) = (unsafe { application.worker(worker_index) }) else {
+                continue;
+            };
+            self.program_io_event(worker, session, SessionEventType::Rx, false);
+            self.app_workers_pending.set(worker_index as usize);
+        }
         Some(app_worker_index)
     }
 
@@ -1391,8 +2071,10 @@ impl SessionWorker {
             let Some(session) = self.session_from_handle(handle) else {
                 continue;
             };
-            if session.session_type == protocol {
-                self.enqueue_notify(runtime, handle);
+            if session.transport_protocol() == protocol {
+                let is_connectionless = session.flags.connectionless;
+                self.queue_rx_notification(handle, is_connectionless);
+                self.schedule_pending_app_events(runtime);
             } else {
                 self.sessions_to_enqueue.push(handle);
             }
@@ -1620,6 +2302,7 @@ pub struct Session {
     handle: SessionHandle,
     state: AtomicU8,
     session_type: u8,
+    transport_protocol: u8,
     flags: SessionFlags,
     rx_fifo: Option<Rc<SvmFifo>>,
     tx_fifo: Option<Rc<SvmFifo>>,
@@ -1632,13 +2315,19 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(handle: SessionHandle, state: SessionState, protocol: u8, opaque: u32) -> Self {
+    fn new(
+        handle: SessionHandle,
+        state: SessionState,
+        session_type: u8,
+        transport_protocol: u8,
+        opaque: u32,
+    ) -> Self {
         Self {
             handle,
             state: AtomicU8::new(u8::from(state)),
-            session_type: protocol,
+            session_type,
+            transport_protocol,
             flags: SessionFlags::default(),
-            app_worker_index: None,
             rx_fifo: None,
             tx_fifo: None,
             application_worker: SESSION_INDEX_INVALID,
@@ -1673,18 +2362,18 @@ impl Session {
     // VPP: session_t.app_wrk_index, session_types.h:264-271.
     #[inline(always)]
     pub const fn app_worker_index(&self) -> Option<u32> {
-        self.app_worker_index
+        self.application_worker()
     }
 
     // VPP: app_worker_init_accepted/app_worker_init_connected,
     // application_worker.c:493-631. Only the owning worker mutates a Session.
     pub fn attach_app_worker(&mut self, app_worker_index: u32) {
-        self.app_worker_index = Some(app_worker_index);
+        self.application_worker = app_worker_index;
     }
 
     // VPP: segment_manager_del_sessions_filter, segment_manager.c:716-743.
     pub fn detach_app_worker(&mut self) {
-        self.app_worker_index = None;
+        self.application_worker = SESSION_INDEX_INVALID;
     }
 
     #[inline(always)]
@@ -1704,6 +2393,11 @@ impl Session {
 
     #[inline(always)]
     pub const fn transport_protocol(&self) -> u8 {
+        self.transport_protocol
+    }
+
+    #[inline(always)]
+    pub const fn session_type(&self) -> u8 {
         self.session_type
     }
 
@@ -1798,7 +2492,7 @@ impl<T> AppSession<T> {
                     .expect("accepted Session has a TX FIFO"),
             ),
             session_handle: handle,
-            session_type: session.transport_protocol(),
+            session_type: session.session_type(),
             state: AtomicU8::new(SessionState::Created.into()),
             transport: None,
             event_queue: Arc::clone(event_queue),
@@ -2149,6 +2843,7 @@ pub struct SessionFlags {
     pub rx_event: bool,
     pub rx_ready: bool,
     pub tx_ready: bool,
+    pub custom_tx: bool,
 }
 
 // VPP: session_types.h:476-492, session_event_t. The last 16 bytes are the
@@ -2360,8 +3055,8 @@ pub struct SessionMain {
     worker_states: Vec<AtomicU8>,
     queue_node: AtomicU32,
     listening_sessions: UnsafeCell<Pool<Session>>,
-    session_tx_modes: UnsafeCell<Vec<TransportTxMode>>,
-    session_type_to_next: UnsafeCell<Vec<u32>>,
+    session_tx: UnsafeCell<Vec<Option<SessionTxDispatch>>>,
+    session_type_to_next: UnsafeCell<Vec<Option<super::node::SessionQueueNext>>>,
     transport_io: UnsafeCell<Vec<Option<SessionIoDispatch>>>,
     transport_control: UnsafeCell<Vec<Option<SessionControlDispatch>>>,
     transport_time: UnsafeCell<Vec<Option<SessionTimeDispatch>>>,
@@ -2421,7 +3116,7 @@ impl SessionMain {
                 .collect(),
             queue_node: AtomicU32::new(u32::MAX),
             listening_sessions: UnsafeCell::new(Pool::new()),
-            session_tx_modes: UnsafeCell::new(Vec::new()),
+            session_tx: UnsafeCell::new(Vec::new()),
             session_type_to_next: UnsafeCell::new(Vec::new()),
             transport_io: UnsafeCell::new(Vec::new()),
             transport_control: UnsafeCell::new(Vec::new()),
@@ -2528,22 +3223,11 @@ impl SessionMain {
     }
 
     #[inline(always)]
-    fn transport_tx_mode(&self, protocol: u8) -> Option<TransportTxMode> {
-        unsafe { &*self.session_tx_modes.get() }
-            .get(usize::from(protocol.checked_sub(1)?))
-            .copied()
-    }
-
-    #[inline(always)]
-    pub(crate) fn now(&self) -> f64 {
+    pub fn now(&self) -> f64 {
         self.started_at.elapsed().as_secs_f64()
     }
 
-    pub fn register_transport_type(
-        &self,
-        tx_mode: TransportTxMode,
-        output_next: u32,
-    ) -> Result<u8, SessionError> {
+    pub fn register_transport_protocol(&self) -> Result<u8, SessionError> {
         if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
             return Err(SessionError::Invalid);
         }
@@ -2551,8 +3235,6 @@ impl SessionMain {
         let protocol = previous.checked_add(1).ok_or(SessionError::Invalid)?;
         // SAFETY: registration is Main Thread work performed before worker
         // launch or while WorkerBarrier excludes readers.
-        unsafe { &mut *self.session_tx_modes.get() }.push(tx_mode);
-        unsafe { &mut *self.session_type_to_next.get() }.push(output_next);
         unsafe { &mut *self.transport_io.get() }.push(None);
         unsafe { &mut *self.transport_control.get() }.push(None);
         unsafe { &mut *self.transport_time.get() }.push(None);
@@ -2566,6 +3248,47 @@ impl SessionMain {
         self.last_transport_protocol
             .store(protocol, Ordering::Release);
         Ok(protocol)
+    }
+
+    /// VPP session.c:1827-1847. The output edge was already compiled by the
+    /// concrete transport output node before this startup publication.
+    pub fn register_transport(
+        &self,
+        session_type: u8,
+        output_next: super::node::SessionQueueNext,
+        tx: SessionTxDispatch,
+    ) {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "Session transport registration requires Main Thread and stopped workers"
+        );
+        let slot = usize::from(session_type);
+        let tx_entries = unsafe { &mut *self.session_tx.get() };
+        let next_entries = unsafe { &mut *self.session_type_to_next.get() };
+        tx_entries.resize(slot + 1, None);
+        next_entries.resize(slot + 1, None);
+        assert!(tx_entries[slot].is_none() && next_entries[slot].is_none());
+        tx_entries[slot] = Some(tx);
+        next_entries[slot] = Some(output_next);
+    }
+
+    #[inline(always)]
+    fn session_tx(&self, session_type: u8) -> Option<SessionTxDispatch> {
+        unsafe { &*self.session_tx.get() }
+            .get(usize::from(session_type))
+            .copied()
+            .flatten()
+    }
+
+    #[inline(always)]
+    pub(crate) fn session_output_next(
+        &self,
+        session_type: u8,
+    ) -> Option<super::node::SessionQueueNext> {
+        unsafe { &*self.session_type_to_next.get() }
+            .get(usize::from(session_type))
+            .copied()
+            .flatten()
     }
 
     /// VPP: session_node.c:1870-1883, dispatch by registered session type.
@@ -2673,7 +3396,8 @@ impl SessionMain {
         &mut self,
         worker_index: u32,
         state: SessionState,
-        protocol: u8,
+        session_type: u8,
+        transport_protocol: u8,
         opaque: u32,
     ) -> Result<SessionHandle, SessionError> {
         let worker = self
@@ -2681,7 +3405,7 @@ impl SessionMain {
             .get_mut(worker_index as usize)
             .ok_or(SessionError::Invalid)?
             .get_mut();
-        Ok(worker.allocate(state, protocol, opaque))
+        Ok(worker.allocate(state, session_type, transport_protocol, opaque))
     }
 
     /// VPP: `listen_session_alloc`, session.h:1044-1052. Hammer's Main Thread
@@ -2690,6 +3414,7 @@ impl SessionMain {
     pub fn allocate_listening_session(
         &self,
         session_type: u8,
+        transport_protocol: u8,
         application_worker: u32,
         opaque: u32,
     ) -> Result<SessionHandle, SessionError> {
@@ -2711,6 +3436,7 @@ impl SessionMain {
             handle,
             SessionState::Listening,
             session_type,
+            transport_protocol,
             opaque,
         ));
         let session = sessions

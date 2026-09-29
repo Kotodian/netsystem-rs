@@ -5,9 +5,10 @@ use hammer_infra::svm::fifo::Fifo as SvmFifo;
 use hammer_runtime::DataPlaneMain;
 use hammer_service::session::app::{ApplicationError, ApplicationEventResult, ApplicationMain};
 use hammer_service::session::{
-    SessionEndpoint, SessionError, SessionHandle, SessionLookup, SessionMain, SessionState,
+    SessionEndpoint, SessionError, SessionHandle, SessionLookup, SessionMain, SessionQueueNext,
+    SessionState, SessionTxDispatch,
 };
-use hammer_service::transport::{Transport, TransportMain, TransportTxMode};
+use hammer_service::transport::{Transport, TransportMain};
 
 use crate::config::IpSessionConfig;
 use crate::endpoint::{
@@ -18,6 +19,14 @@ use crate::lookup::{IpSessionFamily, IpSessionLookup};
 use crate::transport::{IpTransportConfig, IpTransportMain};
 
 static IP_SESSION_MAIN: OnceLock<IpSessionMain> = OnceLock::new();
+
+#[inline(always)]
+fn session_type(protocol: u8, family: IpSessionFamily) -> u8 {
+    let base = protocol
+        .checked_mul(2)
+        .expect("IP Session transport protocol fits the Session type field");
+    base | u8::from(matches!(family, IpSessionFamily::Ip4))
+}
 
 pub struct IpSessionMain {
     session: &'static SessionMain,
@@ -160,6 +169,7 @@ impl IpSessionMain {
                 source => panic!("validated Application listener allocation failed: {source}"),
             })?;
         let session = match self.session.allocate_listening_session(
+            session_type(request.endpoint.transport_protocol(), family),
             request.endpoint.transport_protocol(),
             app_worker,
             opaque,
@@ -294,7 +304,16 @@ impl IpSessionMain {
         // SAFETY: the TCP node calls this for the exclusively executing
         // Data Worker; no other runtime may borrow this worker's Session pool.
         let worker = unsafe { self.session.worker_mut(runtime)? };
-        let session = worker.allocate(SessionState::Connecting, endpoint.transport_protocol(), 0);
+        let family = match endpoint.transport().local.address {
+            IpAddr::V4(_) => IpSessionFamily::Ip4,
+            IpAddr::V6(_) => IpSessionFamily::Ip6,
+        };
+        let session = worker.allocate(
+            SessionState::Connecting,
+            session_type(endpoint.transport_protocol(), family),
+            endpoint.transport_protocol(),
+            0,
+        );
         worker.attach_transport(session, connection_index)?;
         Ok(session)
     }
@@ -307,6 +326,7 @@ impl IpSessionMain {
         listener: SessionHandle,
         connection_index: u32,
         protocol: u8,
+        family: IpSessionFamily,
     ) -> Result<Option<SessionHandle>, SessionError> {
         let application = ApplicationMain::global()
             .expect("Application Main initializes before TCP accepts Sessions");
@@ -315,7 +335,13 @@ impl IpSessionMain {
             .ok_or(SessionError::NotListening)?;
         // SAFETY: the caller executes on the Session's owning Data Worker.
         let worker = unsafe { self.session.worker_mut(runtime)? };
-        let session = worker.allocate_accepted(listener, connection_index, protocol, 0);
+        let session = worker.allocate_accepted(
+            listener,
+            connection_index,
+            session_type(protocol, family),
+            protocol,
+            0,
+        );
         match application.init_accepted(runtime, worker, app_listener, session) {
             Ok(ApplicationEventResult::Queued) => {
                 worker.store_state(session, SessionState::Accepting)?;
@@ -420,12 +446,15 @@ impl IpSessionMain {
         self.transport.release(endpoint)
     }
 
-    pub fn register_transport_type(
+    pub fn register_transport(
         &self,
-        tx_mode: TransportTxMode,
-        output_next: u32,
-    ) -> Result<u8, SessionError> {
-        self.session.register_transport_type(tx_mode, output_next)
+        protocol: u8,
+        family: IpSessionFamily,
+        output_next: SessionQueueNext,
+        tx: SessionTxDispatch,
+    ) {
+        self.session
+            .register_transport(session_type(protocol, family), output_next, tx);
     }
 
     /// # Safety

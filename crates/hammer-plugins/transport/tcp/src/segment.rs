@@ -124,6 +124,42 @@ impl TcpSegment {
         );
         Ok(())
     }
+
+    #[inline]
+    pub(crate) fn cache_options(&self, output: &mut [u8; 40]) -> usize {
+        self.header().cache_options(output, self.sack_blocks())
+    }
+
+    /// VPP: tcp_output.c:884-952. The burst keeps the options and receive
+    /// window fixed; each first Buffer receives its own sequence and PSH bit.
+    pub(crate) fn write_burst_header(
+        &self,
+        buffer: &mut hammer_core::data_plane::Buffer,
+        options: &[u8],
+        sequence: TcpSeq,
+        psh: bool,
+    ) -> RuntimeResult<()> {
+        let mut header = self.header();
+        header.sequence_number = sequence.raw();
+        header.flags = TcpSegmentFlags::ACK;
+        if psh {
+            header.flags.insert(TcpSegmentFlags::PSH);
+        }
+        let header_len = size_of::<TcpHeader>() + options.len();
+        assert!(header_len <= 60, "cached TCP options fit the protocol header");
+        header.write_to_buffer_cached(buffer.push_uninit(header_len as u8), options)?;
+        {
+            let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
+            network.ip_mut().set_ip_ecn(self.ip_ecn.map(Into::into));
+            network.flags.insert(NetworkFlags::LOCALLY_ORIGINATED);
+        }
+        crate::write_tcp_egress_endpoints(
+            hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).egress_mut(),
+            self.local.ip(),
+            self.remote.ip(),
+        );
+        Ok(())
+    }
 }
 
 pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<TcpPacket> {

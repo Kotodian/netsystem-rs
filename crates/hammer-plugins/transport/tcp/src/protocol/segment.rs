@@ -193,6 +193,41 @@ impl TcpSegmentHeader<'_> {
         write_tcp_options(options, self, sack_blocks);
         Ok(header_len)
     }
+
+    /// VPP: tcp_output.c:300-329. Called once before a data burst.
+    pub(crate) fn cache_options(
+        self,
+        output: &mut [u8; 40],
+        sack_blocks: Option<&[TcpSackBlock]>,
+    ) -> usize {
+        let length = tcp_options_len(self, sack_blocks);
+        write_tcp_options(&mut output[..length], self, sack_blocks);
+        length
+    }
+
+    /// VPP: tcp_output.c:884-952. Writes the fixed header directly into
+    /// the final Buffer and copies only the worker's cached option bytes.
+    pub(crate) fn write_to_buffer_cached(
+        self,
+        output: &mut [u8],
+        options: &[u8],
+    ) -> Result<usize, TcpError> {
+        let header_len = TCP_HEADER_MIN_LEN + options.len();
+        if header_len > 60 || header_len % 4 != 0 || output.len() < header_len {
+            return Err(TcpError::Length);
+        }
+        let (header, _) = TcpHeader::mut_from_prefix(output).map_err(|_| TcpError::Length)?;
+        header.set_source_port(self.source_port);
+        header.set_destination_port(self.destination_port);
+        header.set_sequence_number(self.sequence_number);
+        header.set_acknowledgment_number(self.acknowledgment_number);
+        header.set_data_offset_flags(tcp_data_offset_flags(header_len, self.flags));
+        header.set_advertised_window(self.advertised_window);
+        header.set_checksum(0);
+        header.set_urgent_pointer(self.urgent_pointer);
+        output[TCP_HEADER_MIN_LEN..header_len].copy_from_slice(options);
+        Ok(header_len)
+    }
 }
 
 #[inline(always)]

@@ -40,16 +40,20 @@ pub fn register_tcp4_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
     if let Some(node) = runtime.nodes().node_by_name("tcp4-established") {
         return Ok(node);
     }
-    runtime.nodes().try_register_internal_with_next_names(
+    let node = runtime.nodes().try_register_internal_with_next_names(
         Tcp4EstablishedNode::new(),
         &TcpEstablishedNext::NEXT_NAMES,
-    )
+    )?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 pub fn register_tcp6_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(Tcp6EstablishedNode::new(), &["tcp6-output", "drop"])
+        .try_register_internal_with_next_names(Tcp6EstablishedNode::new(), &["tcp6-output", "drop"])?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 impl Node for Tcp4EstablishedNode {
@@ -95,7 +99,25 @@ fn tcp_established_frame<const IS_IP4: bool>(
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
-    for &index in frame.vector_args() {
+    let mut error_counts = [0u16; super::TCP_NODE_ERRORS.len()];
+    let mut error_codes = [None; super::TCP_NODE_ERRORS.len()];
+    let mut error_mask = 0u64;
+    for (position, &index) in frame.vector_args().iter().enumerate() {
+        // VPP tcp_input.c:1359-1369 prefetches the next packet in the
+        // single-packet established loop.
+        if let Some(&next) = frame.vector_args().get(position + 1) {
+            runtime.prefetch_header(next);
+            let buffer = runtime.buffer(next);
+            let data = buffer
+                .current()
+                .as_ptr()
+                .wrapping_offset(-isize::from(buffer.current_data_offset()));
+            hammer_infra::prefetch::prefetch_read_l1_bytes(
+                data,
+                2 * hammer_infra::align::CACHE_LINE,
+            );
+        }
+        let mut error = None;
         if tcp_established_index::<IS_IP4>(
             runtime,
             node_runtime,
@@ -103,6 +125,7 @@ fn tcp_established_frame<const IS_IP4: bool>(
             &mut output,
             &mut nexts,
             &mut out_len,
+            &mut error,
         )
         .is_err()
         {
@@ -115,6 +138,12 @@ fn tcp_established_frame<const IS_IP4: bool>(
                 TcpEstablishedNext::Drop,
                 index,
             );
+        }
+        if let Some(error) = error {
+            let code = error.code() as usize;
+            error_counts[code] += 1;
+            error_codes[code] = Some(error);
+            error_mask |= 1u64 << code;
         }
     }
     if out_len != 0 {
@@ -129,6 +158,30 @@ fn tcp_established_frame<const IS_IP4: bool>(
         .expect("TCP Main initializes before established input")
         .protocol();
     sessions.flush_enqueue_events(runtime, protocol);
+    if crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before established input")
+        .worker(runtime.thread_index())
+        .expect("established input runs on its TCP worker")
+        .handle_postponed_dequeues(runtime, sessions)
+        .is_err()
+    {
+        let error = TcpNodeError::TimerUpdateFailed;
+        let code = error.code() as usize;
+        error_counts[code] += 1;
+        error_codes[code] = Some(error);
+        error_mask |= 1u64 << code;
+    }
+    // VPP tcp_inlines.h:28-53 stores only nonzero frame-local counters.
+    while error_mask != 0 {
+        let code = error_mask.trailing_zeros() as usize;
+        error_mask &= error_mask - 1;
+        runtime.record_current_node_error_count(
+            error_codes[code].expect("nonzero TCP error has its typed code"),
+            u64::from(error_counts[code]),
+        )
+        .expect("TCP established node registers its error counters");
+    }
     ()
 }
 
@@ -165,6 +218,7 @@ fn tcp_established_index<const IS_IP4: bool>(
     _: &mut Frame,
     _: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     _: &mut usize,
+    error: &mut Option<TcpNodeError>,
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
     if packet.local.is_ipv4() != IS_IP4 {
@@ -181,7 +235,7 @@ fn tcp_established_index<const IS_IP4: bool>(
         let sessions = &mut *sessions;
         let tcp = &mut *tcp;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
-            let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing);
+            *error = Some(TcpNodeError::EstablishedSessionRouteMissing);
             TcpNodeError::EstablishedSessionRouteMissing
         })?;
         let handle = SessionHandle {
@@ -195,7 +249,6 @@ fn tcp_established_index<const IS_IP4: bool>(
         let (
             control,
             acked_tx_len,
-            ack_advanced,
             accept_payload,
             accepted_sequence,
             duplicate_payload,
@@ -206,7 +259,7 @@ fn tcp_established_index<const IS_IP4: bool>(
                 ..
             } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                *error = Some(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             let previous_snd_una = connection.snd_una();
@@ -221,39 +274,37 @@ fn tcp_established_index<const IS_IP4: bool>(
             (
                 control,
                 connection.take_acked_tx_len(previous_snd_una),
-                connection.snd_una() != previous_snd_una,
                 accept_payload,
                 packet.sequence,
                 duplicate_payload,
             )
         };
         if acked_tx_len != 0 {
-            let tx = sessions
-                .session_from_handle(handle)
-                .and_then(|session| session.tx_fifo())
-                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
-            assert_eq!(
-                tx.drop_dequeue(acked_tx_len as usize),
-                acked_tx_len as usize
-            );
+            tcp.program_dequeue(connection_index, acked_tx_len);
         }
-        if ack_advanced
-            && sessions
-                .session_from_handle(handle)
-                .and_then(|session| session.tx_fifo())
-                .is_some_and(|fifo| fifo.max_dequeue() != 0)
-        {
-            sessions.enqueue_ready(handle, tcp.protocol)?;
+        let retransmit_pending = tcp.connection(connection_index)
+            .is_some_and(|connection| {
+                connection.recovery.in_recovery()
+                    && (connection.recovery.retransmit_candidate().is_some()
+                        || (!connection.negotiated_options().sack
+                            && connection.recovery.oldest_unacked()
+                                .is_some_and(|sample| !sample.retransmitted)))
+            });
+        if retransmit_pending {
+            tcp.program_retransmit(runtime, sessions, connection_index);
         }
         let mut immediate_ack = false;
+        let mut duplicate_ack = duplicate_payload;
         if let Some((trim, offset)) = accept_payload {
+            duplicate_ack = offset != 0;
             let accepted_len = packet.payload_len.saturating_sub(trim) as u32;
-            {
-                let buffer = runtime.buffer_mut(index);
-                buffer.advance(packet.payload_offset.saturating_add(trim) as isize);
-                buffer.truncate(accepted_len as usize)?;
-            }
+            crate::expose_payload(runtime, index, &packet, trim)?;
             let delivery = sessions.enqueue_rx(runtime, handle, index, offset)?;
+            let send_mss = tcp.connection(connection_index)
+                .expect("payload retains its TCP connection").send_mss;
+            *error = Some(crate::payload_node_error(
+                delivery, accepted_len, send_mss, offset,
+            ));
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
                 | RxDelivery::InOrder { rx_available, .. }
@@ -276,8 +327,7 @@ fn tcp_established_index<const IS_IP4: bool>(
                     ..
                 } = tcp;
                 let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                    let _ =
-                        runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                    *error = Some(TcpNodeError::EstablishedSessionMissing);
                     TcpNodeError::EstablishedSessionMissing
                 })?;
                 connection.receive_payload(accepted_sequence, trim as u32, delivery)?;
@@ -303,13 +353,14 @@ fn tcp_established_index<const IS_IP4: bool>(
                 }
             }
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                *error = Some(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             connection.set_rcv_wnd(rx_available);
         } else if duplicate_payload {
+            *error = Some(TcpNodeError::SegmentOld);
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                *error = Some(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             let sequence = packet.sequence;
@@ -319,33 +370,21 @@ fn tcp_established_index<const IS_IP4: bool>(
         }
 
         let fin_control = {
-            let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+            let crate::worker::TcpWorker { connections, timer_wheel, .. } = tcp;
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
+                *error = Some(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
-            connection.process_fin_after_payload(&packet)?
+            connection.process_fin_after_payload(connection_index, timer_wheel, &packet)?
         };
         if fin_control.is_some() {
+            tcp.program_ack(runtime, sessions, connection_index, false);
             sessions.transport_closing(runtime, handle, connection_index)?;
         }
-
-        let tx_segment = if immediate_ack {
-            let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
-                TcpNodeError::EstablishedSessionMissing
-            })?;
-            Some(connection.control_segment(
-                packet.local,
-                packet.remote,
-                crate::TcpSegmentFlags::ACK,
-                None,
-                crate::TcpCapabilities::default(),
-            ))
-        } else {
-            None
+        if immediate_ack {
+            tcp.program_ack(runtime, sessions, connection_index, duplicate_ack);
         }
-        .or(fin_control)
-        .or(control);
+        let tx_segment = control;
         (tx_segment, connection_index)
     };
     if let Some(segment) = tx_segment {

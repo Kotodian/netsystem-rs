@@ -8,8 +8,9 @@ use super::worker::TcpWorker;
 
 pub(super) const TCP_TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 pub(super) const TCP_TIMER_EXPIRY_BUDGET: usize = 256;
-const TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = 2048 * 2048 - 1;
-pub(super) const TCP_TIMER_RESOLUTION: Duration = Duration::from_millis(10);
+pub(super) const TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = 2048 * 2048 - 1;
+/// VPP tcp_types.h:71 uses a 100 us TCP timer tick, including RACK REO.
+pub(super) const TCP_TIMER_RESOLUTION: Duration = Duration::from_micros(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -20,7 +21,7 @@ pub(super) enum TcpTimerKind {
     DelayedAck = 3,
     Persist = 4,
     KeepAlive = 5,
-    TimeWait = 6,
+    WaitClose = 6,
     Pacing = 7,
 }
 
@@ -39,7 +40,7 @@ impl TcpTimerKind {
             3 => Some(Self::DelayedAck),
             4 => Some(Self::Persist),
             5 => Some(Self::KeepAlive),
-            6 => Some(Self::TimeWait),
+            6 => Some(Self::WaitClose),
             7 => Some(Self::Pacing),
             _ => None,
         }
@@ -62,7 +63,7 @@ bitflags::bitflags! {
         const DELAYED_ACK = 1 << 3;
         const PERSIST = 1 << 4;
         const KEEP_ALIVE = 1 << 5;
-        const TIME_WAIT = 1 << 6;
+        const WAIT_CLOSE = 1 << 6;
         const PACING = 1 << 7;
     }
 }
@@ -212,8 +213,10 @@ impl TcpWorker {
     }
 
     /// VPP: tcp.c:1293-1335, `tcp_dispatch_pending_timers`.
-    pub(super) fn take_pending_timer(&mut self) -> Option<TcpTimerToken> {
-        while let Some(token) = self.pending_timers.pop_front() {
+    pub(super) fn take_pending_timer(&mut self, budget: &mut usize) -> Option<TcpTimerToken> {
+        while *budget != 0 {
+            let token = self.pending_timers.pop_front()?;
+            *budget -= 1;
             let Some(connection) = self.connections.get_mut(token.index) else {
                 continue;
             };

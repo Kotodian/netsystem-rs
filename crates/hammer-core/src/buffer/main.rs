@@ -308,6 +308,13 @@ impl BufferMain {
         &self.pools[usize::from(pool_index)].name
     }
 
+    /// VPP: vlib/buffer_funcs.h:127-131, `vlib_buffer_get_default_data_size` selects the
+    /// current NUMA node's default Buffer Pool before reading its data size.
+    #[inline(always)]
+    pub fn default_data_size(&self, numa_node: u32) -> usize {
+        self.pools[usize::from(self.default_pool(numa_node))].data_size
+    }
+
     /// Samples one Pool: VPP `buffer_gauges_collect_*_fn`'s three reads
     /// (`buffer.c:838-872`).
     ///

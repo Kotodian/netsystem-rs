@@ -596,8 +596,8 @@ pub struct Fifo {
     pub ooo_deq: *mut SvmFifoChunk,
     pub ooo_enq: *mut SvmFifoChunk,
     pub ooo_segments: UnsafeCell<Pool<OooSegment>>,
-    pub ooos_list_head: u32,
-    pub ooos_newest: u32,
+    pub ooos_list_head: UnsafeCell<u32>,
+    pub ooos_newest: UnsafeCell<u32>,
     pub flags: u8,
     pub refcnt: i8,
     pub client_thread_index: u8,
@@ -708,7 +708,7 @@ impl Fifo {
                 );
             }
         }
-        Ok(Self {
+        let mut fifo = Self {
             shr: hdr,
             fs_hdr: base.cast::<FifoSegmentHeader>(),
             ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
@@ -716,8 +716,8 @@ impl Fifo {
             ooo_deq: std::ptr::null_mut(),
             ooo_enq: std::ptr::null_mut(),
             ooo_segments: UnsafeCell::new(Pool::with_capacity(4)),
-            ooos_list_head: OOO_SEGMENT_INVALID_INDEX,
-            ooos_newest: OOO_SEGMENT_INVALID_INDEX,
+            ooos_list_head: UnsafeCell::new(OOO_SEGMENT_INVALID_INDEX),
+            ooos_newest: UnsafeCell::new(OOO_SEGMENT_INVALID_INDEX),
             flags: 0,
             refcnt: 1,
             client_thread_index: 0,
@@ -741,7 +741,9 @@ impl Fifo {
             hdr,
             hdr_off: hdr_offset,
             ooo_base: UnsafeCell::new(0),
-        })
+        };
+        fifo.initialize_chunk_lookups();
+        Ok(fifo)
     }
 
     /// Initializes a process-local FIFO around a shared header and a chunk
@@ -807,7 +809,7 @@ impl Fifo {
                 },
             );
         }
-        Ok(Self {
+        let mut fifo = Self {
             shr: hdr,
             fs_hdr: base.cast::<FifoSegmentHeader>(),
             ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
@@ -815,8 +817,8 @@ impl Fifo {
             ooo_deq: std::ptr::null_mut(),
             ooo_enq: std::ptr::null_mut(),
             ooo_segments: UnsafeCell::new(Pool::with_capacity(4)),
-            ooos_list_head: OOO_SEGMENT_INVALID_INDEX,
-            ooos_newest: OOO_SEGMENT_INVALID_INDEX,
+            ooos_list_head: UnsafeCell::new(OOO_SEGMENT_INVALID_INDEX),
+            ooos_newest: UnsafeCell::new(OOO_SEGMENT_INVALID_INDEX),
             flags: 0,
             refcnt: 1,
             client_thread_index: 0,
@@ -840,7 +842,9 @@ impl Fifo {
             hdr,
             hdr_off: hdr_offset,
             ooo_base: UnsafeCell::new(0),
-        })
+        };
+        fifo.initialize_chunk_lookups();
+        Ok(fifo)
     }
 
     /// Reconstructs the process-local FIFO state for an already initialized
@@ -877,7 +881,7 @@ impl Fifo {
         {
             return Err(FifoError::SegmentExhausted);
         }
-        Ok(Self {
+        let mut fifo = Self {
             shr: hdr,
             fs_hdr: base.cast::<FifoSegmentHeader>(),
             ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
@@ -885,8 +889,8 @@ impl Fifo {
             ooo_deq: std::ptr::null_mut(),
             ooo_enq: std::ptr::null_mut(),
             ooo_segments: UnsafeCell::new(Pool::with_capacity(4)),
-            ooos_list_head: OOO_SEGMENT_INVALID_INDEX,
-            ooos_newest: OOO_SEGMENT_INVALID_INDEX,
+            ooos_list_head: UnsafeCell::new(OOO_SEGMENT_INVALID_INDEX),
+            ooos_newest: UnsafeCell::new(OOO_SEGMENT_INVALID_INDEX),
             flags: 0,
             refcnt: 1,
             client_thread_index: 0,
@@ -910,7 +914,9 @@ impl Fifo {
             hdr,
             hdr_off: hdr_offset,
             ooo_base: UnsafeCell::new(0),
-        })
+        };
+        fifo.initialize_chunk_lookups();
+        Ok(fifo)
     }
 
     /// Offset of the [`FifoHeader`] within the FIFO Segment mapping.
@@ -939,13 +945,13 @@ impl Fifo {
         Self {
             shr: self.shr,
             fs_hdr: self.fs_hdr,
-            ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
-            ooo_deq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
+            ooo_enq_lookup: UnsafeCell::new(unsafe { &*self.ooo_enq_lookup.get() }.clone()),
+            ooo_deq_lookup: UnsafeCell::new(unsafe { &*self.ooo_deq_lookup.get() }.clone()),
             ooo_deq: self.ooo_deq,
             ooo_enq: self.ooo_enq,
-            ooo_segments: UnsafeCell::new(Pool::with_capacity(4)),
-            ooos_list_head: self.ooos_list_head,
-            ooos_newest: self.ooos_newest,
+            ooo_segments: UnsafeCell::new(unsafe { &*self.ooo_segments.get() }.clone()),
+            ooos_list_head: UnsafeCell::new(unsafe { *self.ooos_list_head.get() }),
+            ooos_newest: UnsafeCell::new(unsafe { *self.ooos_newest.get() }),
             flags: self.flags,
             refcnt: self.refcnt,
             client_thread_index: self.client_thread_index,
@@ -962,6 +968,28 @@ impl Fifo {
             hdr: self.hdr,
             hdr_off: self.hdr_off,
             ooo_base: UnsafeCell::new(unsafe { *self.ooo_base.get() }),
+        }
+    }
+
+    fn initialize_chunk_lookups(&self) {
+        // Construction, reset and pointer initialization exclude producer and
+        // consumer access to both process-local lookup trees.
+        let enqueue = unsafe { &mut *self.ooo_enq_lookup.get() };
+        let dequeue = unsafe { &mut *self.ooo_deq_lookup.get() };
+        while let Some((key, _)) = enqueue.first() {
+            let key = *key;
+            enqueue.remove(&key);
+        }
+        while let Some((key, _)) = dequeue.first() {
+            let key = *key;
+            dequeue.remove(&key);
+        }
+        let mut chunk_off = unsafe { (*self.hdr).start_chunk.load(Ordering::Relaxed) };
+        while chunk_off != 0 {
+            let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+            enqueue.insert(chunk.start_byte, chunk_off as u32);
+            dequeue.insert(chunk.start_byte, chunk_off as u32);
+            chunk_off = chunk.next.load(Ordering::Acquire);
         }
     }
 
@@ -1003,8 +1031,14 @@ impl Fifo {
 
     #[inline]
     pub fn enqueue(&self, src: &[u8]) -> usize {
+        let (copied, promoted) = self.enqueue_in_order(src);
+        copied + promoted
+    }
+
+    fn enqueue_in_order(&self, src: &[u8]) -> (usize, usize) {
+        unsafe { *self.ooos_newest.get() = OOO_SEGMENT_INVALID_INDEX };
         if src.is_empty() {
-            return 0;
+            return (0, 0);
         }
         let hdr = self.hdr;
         unsafe {
@@ -1017,19 +1051,19 @@ impl Fifo {
             let free = ((*hdr).size - used) as usize;
             let to_write = src.len().min(free);
             if to_write == 0 {
-                return 0;
+                return (0, 0);
             }
+            let old_tail_chunk = (*hdr).tail_chunk.load(Ordering::Relaxed);
             let written = self.append_at_tail_without_tail_store(tail, &src[..to_write]);
             if written == 0 {
-                return 0;
+                return (0, 0);
             }
             let new_tail = tail.wrapping_add(written as u32);
-            (*hdr).tail.store(new_tail, Ordering::Release);
             let collected = self.promote_contiguous_from(new_tail);
-            (*hdr)
-                .tail
-                .store(new_tail.wrapping_add(collected), Ordering::Release);
-            written + collected as usize
+            let final_tail = new_tail.wrapping_add(collected);
+            self.clear_enq_chunks(old_tail_chunk, final_tail);
+            (*hdr).tail.store(final_tail, Ordering::Release);
+            (written, collected as usize)
         }
     }
 
@@ -1169,6 +1203,7 @@ impl Fifo {
                     }
                     (*hdr).head_chunk.store(next_off, Ordering::Release);
                     (*hdr).start_chunk.store(next_off, Ordering::Release);
+                    (&mut *self.ooo_deq_lookup.get()).remove(&chunk.start_byte);
                     self.release_chunk(chunk_off);
                     chunk_off = next_off;
                 } else {
@@ -1254,6 +1289,32 @@ impl Fifo {
         }
     }
 
+    fn clear_enq_chunks(&self, start_chunk: u64, end_pos: u32) {
+        // VPP f_lookup_clear_enq_chunks: the producer removes lookup entries
+        // before publishing tail, so the consumer may then release old chunks.
+        let lookup = unsafe { &mut *self.ooo_enq_lookup.get() };
+        let mut chunk_off = start_chunk;
+        while chunk_off != 0 {
+            let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+            if f_chunk_includes_pos(chunk, end_pos) {
+                break;
+            }
+            let next = chunk.next.load(Ordering::Acquire);
+            if next == 0 {
+                break;
+            }
+            lookup.remove(&chunk.start_byte);
+            chunk_off = next;
+        }
+        if chunk_off != 0 {
+            let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
+            if unsafe { *self.ooos_list_head.get() } == OOO_SEGMENT_INVALID_INDEX {
+                lookup.remove(&chunk.start_byte);
+            }
+            unsafe { (*self.hdr).tail_chunk.store(chunk_off, Ordering::Release) };
+        }
+    }
+
     fn write_at_without_tail_store(&self, offset: u32, src: &[u8]) -> usize {
         if src.is_empty() {
             return 0;
@@ -1265,7 +1326,20 @@ impl Fifo {
             let mut remaining_offset = offset;
             let mut remaining_src = src;
 
-            let mut chunk_off = (*hdr).tail_chunk.load(Ordering::Acquire);
+            let lookup = &*self.ooo_enq_lookup.get();
+            let mut chunk_off = lookup
+                .get(&remaining_offset)
+                .or_else(|| lookup.predecessor(&remaining_offset).map(|(_, value)| value))
+                .map_or(0, |value| u64::from(*value));
+            if chunk_off != 0 {
+                let chunk = &*self.base.add(chunk_off as usize).cast::<Chunk>();
+                if !f_chunk_includes_pos(chunk, remaining_offset) {
+                    chunk_off = 0;
+                }
+            }
+            if chunk_off == 0 {
+                chunk_off = (*hdr).tail_chunk.load(Ordering::Acquire);
+            }
             // Seek to the chunk covering remaining_offset
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
@@ -1373,6 +1447,7 @@ impl Fifo {
 
     /// Publish bytes already copied into the producer chunks.
     pub fn enqueue_nocopy(&self, len: usize) -> Result<(), FifoError> {
+        unsafe { *self.ooos_newest.get() = OOO_SEGMENT_INVALID_INDEX };
         if len > self.max_enqueue() {
             return Err(FifoError::InsufficientCapacity {
                 requested: len,
@@ -1381,12 +1456,12 @@ impl Fifo {
         }
         unsafe {
             let tail = (*self.hdr).tail.load(Ordering::Relaxed);
+            let old_tail_chunk = (*self.hdr).tail_chunk.load(Ordering::Relaxed);
             let new_tail = tail.wrapping_add(len as u32);
-            (*self.hdr).tail.store(new_tail, Ordering::Release);
             let collected = self.promote_contiguous_from(new_tail);
-            (*self.hdr)
-                .tail
-                .store(new_tail.wrapping_add(collected), Ordering::Release);
+            let final_tail = new_tail.wrapping_add(collected);
+            self.clear_enq_chunks(old_tail_chunk, final_tail);
+            (*self.hdr).tail.store(final_tail, Ordering::Release);
         }
         Ok(())
     }
@@ -1419,7 +1494,7 @@ impl Fifo {
     #[inline]
     pub fn unset_event(&self) {
         unsafe {
-            (*self.hdr).signals.has_event.store(0, Ordering::Release);
+            (*self.hdr).signals.has_event.swap(0, Ordering::Acquire);
         }
     }
 
@@ -1454,6 +1529,14 @@ impl Fifo {
         }
     }
 
+    /// VPP: svm_fifo.h:868-875. Subscriber slots are changed by the owner
+    /// while workers are stopped; the returned slice borrows this FIFO.
+    #[inline(always)]
+    pub fn subscribers(&self) -> &[u8] {
+        let signals = unsafe { &(*self.hdr).signals };
+        &signals.subscribers[..usize::from(signals.n_subscribers)]
+    }
+
     pub fn clear(&mut self) {
         let hdr = self.hdr;
         unsafe {
@@ -1473,6 +1556,13 @@ impl Fifo {
             (*hdr).signals.want_deq_ntf.store(0, Ordering::Relaxed);
             (*hdr).signals.has_deq_ntf.store(0, Ordering::Relaxed);
         }
+        let segments = self.ooo_segments.get_mut();
+        while let Some((index, _)) = segments.iter().next() {
+            segments.remove(index);
+        }
+        *self.ooos_list_head.get_mut() = OOO_SEGMENT_INVALID_INDEX;
+        *self.ooos_newest.get_mut() = OOO_SEGMENT_INVALID_INDEX;
+        self.initialize_chunk_lookups();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1503,6 +1593,7 @@ impl Fifo {
                 chunk_off = current.next.load(Ordering::Acquire);
             }
         }
+        self.initialize_chunk_lookups();
     }
 
     #[inline]
@@ -1566,9 +1657,9 @@ impl Fifo {
         self.n_ooo_segments() != 0
     }
 
-    pub fn first_ooo_segment(&self) -> Option<&OooSegment> {
+    pub fn first_ooo_segment(&self) -> Option<OooSegment> {
         let entries = unsafe { &*self.ooo_segments.get() };
-        entries.get(self.ooos_list_head)
+        entries.get(unsafe { *self.ooos_list_head.get() }).copied()
     }
 
     pub fn n_chunks(&self) -> usize {
@@ -1604,6 +1695,15 @@ impl Fifo {
     pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError> {
         let length = u32::try_from(src.len())
             .map_err(|_| FifoError::OutOfOrderLengthOutOfRange { length: src.len() })?;
+        if offset == 0 {
+            let (accepted, delivered) = self.enqueue_in_order(src);
+            return Ok(OooResult {
+                accepted: accepted as u32,
+                delivered: delivered as u32,
+                start: None,
+                len: 0,
+            });
+        }
         let available = self.max_enqueue();
         if offset as usize > available || src.len() > available.saturating_sub(offset as usize) {
             return Err(FifoError::OutOfOrderCapacityExceeded {
@@ -1617,137 +1717,162 @@ impl Fifo {
         if written != src.len() {
             return Err(FifoError::SegmentExhausted);
         }
-        if offset == 0 {
-            unsafe {
-                (*self.hdr)
-                    .tail
-                    .store(tail.wrapping_add(length), Ordering::Release)
-            };
-            let delivered = self.promote_contiguous();
-            return Ok(OooResult {
-                accepted: length,
-                delivered,
-                start: Some(0),
-                len: length.wrapping_add(delivered),
-            });
-        }
-
-        let end = abs_start.wrapping_add(length);
-        let old_segments = self.collect_ooo_segments();
-        let mut intervals = old_segments;
-        intervals.push((abs_start, end));
-        intervals.sort_by(|left, right| {
-            if left.0 == right.0 {
-                core::cmp::Ordering::Equal
-            } else if f_pos_lt(left.0, right.0) {
-                core::cmp::Ordering::Less
-            } else {
-                core::cmp::Ordering::Greater
-            }
-        });
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
-        for (start, finish) in intervals {
-            if let Some((_, last_finish)) = merged.last_mut() {
-                if f_pos_leq(start, *last_finish) {
-                    if f_pos_gt(finish, *last_finish) {
-                        *last_finish = finish;
-                    }
-                    continue;
-                }
-            }
-            merged.push((start, finish));
-        }
-        self.replace_ooo_segments(&merged);
-        let accepted = length;
+        let newest = self.add_ooo_segment(tail, offset, length);
         Ok(OooResult {
-            accepted,
+            accepted: length,
             delivered: 0,
-            start: Some(offset),
-            len: length,
+            start: newest.map(|(start, _)| start),
+            len: newest.map_or(0, |(_, len)| len),
         })
     }
 
-    fn collect_ooo_segments(&self) -> Vec<(u32, u32)> {
-        let entries = unsafe { &*self.ooo_segments.get() };
-        let mut segments = Vec::new();
-        let mut index = self.ooos_list_head;
-        while index != OOO_SEGMENT_INVALID_INDEX {
-            if let Some(segment) = entries.get(index) {
-                segments.push((segment.start, segment.start.wrapping_add(segment.length)));
-                index = segment.next;
-            } else {
+    fn add_ooo_segment(&self, tail: u32, offset: u32, length: u32) -> Option<(u32, u32)> {
+        let start = tail.wrapping_add(offset);
+        let end = start.wrapping_add(length);
+        // SAFETY: the FIFO producer alone mutates OOO metadata. The consumer
+        // cannot observe future bytes until a release store advances tail.
+        let segments = unsafe { &mut *self.ooo_segments.get() };
+        let head = unsafe { &mut *self.ooos_list_head.get() };
+        let newest = unsafe { &mut *self.ooos_newest.get() };
+        *newest = OOO_SEGMENT_INVALID_INDEX;
+        if length == 0 {
+            return None;
+        }
+
+        let mut previous = OOO_SEGMENT_INVALID_INDEX;
+        let mut current = *head;
+        while current != OOO_SEGMENT_INVALID_INDEX {
+            let segment = segments.get(current).expect("OOO link remains live");
+            if !f_pos_lt(segment.start, start) {
                 break;
             }
+            previous = current;
+            current = segment.next;
         }
-        segments
-    }
 
-    fn replace_ooo_segments(&self, intervals: &[(u32, u32)]) {
-        let entries = unsafe { &mut *self.ooo_segments.get() };
-        let lookup = unsafe { &mut *self.ooo_enq_lookup.get() };
-        while let Some(index) = entries.iter().next().map(|(index, _)| index) {
-            let _ = entries.remove(index);
-        }
-        while let Some((key, _)) = lookup.first().map(|(key, value)| (*key, *value)) {
-            let _ = lookup.remove(&key);
-        }
-        let fifo = self as *const Fifo as *mut Fifo;
-        unsafe {
-            (*fifo).ooos_list_head = OOO_SEGMENT_INVALID_INDEX;
-            (*fifo).ooos_newest = OOO_SEGMENT_INVALID_INDEX;
-        }
-        let mut previous = OOO_SEGMENT_INVALID_INDEX;
-        for &(start, finish) in intervals {
-            let index = entries.insert(OooSegment {
-                next: OOO_SEGMENT_INVALID_INDEX,
+        let target = if previous != OOO_SEGMENT_INVALID_INDEX {
+            let segment = segments.get(previous).expect("OOO predecessor remains live");
+            if f_pos_leq(start, segment.start.wrapping_add(segment.length)) {
+                Some(previous)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let target = target.or_else(|| {
+            let segment = segments.get(current)?;
+            f_pos_leq(segment.start, end).then_some(current)
+        });
+
+        let index = if let Some(index) = target {
+            let segment = segments.get_mut(index).expect("OOO target remains live");
+            let old_start = segment.start;
+            let old_end = old_start.wrapping_add(segment.length);
+            if f_pos_lt(start, old_start) {
+                segment.start = start;
+            }
+            if f_pos_gt(end, old_end) {
+                segment.length = end.wrapping_sub(segment.start);
+            } else {
+                segment.length = old_end.wrapping_sub(segment.start);
+            }
+            if segment.start == old_start && segment.length == old_end.wrapping_sub(old_start) {
+                return None;
+            }
+            index
+        } else {
+            let index = segments.insert(OooSegment {
+                next: current,
                 prev: previous,
                 start,
-                length: finish.wrapping_sub(start),
+                length,
             });
             if previous == OOO_SEGMENT_INVALID_INDEX {
-                unsafe { (*fifo).ooos_list_head = index };
-            } else if let Some(segment) = entries.get_mut(previous) {
-                segment.next = index;
+                *head = index;
+            } else {
+                segments.get_mut(previous).expect("OOO predecessor remains live").next = index;
             }
-            lookup.insert(start, index);
-            previous = index;
-            unsafe { (*fifo).ooos_newest = index };
+            if current != OOO_SEGMENT_INVALID_INDEX {
+                segments.get_mut(current).expect("OOO successor remains live").prev = index;
+            }
+            index
+        };
+
+        loop {
+            let segment = *segments.get(index).expect("merged OOO segment remains live");
+            let next = segment.next;
+            if next == OOO_SEGMENT_INVALID_INDEX {
+                break;
+            }
+            let following = *segments.get(next).expect("OOO successor remains live");
+            let segment_end = segment.start.wrapping_add(segment.length);
+            if f_pos_gt(following.start, segment_end) {
+                break;
+            }
+            let following_end = following.start.wrapping_add(following.length);
+            let after = following.next;
+            let merged = segments.get_mut(index).expect("merged OOO segment remains live");
+            if f_pos_gt(following_end, segment_end) {
+                merged.length = following_end.wrapping_sub(merged.start);
+            }
+            merged.next = after;
+            if after != OOO_SEGMENT_INVALID_INDEX {
+                segments.get_mut(after).expect("OOO successor remains live").prev = index;
+            }
+            segments.remove(next).expect("merged OOO successor remains live");
         }
+        let segment = segments.get(index).expect("merged OOO segment remains live");
+        *newest = index;
+        Some((segment.start.wrapping_sub(tail), segment.length))
     }
 
     fn promote_contiguous_from(&self, base: u32) -> u32 {
         let mut tail = base;
-        let mut delivered: u32 = 0;
+        let segments = unsafe { &mut *self.ooo_segments.get() };
+        let head = unsafe { &mut *self.ooos_list_head.get() };
+        let newest = unsafe { &mut *self.ooos_newest.get() };
         loop {
-            let Some((start, finish)) = self.collect_ooo_segments().first().copied() else {
+            let Some(segment) = segments.get(*head).copied() else {
                 break;
             };
-            if start != tail && !f_pos_lt(start, tail) {
+            if f_pos_gt(segment.start, tail) {
                 break;
             }
-            let advance = finish.wrapping_sub(tail);
-            if advance == 0 {
-                break;
+            let finish = segment.start.wrapping_add(segment.length);
+            if f_pos_gt(finish, tail) {
+                tail = finish;
             }
-            tail = finish;
-            delivered = delivered.wrapping_add(advance);
-            let mut remaining = self.collect_ooo_segments();
-            remaining.remove(0);
-            self.replace_ooo_segments(&remaining);
+            let old_head = *head;
+            *head = segment.next;
+            if *head != OOO_SEGMENT_INVALID_INDEX {
+                segments.get_mut(*head).expect("OOO successor remains live").prev =
+                    OOO_SEGMENT_INVALID_INDEX;
+            }
+            if *newest == old_head {
+                *newest = OOO_SEGMENT_INVALID_INDEX;
+            }
+            segments.remove(old_head).expect("collected OOO segment remains live");
         }
-        unsafe { (*self.hdr).tail.store(tail, Ordering::Release) };
-        delivered
+        tail.wrapping_sub(base)
     }
 
     pub fn promote_contiguous(&self) -> u32 {
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Relaxed) };
-        self.promote_contiguous_from(tail)
+        let old_tail_chunk = unsafe { (*self.hdr).tail_chunk.load(Ordering::Relaxed) };
+        let collected = self.promote_contiguous_from(tail);
+        if collected != 0 {
+            let final_tail = tail.wrapping_add(collected);
+            self.clear_enq_chunks(old_tail_chunk, final_tail);
+            unsafe { (*self.hdr).tail.store(final_tail, Ordering::Release) };
+        }
+        collected
     }
 
     pub fn ooo_head(&self) -> Option<(u32, u32)> {
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Relaxed) };
         let entries = unsafe { &*self.ooo_segments.get() };
-        let segment = entries.get(self.ooos_list_head)?;
+        let segment = entries.get(unsafe { *self.ooos_list_head.get() })?;
         Some((segment.start.wrapping_sub(tail), segment.length))
     }
 

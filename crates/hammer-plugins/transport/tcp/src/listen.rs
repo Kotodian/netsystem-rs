@@ -1,6 +1,6 @@
 use crate::{TcpCapabilities, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
-use hammer_plugin_session::{IpSessionEndpoint, IpSessionMain};
+use hammer_plugin_session::{IpSessionEndpoint, IpSessionFamily, IpSessionMain};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 
@@ -43,16 +43,20 @@ pub fn register_tcp4_listen(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("tcp4-listen") {
         return Ok(node);
     }
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(Tcp4ListenNode::new(), &TcpListenNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(Tcp4ListenNode::new(), &TcpListenNext::NEXT_NAMES)?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 pub fn register_tcp6_listen(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal_with_next_names(
+    let node = runtime.nodes().try_register_internal_with_next_names(
         Tcp6ListenNode::new(),
         &["tcp6-output", "tcp6-established", "drop"],
-    )
+    )?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 impl Node for Tcp4ListenNode {
@@ -208,7 +212,7 @@ fn tcp_listen_index<const IS_IP4: bool>(
         .listener_connection(listener.lookup_id)
         .expect("published TCP listener retains its transport connection");
     let (control_segment, established_session) = TcpListener::new(
-        sessions,
+        &mut *sessions,
         &mut tcp,
         ip_session,
         listener.lookup_id,
@@ -243,10 +247,15 @@ fn tcp_listen_index<const IS_IP4: bool>(
         && packet.payload_len != 0
         && packet.flags != TcpSegmentFlags::SYN
     {
+        let connection_index = sessions
+            .session(session_id)
+            .expect("accepted TCP Session remains present for its input packet")
+            .connection_index();
         let buffer = runtime.buffer_mut(index);
         write_session_route_opaque(
             hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut(),
             session_id,
+            connection_index,
             listener.owner_worker,
             TcpInputNext::Established,
         );
@@ -566,6 +575,11 @@ impl<'a> TcpListener<'a> {
                 self.session_listener,
                 connection_index,
                 self.tcp.protocol,
+                if packet.local.is_ipv4() {
+                    IpSessionFamily::Ip4
+                } else {
+                    IpSessionFamily::Ip6
+                },
             )
         };
         let session = match accepted {

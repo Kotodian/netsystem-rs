@@ -47,6 +47,7 @@ use hammer_core::data_plane::{BufferPacketCursor, NodeId};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult,
 };
+use hammer_runtime::node::{NodeErrorDescriptor, NodeErrorSeverity};
 use thiserror::Error;
 
 use hammer_infra::align::CacheLineAlignMark;
@@ -58,15 +59,14 @@ use hammer_plugin_session::{
 use hammer_service::session::node::SessionQueueNode;
 use hammer_service::session::{
     SessionError, SessionEventType, SessionHandle as ServiceSessionHandle, SessionQueueNext,
-    SessionMain as ServiceSessionMain, SessionWorker as ServiceSessionWorker,
+    SessionMain as ServiceSessionMain, SessionTxOutcome, SessionWorker as ServiceSessionWorker,
 };
 use hammer_service::transport::{
     Transport, TransportMain, TransportOptions, TransportSendFlags, TransportSendParams,
-    TransportServiceType, TransportTxMode,
+    TransportServiceType, TransportTxTarget,
 };
 
 pub mod config;
-pub mod congestion;
 pub mod connection;
 mod drop;
 pub mod established;
@@ -93,7 +93,9 @@ pub use connection::{
     TcpConnection, TcpRetransmitTimeoutState,
 };
 pub use established::{Tcp4EstablishedNode, Tcp6EstablishedNode, TcpEstablishedNext};
-pub use input::{Tcp4InputNode, Tcp6InputNode, TcpInputTrace};
+pub use input::{
+    Tcp4InputNode, Tcp4InputNoLookupNode, Tcp6InputNode, Tcp6InputNoLookupNode, TcpInputTrace,
+};
 pub use listen::{Tcp4ListenNode, Tcp6ListenNode, TcpListenNext};
 pub use output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, Tcp4OutputNode, Tcp6OutputNode, TcpOutputNext};
 pub use policy::{TcpPolicy, active_tcp_policy, publish_tcp_policy, tcp_policy};
@@ -104,6 +106,32 @@ use segment::TcpSegment;
 pub use syn_sent::{Tcp4SynSentNode, Tcp6SynSentNode, TcpSynSentNext};
 
 pub use worker::TcpWorker;
+
+// VPP tcp_input.c:1149-1211; session.h:685-829. Keep the packet chain as
+// the source for the single copy into the Session RX FIFO.
+pub(crate) fn expose_payload(
+    runtime: &mut DataPlaneMain,
+    buffer_index: u32,
+    packet: &TcpPacket,
+    trim: usize,
+) -> RuntimeResult<()> {
+    let mut prefix_left = packet.payload_offset + trim;
+    let mut payload_left = packet.payload_len - trim;
+    let mut next = Some(buffer_index);
+    while let Some(index) = next {
+        let buffer = runtime.buffer_mut(index);
+        next = buffer.next_buffer_slot();
+        let skip = prefix_left.min(buffer.current_len());
+        buffer.advance(skip as isize);
+        prefix_left -= skip;
+        let keep = payload_left.min(buffer.current_len());
+        buffer.truncate(keep)?;
+        payload_left -= keep;
+    }
+    assert_eq!(prefix_left, 0, "parsed TCP header fits the Buffer chain");
+    assert_eq!(payload_left, 0, "parsed TCP payload fits the Buffer chain");
+    Ok(())
+}
 
 #[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, Error)]
@@ -265,7 +293,7 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
     type Attribute = TcpTransportAttribute;
 
     fn options(&self) -> TransportOptions {
-        TransportOptions::new(TransportTxMode::Peek, TransportServiceType::VirtualCircuit)
+        TransportOptions::new(TransportServiceType::VirtualCircuit)
     }
 
     fn connect(
@@ -388,40 +416,124 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         }
     }
 
-    fn half_close(&self, connection_index: u32, worker_index: u32) {
-        self.close(connection_index, worker_index);
-    }
-
-    fn close(&self, connection_index: u32, worker_index: u32) {
-        if let Some(slot) = self.workers.get(worker_index as usize) {
-            let worker = unsafe { &mut *slot.worker.as_ptr() };
-            let TcpWorker {
-                connections,
-                timer_wheel: timers,
-                ..
-            } = worker;
-            if let Some(connection) = connections.get_mut(connection_index) {
-                connection.on_session_close(connection_index, timers);
-                return;
-            }
+    fn half_close(
+        &self,
+        runtime: &mut DataPlaneMain,
+        sessions: &mut ServiceSessionWorker,
+        connection_index: u32,
+        _: u32,
+    ) {
+        let mut worker = self.worker(runtime.thread_index())
+            .expect("TCP close executes on its owner Data Worker");
+        let Some(connection) = worker.connections.get(connection_index) else {
+            return;
+        };
+        let handle = connection.base.session;
+        let tx_queued = sessions.session_from_handle(handle)
+            .and_then(|session| session.tx_fifo())
+            .is_some_and(|fifo| fifo.max_dequeue() != 0);
+        let (segment, next) = {
+            let worker::TcpWorker { connections, timer_wheel, tco_next_node, .. } = &mut *worker;
+            let connection = connections.get_mut(connection_index)
+                .expect("closing TCP connection remains allocated");
+            let next = tco_next_node[usize::from(!connection.remote().is_ipv4())];
+            (connection.on_session_close(connection_index, timer_wheel, tx_queued), next)
+        };
+        drop(worker);
+        if let Some(segment) = segment {
+            let sent = enqueue_session_tcp_segment(runtime, sessions, connection_index, next, segment)
+                .expect("valid TCP FIN fits a control Buffer");
+            let mut worker = self.worker(runtime.thread_index())
+                .expect("TCP close retains its owner Data Worker");
+            let worker::TcpWorker { connections, timer_wheel, .. } = &mut *worker;
+            let connection = connections.get_mut(connection_index)
+                .expect("FIN retains its TCP connection");
+            let interval = if sent {
+                connection.retransmit_timeout().retransmit_timeout()
+            } else {
+                active_tcp_policy().allocation_retry
+            };
+            timers::update(timer_wheel, connection_index, connection.timer_state_mut(),
+                timers::TcpTimerKind::Retransmit, interval)
+                .expect("validated FIN retry interval fits TCP wheel");
         }
     }
 
-    fn reset(&self, connection_index: u32, worker_index: u32) {
-        self.close(connection_index, worker_index);
+    fn close(
+        &self,
+        runtime: &mut DataPlaneMain,
+        sessions: &mut ServiceSessionWorker,
+        connection_index: u32,
+        worker_index: u32,
+    ) {
+        let (unread, half_open) = {
+            let worker = self.worker(runtime.thread_index())
+                .expect("TCP close executes on its owner Data Worker");
+            let Some(connection) = worker.connections.get(connection_index) else {
+                return;
+            };
+            (connection.state() == TcpState::Established
+                && sessions.session_from_handle(connection.base.session)
+                    .and_then(|session| session.rx_fifo())
+                    .is_some_and(|fifo| fifo.max_dequeue() != 0),
+                connection.state() == TcpState::SynSent)
+        };
+        if unread || half_open {
+            self.reset(runtime, sessions, connection_index, worker_index);
+        } else {
+            self.half_close(runtime, sessions, connection_index, worker_index);
+        }
+    }
+
+    fn reset(
+        &self,
+        runtime: &mut DataPlaneMain,
+        sessions: &mut ServiceSessionWorker,
+        connection_index: u32,
+        _: u32,
+    ) {
+        let mut worker = self.worker(runtime.thread_index())
+            .expect("TCP reset executes on its owner Data Worker");
+        let (segment, next, handle) = {
+            let worker::TcpWorker { connections, timer_wheel, tco_next_node, .. } = &mut *worker;
+            let Some(connection) = connections.get_mut(connection_index) else {
+                return;
+            };
+            let handle = connection.base.session;
+            let next = tco_next_node[usize::from(!connection.remote().is_ipv4())];
+            let segment = if connection.state() == TcpState::SynSent {
+                None
+            } else {
+                let local = connection.local().expect("reset TCP has a local endpoint");
+                Some(connection.control_segment(local, connection.remote(),
+                    TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+                    None, TcpCapabilities::default()))
+            };
+            for id in 0..timers::TCP_TIMER_KIND_COUNT as u32 {
+                let kind = timers::TcpTimerKind::from_id(id)
+                    .expect("TCP timer count covers every registered kind");
+                timers::reset(timer_wheel, connection_index, connection.timer_state_mut(), kind);
+            }
+            connection.state = TcpState::Closed;
+            (segment, next, handle)
+        };
+        worker.program_cleanup(connection_index);
+        drop(worker);
+        if let Some(segment) = segment {
+            enqueue_session_tcp_segment(runtime, sessions, connection_index, next, segment)
+                .expect("valid TCP reset fits a control Buffer");
+        }
+        if sessions.session_from_handle(handle).is_some() {
+            sessions.transport_closed(runtime, handle, connection_index)
+                .expect("reset retains its Session until closed notification");
+        }
     }
 
     fn cleanup(&self, connection_index: u32, worker_index: u32) {
         if let Some(slot) = self.workers.get(worker_index as usize) {
             let worker = unsafe { &mut *slot.worker.as_ptr() };
-            if let Some(session_index) = worker
-                .connection(connection_index)
-                .map(|connection| connection.base.session.session_index)
-            {
-                worker.lookup.forget_session(session_index);
-                worker.lookup.forget_pending_open(session_index);
-                drop(worker.remove_connection(connection_index));
-                return;
+            if worker.connection(connection_index).is_some() {
+                worker.program_cleanup(connection_index);
             }
         }
     }
@@ -449,94 +561,99 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
     /// VPP: tcp_output.c:980-1035, `tcp_session_push_header`.
     fn push_header(
         &self,
-        connection_index: u32,
-        worker_index: u32,
-        buffers: &mut [u32],
-        _: u32,
-    ) -> u32 {
-        let thread_index = DataWorkerId::new(worker_index).thread_index();
+        runtime: &mut DataPlaneMain,
+        sessions: &ServiceSessionWorker,
+        target: TransportTxTarget,
+        buffers: &[u32],
+        available_bytes: u32,
+    ) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        let worker_index = sessions.worker_index();
         let mut tcp = self
-            .worker(thread_index)
+            .worker(runtime.thread_index())
             .expect("TCP header push runs on its owner Data Worker");
         let TcpWorker {
             connections,
-            lookup,
             timer_wheel,
+            cached_opts,
+            cached_segment,
             ..
         } = &mut *tcp;
         let connection = connections
             .get_mut(connection_index)
             .expect("Session Queue retains a live TCP connection while pushing headers");
-        let capabilities = lookup
-            .pending_open_capabilities(connection.session_id())
-            .unwrap_or_default();
         let now = std::time::Instant::now();
-        let buffer_main = hammer_core::buffer::BufferMain::global();
+        let outstanding = connection.snd_nxt().wrapping_sub(connection.snd_una());
+        let max_dequeue = outstanding.checked_add(available_bytes)
+            .expect("TCP flight and Session FIFO bytes fit u32");
+        let segment = (*cached_segment)
+            .expect("send params prepares TCP options before pushing a burst");
+        let options_len = segment.header_len() - core::mem::size_of::<TcpHeader>();
         for &index in buffers.iter() {
-            // SAFETY: Session Queue transfers each live TX Buffer to this
-            // transport operation and does not retain an overlapping borrow.
-            let buffer = unsafe { buffer_main.buffer_mut_for_worker(thread_index, index) };
-            let payload_len = buffer.current_len() + buffer.total_len_not_including_first();
-            let segment = connection
-                .tx_segment(payload_len, capabilities)
-                .expect("Session Queue pushes TCP headers only for a sendable connection");
-            segment
-                .write_to_buffer(buffer)
-                .expect("Session Queue supplies a Buffer with TCP header headroom");
+            let buffer = runtime.buffer_mut(index);
+            connection.push_one_header(buffer, &segment, &cached_opts[..options_len], now)
+                .expect("Session Queue supplies a sendable TCP Buffer and headroom");
             let egress = hammer_core::buffer_opaque!(mut buffer => TcpSecondaryOpaque).egress_mut();
             egress.connection_index = connection_index;
             egress.worker_index = worker_index;
             egress.fib_index = connection.base.endpoint.fib_index();
-            connection
-                .commit_payload_tx(payload_len, now)
-                .expect("validated TCP payload length commits after header construction");
         }
         if !buffers.is_empty() {
+            connection.update_cwnd_limited(max_dequeue);
             connection
                 .sync_payload_tx_timers(connection_index, timer_wheel, now)
                 .expect("TCP timer interval remains valid after payload transmission");
         }
-        0
     }
 
     /// VPP: tcp.c:1170-1198, `tcp_session_send_params`.
-    fn send_params(&self, connection_index: u32, worker_index: u32) -> TransportSendParams {
+    fn send_params(
+        &self,
+        runtime: &DataPlaneMain,
+        sessions: &ServiceSessionWorker,
+        target: TransportTxTarget,
+        params: &mut TransportSendParams,
+    ) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
         let mut tcp = self
-            .worker(DataWorkerId::new(worker_index).thread_index())
+            .worker(runtime.thread_index())
             .expect("TCP send-params runs on its owner Data Worker");
-        let TcpWorker {
-            connections,
-            lookup,
-            ..
-        } = &mut *tcp;
+        let TcpWorker { connections, cached_opts, cached_segment, time_us, .. } = &mut *tcp;
         let connection = connections
             .get_mut(connection_index)
             .expect("Session Queue retains a live TCP connection while querying send space");
-        let _ = connection.refresh_path_mtu_from_cache();
-        let start = if connection.state() == TcpState::SynSent {
-            connection.iss()
-        } else {
-            connection.snd_una()
+        connection.refresh_path_mtu_from_cache();
+        let fifo = sessions
+            .session_from_handle(connection.base.session)
+            .and_then(|session| session.tx_fifo())
+            .expect("sendable TCP connection retains its Session TX FIFO");
+        let rx_available = sessions
+            .session_from_handle(connection.base.session)
+            .and_then(|session| session.rx_fifo())
+            .expect("sendable TCP connection retains its Session RX FIFO")
+            .max_enqueue();
+        connection.set_rcv_wnd(rx_available);
+        let segment = connection.tx_segment(0, TcpCapabilities::default())
+            .expect("ready TCP connection prepares established burst options");
+        let options_len = segment.cache_options(cached_opts);
+        connection.update_burst_send_vars(fifo, options_len, (*time_us * 1_000_000.0) as u64);
+        *cached_segment = Some(segment);
+        let flight = connection.snd_nxt().wrapping_sub(connection.snd_una());
+        let send_space = connection
+            .send_space()
+            .min(connection.snd_wnd().saturating_sub(flight));
+        params.send_space = send_space;
+        params.tx_offset = flight;
+        params.send_mss = u16::try_from(connection.send_mss)
+            .expect("TCP effective MSS fits transport parameter");
+        params.flags = TransportSendFlags {
+            deschedule: send_space == 0,
+            postpone: false,
         };
-        let tx_offset = TcpSeq::from(start).distance_to(connection.tx_payload_sequence());
-        let capabilities = lookup
-            .pending_open_capabilities(connection.session_id())
-            .unwrap_or_default();
-        let send_space = connection.tx_payload_budget(
-            u32::MAX as usize,
-            std::time::Instant::now(),
-            capabilities,
-        );
-        TransportSendParams {
-            send_space: u32::try_from(send_space).unwrap_or(u32::MAX),
-            tx_offset,
-            send_mss: u16::try_from(connection.send_goal_size()).unwrap_or(u16::MAX),
-            flags: TransportSendFlags {
-                deschedule: send_space == 0,
-                postpone: false,
-            },
-            ..TransportSendParams::default()
-        }
     }
 
     /// VPP: tcp.c:1361-1369, `tcp_update_time`; tcp.h:76-122,
@@ -560,14 +677,179 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         tcp.advance_timer_wheel(now);
     }
 
-    fn flush_data(&self, _: u32, _: u32) {}
-
-    fn custom_tx(&self, _: ServiceSessionHandle, _: &mut TransportSendParams) -> usize {
-        0
+    fn flush_data(&self, sessions: &ServiceSessionWorker, target: TransportTxTarget) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        let mut tcp = self
+            .worker(DataWorkerId::new(sessions.worker_index()).thread_index())
+            .expect("TCP flush runs on its owner Data Worker");
+        let connection = tcp.connections.get_mut(connection_index)
+            .expect("TX flush retains its TCP connection");
+        let fifo = sessions.session_from_handle(connection.base.session)
+            .and_then(|session| session.tx_fifo())
+            .expect("TX flush retains its Session TX FIFO");
+        connection.flush_data(fifo);
     }
 
-    fn app_rx_event(&self, _: u32, _: u32) -> Result<(), SessionError> {
-        Err(SessionError::NotSupported)
+    fn custom_tx(
+        &self,
+        runtime: &mut DataPlaneMain,
+        sessions: &mut ServiceSessionWorker,
+        target: TransportTxTarget,
+        params: &mut TransportSendParams,
+    ) -> usize {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP registers only the connection peek TX entry");
+        };
+        let mut tcp = self.worker(runtime.thread_index())
+            .expect("custom TX runs on its TCP owner worker");
+        let retransmit = {
+            let connection = tcp.connections.get_mut(connection_index)
+                .expect("custom TX retains the TCP connection");
+            let pending = connection.recovery.in_recovery()
+                && connection.retransmit_pending;
+            if pending {
+                connection.retransmit_pending = false;
+            }
+            pending
+        };
+        let packets = if retransmit {
+            tcp.retransmit(
+                runtime, sessions, connection_index, params.max_burst_size as usize,
+            )
+        } else {
+            0
+        };
+        let send_ack = {
+            let connection = tcp.connections.get_mut(connection_index)
+                .expect("custom TX retains the TCP connection");
+            let pending = connection.send_ack_pending;
+            connection.send_ack_pending = false;
+            pending && (packets == 0 || connection.pending_dupacks != 0)
+        };
+        if !send_ack {
+            return packets;
+        }
+        if packets >= params.max_burst_size as usize {
+            tcp.program_ack(runtime, sessions, connection_index, false);
+            return packets;
+        }
+        packets + tcp.send_acks(
+            runtime, sessions, connection_index, params.max_burst_size as usize - packets,
+        )
+    }
+
+    fn app_rx_event(
+        &self,
+        runtime: &mut DataPlaneMain,
+        sessions: &mut ServiceSessionWorker,
+        connection_index: u32,
+    ) {
+        let mut tcp = self.worker(runtime.thread_index())
+            .expect("TCP RX event runs on its owner Data Worker");
+        let next_nodes = tcp.tco_next_node;
+        let connection = tcp.connections.get_mut(connection_index)
+            .expect("RX event retains its TCP connection");
+        if !connection.zero_receive_window_sent() {
+            return;
+        }
+        let rx = sessions.session_from_handle(connection.base.session)
+            .and_then(|session| session.rx_fifo())
+            .expect("RX event retains its Session RX FIFO");
+        let available = rx.max_enqueue();
+        let minimum = (rx.size() >> 3).clamp(4 << 10, 128 << 10);
+        if available < minimum {
+            rx.want_deq_notification();
+            return;
+        }
+        let segment = connection.receive_window_update_segment(available)
+            .expect("zero-window TCP Session remains established");
+        let next = next_nodes[usize::from(!connection.remote().is_ipv4())];
+        drop(tcp);
+        match enqueue_session_tcp_segment(runtime, sessions, connection_index, next, segment) {
+            Ok(true) | Ok(false) => {}
+            Err(error) => panic!("TCP RX window ACK remains sendable: {error}"),
+        }
+    }
+
+    fn is_descheduled(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> bool {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker")
+            .connections.get(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.is_descheduled()
+    }
+
+    fn deschedule(&self, runtime: &DataPlaneMain, target: TransportTxTarget) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker")
+            .connections.get_mut(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.flags.descheduled = true;
+    }
+
+    fn clear_descheduled(&self, runtime: &DataPlaneMain, target: TransportTxTarget) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        let mut tcp = self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker");
+        let now_us = (tcp.time_us * 1_000_000.0) as u64;
+        tcp.connections.get_mut(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.clear_descheduled(now_us);
+    }
+
+    fn is_tx_paced(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> bool {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker")
+            .connections.get(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.is_tx_paced()
+    }
+
+    fn tx_pacer_burst(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> u32 {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        let mut tcp = self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker");
+        let now = (tcp.time_us * 1_000_000.0) as u64;
+        tcp.connections.get_mut(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.pacer.update(now)
+    }
+
+    fn tx_pacer_update_bytes(&self, runtime: &DataPlaneMain, target: TransportTxTarget, bytes: u32) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker")
+            .connections.get_mut(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.pacer.update_bytes(bytes);
+    }
+
+    fn tx_pacer_reset_bucket(&self, runtime: &DataPlaneMain, target: TransportTxTarget, bucket: u32) {
+        let TransportTxTarget::Connection(connection_index) = target else {
+            panic!("TCP peek TX requires a connection");
+        };
+        self.worker(runtime.thread_index())
+            .expect("transport is on its TCP worker")
+            .connections.get_mut(connection_index)
+            .expect("Session retains its TCP connection")
+            .base.pacer.bucket = i64::from(bucket);
     }
 
     #[inline]
@@ -694,9 +976,9 @@ fn init_tcp() -> RuntimeResult<()> {
         TCP_MAIN.get().is_none(),
         "TCP initialization callback executes once"
     );
-    let protocol = IpSessionMain::global()
+    let protocol = ServiceSessionMain::global()
         .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?
-        .register_transport_type(TransportTxMode::Peek, u32::MAX)
+        .register_transport_protocol()
         .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
     let config = TCP_CONFIG
         .get()
@@ -722,6 +1004,7 @@ fn init_tcp() -> RuntimeResult<()> {
 /// chooses the registered protocol; TCP calls its concrete Transport trait.
 fn tcp_session_control(
     sessions: &mut ServiceSessionWorker,
+    runtime: &mut DataPlaneMain,
     session_index: u32,
     event: SessionEventType,
 ) -> Result<(), SessionError> {
@@ -735,6 +1018,8 @@ fn tcp_session_control(
         SessionEventType::HalfClose => {
             <TcpMain as Transport<IpTransportEndpointConfig>>::half_close(
                 tcp,
+                runtime,
+                sessions,
                 connection_index,
                 worker_index,
             );
@@ -742,6 +1027,8 @@ fn tcp_session_control(
         SessionEventType::Close => {
             <TcpMain as Transport<IpTransportEndpointConfig>>::close(
                 tcp,
+                runtime,
+                sessions,
                 connection_index,
                 worker_index,
             );
@@ -749,6 +1036,8 @@ fn tcp_session_control(
         SessionEventType::Reset => {
             <TcpMain as Transport<IpTransportEndpointConfig>>::reset(
                 tcp,
+                runtime,
+                sessions,
                 connection_index,
                 worker_index,
             );
@@ -758,7 +1047,21 @@ fn tcp_session_control(
     Ok(())
 }
 
-/// VPP: session_node.c:1858-1915, the TCP session type's IO dispatch.
+/// VPP: session_node.c:1680-1694, the registered TCP peek TX entry.
+fn tcp_session_tx(
+    sessions: &mut ServiceSessionWorker,
+    runtime: &mut DataPlaneMain,
+    node: &mut NodeRuntime,
+    event_index: u32,
+    packets: &mut usize,
+) -> SessionTxOutcome {
+    let tcp = TCP_MAIN
+        .get()
+        .expect("registered TCP Session type retains TCP Main");
+    sessions.tx_fifo_peek_and_send(runtime, node, event_index, packets, tcp)
+}
+
+/// VPP: session_node.c:1858-1915, the TCP protocol's RX dispatch.
 fn tcp_session_io(
     runtime: &mut DataPlaneMain,
     sessions: &mut ServiceSessionWorker,
@@ -768,60 +1071,21 @@ fn tcp_session_io(
     let tcp = TCP_MAIN
         .get()
         .expect("TCP Main remains published while its Session type is registered");
-    let session = sessions
+    let connection_index = sessions
         .session(session_index)
-        .ok_or(SessionError::NoSession)?;
-    let connection_index = session.connection_index();
-    let worker_index = sessions.worker_index();
+        .ok_or(SessionError::NoSession)?
+        .connection_index();
     match event {
         SessionEventType::Tx | SessionEventType::TxFlush => {
-            if event == SessionEventType::TxFlush {
-                <TcpMain as Transport<IpTransportEndpointConfig>>::flush_data(
-                    tcp, connection_index, worker_index,
-                );
-            }
-            let next = {
-                let worker = tcp
-                    .worker(runtime.thread_index())
-                    .map_err(|source| SessionError::TransportOpFailed { source })?;
-                let connection = worker
-                    .connection(connection_index)
-                    .ok_or(SessionError::NoSession)?;
-                worker.tco_next_node[usize::from(!connection.remote().is_ipv4())]
-            };
-            sessions.tx_fifo_peek_and_send(runtime, session_index, tcp, next)
+            unreachable!("TCP TX events use the registered Session type entry")
         }
         SessionEventType::Rx => {
-            // VPP: tcp.c:1382-1401, tcp_session_app_rx_evt.
-            let rx = session
-                .rx_fifo()
-                .expect("accepted TCP Session retains its RX FIFO");
-            let available = rx.max_enqueue();
-            let minimum = (rx.size() >> 3).clamp(4 << 10, 128 << 10);
-            let mut worker = tcp
-                .worker(runtime.thread_index())
-                .map_err(|source| SessionError::TransportOpFailed { source })?;
-            let next_nodes = worker.tco_next_node;
-            let connection = worker
-                .connection_mut(connection_index)
-                .ok_or(SessionError::NoSession)?;
-            connection.set_rcv_wnd(available);
-            if !connection.zero_receive_window_sent() {
-                return Ok((0, false));
-            }
-            if available < minimum {
-                rx.want_deq_notification();
-                return Ok((0, false));
-            }
-            let mut candidate = connection.clone();
-            let segment = candidate
-                .receive_window_update_segment(available)
-                .map_err(|source| SessionError::TransportOpFailed { source })?;
-            let next = next_nodes[usize::from(!candidate.remote().is_ipv4())];
-            if !enqueue_session_tcp_segment(runtime, sessions, connection_index, next, segment)? {
-                return Ok((0, true));
-            }
-            *connection = candidate;
+            <TcpMain as Transport<IpTransportEndpointConfig>>::app_rx_event(
+                tcp,
+                runtime,
+                sessions,
+                connection_index,
+            );
             Ok((0, false))
         }
         _ => unreachable!("TCP Session IO dispatch receives only stream events"),
@@ -864,16 +1128,22 @@ fn tcp_session_update_time(
         .get()
         .expect("TCP Main remains published while its time subscriber is registered");
     let worker_index = sessions.worker_index();
+    {
+        let mut worker = tcp.worker(runtime.thread_index())
+            .map_err(|source| SessionError::TransportOpFailed { source })?;
+        worker.handle_cleanups(std::time::Instant::now(), sessions);
+    }
     <TcpMain as Transport<IpTransportEndpointConfig>>::update_time(tcp, now, worker_index);
     let mut worker = tcp
         .worker(runtime.thread_index())
         .map_err(|source| SessionError::TransportOpFailed { source })?;
     let now = worker.last_timer_update;
-    for _ in 0..worker.max_timers_per_loop {
-        let Some(token) = worker.take_pending_timer() else {
+    let mut timer_budget = worker.max_timers_per_loop as usize;
+    while timer_budget != 0 {
+        let Some(token) = worker.take_pending_timer(&mut timer_budget) else {
             break;
         };
-        let (session_index, outcome, is_ip4) = {
+        let (session_index, outcome, is_ip4, prior_state, state) = {
             let worker::TcpWorker {
                 connections,
                 lookup,
@@ -884,47 +1154,119 @@ fn tcp_session_update_time(
                 continue;
             };
             let session_index = connection.session_id();
+            let prior_state = connection.state();
             let capabilities = lookup
                 .pending_open_capabilities(session_index)
                 .unwrap_or_default();
             let outcome = connection
                 .on_typed_timer_expiry(token.index, timer_wheel, token.kind, capabilities, now)
                 .map_err(|source| SessionError::TransportOpFailed { source })?;
-            (session_index, outcome, connection.remote().is_ipv4())
+            (session_index, outcome, connection.remote().is_ipv4(),
+                prior_state, connection.state())
         };
-        if let Some(action) = outcome.action {
-            let counter = match action {
-                connection::TcpTimerAction::RtoRetransmit => TcpNodeError::Retransmit,
-                connection::TcpTimerAction::RackRetransmit => TcpNodeError::RackRetransmit,
-                connection::TcpTimerAction::TlpProbe => TcpNodeError::TlpProbe,
-                connection::TcpTimerAction::PersistProbe => TcpNodeError::PersistProbe,
-                connection::TcpTimerAction::KeepaliveProbe => TcpNodeError::KeepaliveProbe,
-            };
-            runtime
-                .record_current_node_error(counter)
-                .expect("TCP timer runs in the registered Session Queue Node");
+        let payload_retransmit = matches!(
+            outcome.action,
+            Some(connection::TcpTimerAction::RtoRetransmit)
+        ) && outcome.segment.is_none();
+        if matches!(outcome.action, Some(connection::TcpTimerAction::RackRetransmit)) {
+            worker.program_retransmit(runtime, sessions, token.index);
+        }
+        if matches!(outcome.action, Some(connection::TcpTimerAction::TlpProbe)) {
+            worker.send_tlp_probe(runtime, sessions, token.index);
+            let worker::TcpWorker { connections, timer_wheel, .. } = &mut *worker;
+            let connection = connections.get_mut(token.index)
+                .expect("TLP expiry retains its TCP connection");
+            let interval = connection.retransmit_timeout().retransmit_timeout();
+            timers::update(
+                timer_wheel,
+                token.index,
+                connection.timer_state_mut(),
+                timers::TcpTimerKind::Retransmit,
+                interval,
+            ).map_err(|source| SessionError::TransportOpFailed { source })?;
+        }
+        if payload_retransmit {
+            let connection = worker.connections.get(token.index)
+                .expect("expired TCP timer retains its connection");
+            let sequence = connection.tx_intent_sequence
+                .expect("payload retransmit timer selected its sequence");
+            let offset = connection.snd_una().distance_to(sequence);
+            let length = connection.tx_intent_payload_len.min(connection.send_mss);
+            let written = worker.prepare_segment(
+                runtime, sessions, token.index, offset, length, true,
+            );
+            if matches!(outcome.action, Some(connection::TcpTimerAction::RtoRetransmit)) {
+                let worker::TcpWorker { connections, timer_wheel, .. } = &mut *worker;
+                let connection = connections.get_mut(token.index)
+                    .expect("RTO retains its TCP connection");
+                let interval = if written == 0 {
+                    active_tcp_policy().allocation_retry
+                } else {
+                    connection.observe_retransmit_timeout()
+                };
+                timers::update(
+                    timer_wheel,
+                    token.index,
+                    connection.timer_state_mut(),
+                    timers::TcpTimerKind::Retransmit,
+                    interval,
+                ).map_err(|source| SessionError::TransportOpFailed { source })?;
+            }
+            if written != 0 {
+                let connection = worker.connections.get_mut(token.index)
+                    .expect("sent retransmit retains its TCP connection");
+                if matches!(outcome.action, Some(connection::TcpTimerAction::RtoRetransmit)) {
+                    connection.recovery.on_retransmit_sent(written as u32);
+                }
+                connection.recovery.commit_retransmit(sequence, now);
+                if matches!(outcome.action, Some(connection::TcpTimerAction::RtoRetransmit)) {
+                    worker.program_retransmit(runtime, sessions, token.index);
+                }
+            }
         }
         let handle = ServiceSessionHandle {
             worker_index,
             session_index,
         };
+        let mut control_sent = false;
         if let Some(segment) = outcome.segment {
             if segment.payload_len() == 0 {
                 let next = worker.tco_next_node[usize::from(!is_ip4)];
-                enqueue_session_tcp_segment(runtime, sessions, token.index, next, segment)?;
+                control_sent = enqueue_session_tcp_segment(
+                    runtime, sessions, token.index, next, segment,
+                )?;
             } else if sessions.session_from_handle(handle).is_some() {
                 sessions.enqueue_ready(handle, tcp.protocol)?;
             }
-        } else if matches!(
-            token.kind,
-            timers::TcpTimerKind::Retransmit
-                | timers::TcpTimerKind::Rack
-                | timers::TcpTimerKind::Tlp
-                | timers::TcpTimerKind::Persist
-                | timers::TcpTimerKind::Pacing
-        ) && sessions.session_from_handle(handle).is_some()
+        } else if matches!(token.kind, timers::TcpTimerKind::Persist
+            | timers::TcpTimerKind::Pacing)
+            && sessions.session_from_handle(handle).is_some()
         {
             sessions.enqueue_ready(handle, tcp.protocol)?;
+        }
+        if token.kind == timers::TcpTimerKind::WaitClose && state != prior_state {
+            if prior_state != TcpState::TimeWait
+                && matches!(state, TcpState::LastAck | TcpState::Closed)
+                && sessions.session_from_handle(handle).is_some()
+            {
+                sessions.transport_closed(runtime, handle, token.index)?;
+            }
+            if prior_state == TcpState::CloseWait && state == TcpState::LastAck {
+                let worker::TcpWorker { connections, timer_wheel, .. } = &mut *worker;
+                let connection = connections.get_mut(token.index)
+                    .expect("WAITCLOSE FIN retains its TCP connection");
+                let interval = if control_sent {
+                    connection.retransmit_timeout().retransmit_timeout()
+                } else {
+                    active_tcp_policy().allocation_retry
+                };
+                timers::update(timer_wheel, token.index, connection.timer_state_mut(),
+                    timers::TcpTimerKind::Retransmit, interval)
+                    .map_err(|source| SessionError::TransportOpFailed { source })?;
+            }
+            if state == TcpState::Closed {
+                worker.program_cleanup(token.index);
+            }
         }
     }
     Ok(())
@@ -956,6 +1298,7 @@ pub fn register_tcp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             &TcpInputNext::NEXT_NAMES,
         )?
     };
+    runtime.register_node_errors(node, &TCP_ERRORS)?;
     hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), 6, node)?;
     Ok(node)
 }
@@ -977,7 +1320,42 @@ pub fn register_tcp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             ],
         )?
     };
+    runtime.register_node_errors(node, &TCP_ERRORS)?;
     hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), 6, node)?;
+    Ok(node)
+}
+
+pub fn register_tcp4_input_nolookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = if let Some(node) = runtime.nodes().node_by_name("tcp4-input-nolookup") {
+        node
+    } else {
+        runtime.nodes().try_register_internal_with_next_names(
+            Tcp4InputNoLookupNode::new(),
+            &TcpInputNext::NEXT_NAMES,
+        )?
+    };
+    runtime.register_node_errors(node, &TCP_ERRORS)?;
+    Ok(node)
+}
+
+pub fn register_tcp6_input_nolookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = if let Some(node) = runtime.nodes().node_by_name("tcp6-input-nolookup") {
+        node
+    } else {
+        runtime.nodes().try_register_internal_with_next_names(
+            Tcp6InputNoLookupNode::new(),
+            &[
+                "tcp6-drop",
+                "ip6-punt",
+                "tcp6-listen",
+                "tcp6-rcv-process",
+                "tcp6-syn-sent",
+                "tcp6-established",
+                "tcp6-reset",
+            ],
+        )?
+    };
+    runtime.register_node_errors(node, &TCP_ERRORS)?;
     Ok(node)
 }
 
@@ -1024,6 +1402,21 @@ fn init_tcp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     bind_worker_graph(engine)
 }
+
+const TCP_ERRORS: [NodeErrorDescriptor; 12] = [
+    NodeErrorDescriptor::new("wrong-thread", NodeErrorSeverity::Error, "Wrong TCP worker"),
+    NodeErrorDescriptor::new("length", NodeErrorSeverity::Error, "Inconsistent IP/TCP length"),
+    NodeErrorDescriptor::new("no-listener", NodeErrorSeverity::Error, "No TCP listener"),
+    NodeErrorDescriptor::new("lookup-drops", NodeErrorSeverity::Error, "TCP lookup dropped packet"),
+    NodeErrorDescriptor::new("dispatch", NodeErrorSeverity::Error, "TCP dispatch failed"),
+    NodeErrorDescriptor::new("segment-invalid", NodeErrorSeverity::Error, "Invalid TCP segment"),
+    NodeErrorDescriptor::new("ack-invalid", NodeErrorSeverity::Error, "Invalid TCP ACK"),
+    NodeErrorDescriptor::new("connection-invalid", NodeErrorSeverity::Error, "Invalid TCP connection"),
+    NodeErrorDescriptor::new("connection-closed", NodeErrorSeverity::Info, "TCP connection closed"),
+    NodeErrorDescriptor::new("options", NodeErrorSeverity::Error, "TCP options invalid"),
+    NodeErrorDescriptor::new("paws", NodeErrorSeverity::Error, "TCP PAWS rejected packet"),
+    NodeErrorDescriptor::new("receive-window", NodeErrorSeverity::Error, "TCP receive window rejected packet"),
+];
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -1072,6 +1465,86 @@ pub enum TcpNodeError {
     BadWindow,
     #[error("keepalive probe")]
     KeepaliveProbe,
+    #[error("payload enqueued")]
+    Enqueued,
+    #[error("out-of-order payload enqueued")]
+    EnqueuedOoo,
+    #[error("receive FIFO full")]
+    FifoFull,
+    #[error("payload partially enqueued")]
+    PartiallyEnqueued,
+    #[error("old segment")]
+    SegmentOld,
+    #[error("zero receive window")]
+    ZeroRwnd,
+}
+
+const TCP_NODE_ERRORS: [hammer_runtime::node::NodeErrorDescriptor; 28] = [
+    hammer_runtime::node::NodeErrorDescriptor::new("session-missing", hammer_runtime::node::NodeErrorSeverity::Error, "Session missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("established-session-missing", hammer_runtime::node::NodeErrorSeverity::Error, "Established Session missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("established-session-route-missing", hammer_runtime::node::NodeErrorSeverity::Error, "Established Session route missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("receive-session-missing", hammer_runtime::node::NodeErrorSeverity::Error, "Receive Session missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("receive-session-route-missing", hammer_runtime::node::NodeErrorSeverity::Error, "Receive Session route missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("syn-sent-session-missing", hammer_runtime::node::NodeErrorSeverity::Error, "SYN-SENT Session missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("syn-sent-session-route-missing", hammer_runtime::node::NodeErrorSeverity::Error, "SYN-SENT Session route missing"),
+    hammer_runtime::node::NodeErrorDescriptor::new("timer-update-failed", hammer_runtime::node::NodeErrorSeverity::Error, "Timer update failed"),
+    hammer_runtime::node::NodeErrorDescriptor::new("tx-offset-overflow", hammer_runtime::node::NodeErrorSeverity::Error, "TX offset overflow"),
+    hammer_runtime::node::NodeErrorDescriptor::new("bad-checksum", hammer_runtime::node::NodeErrorSeverity::Error, "Bad TCP checksum"),
+    hammer_runtime::node::NodeErrorDescriptor::new("reset-received", hammer_runtime::node::NodeErrorSeverity::Info, "Reset received"),
+    hammer_runtime::node::NodeErrorDescriptor::new("bad-segment", hammer_runtime::node::NodeErrorSeverity::Error, "Bad TCP segment"),
+    hammer_runtime::node::NodeErrorDescriptor::new("no-listener", hammer_runtime::node::NodeErrorSeverity::Error, "No TCP listener"),
+    hammer_runtime::node::NodeErrorDescriptor::new("connection-create", hammer_runtime::node::NodeErrorSeverity::Error, "TCP connection creation failed"),
+    hammer_runtime::node::NodeErrorDescriptor::new("rack-retransmit", hammer_runtime::node::NodeErrorSeverity::Info, "RACK retransmit"),
+    hammer_runtime::node::NodeErrorDescriptor::new("tlp-probe", hammer_runtime::node::NodeErrorSeverity::Info, "TLP probe"),
+    hammer_runtime::node::NodeErrorDescriptor::new("retransmit", hammer_runtime::node::NodeErrorSeverity::Info, "RTO retransmit"),
+    hammer_runtime::node::NodeErrorDescriptor::new("pacing-limited", hammer_runtime::node::NodeErrorSeverity::Info, "Pacing limited"),
+    hammer_runtime::node::NodeErrorDescriptor::new("persist-probe", hammer_runtime::node::NodeErrorSeverity::Info, "Persist probe"),
+    hammer_runtime::node::NodeErrorDescriptor::new("bbr-congestion", hammer_runtime::node::NodeErrorSeverity::Info, "BBR congestion"),
+    hammer_runtime::node::NodeErrorDescriptor::new("bad-window", hammer_runtime::node::NodeErrorSeverity::Error, "Bad receive window"),
+    hammer_runtime::node::NodeErrorDescriptor::new("keepalive-probe", hammer_runtime::node::NodeErrorSeverity::Info, "Keepalive probe"),
+    hammer_runtime::node::NodeErrorDescriptor::new("enqueued", hammer_runtime::node::NodeErrorSeverity::Info, "Packets pushed into RX FIFO"),
+    hammer_runtime::node::NodeErrorDescriptor::new("enqueued-ooo", hammer_runtime::node::NodeErrorSeverity::Warn, "OOO packets pushed into RX FIFO"),
+    hammer_runtime::node::NodeErrorDescriptor::new("fifo-full", hammer_runtime::node::NodeErrorSeverity::Error, "Packets dropped for lack of RX FIFO space"),
+    hammer_runtime::node::NodeErrorDescriptor::new("partially-enqueued", hammer_runtime::node::NodeErrorSeverity::Warn, "Packets partially pushed into RX FIFO"),
+    hammer_runtime::node::NodeErrorDescriptor::new("segment-old", hammer_runtime::node::NodeErrorSeverity::Warn, "Old segment"),
+    hammer_runtime::node::NodeErrorDescriptor::new("zero-rwnd", hammer_runtime::node::NodeErrorSeverity::Warn, "Zero receive window"),
+];
+
+pub(crate) fn register_tcp_node_errors(runtime: &DataPlaneMain, node: NodeId) -> RuntimeResult<()> {
+    runtime.register_node_errors(node, &TCP_NODE_ERRORS)
+}
+
+/// VPP tcp_input.c:1003-1111, in-order and OOO FIFO packet classification.
+#[inline(always)]
+pub(crate) fn payload_node_error(
+    delivery: hammer_service::session::RxDelivery,
+    requested: u32,
+    send_mss: u32,
+    offset: u32,
+) -> TcpNodeError {
+    match delivery {
+        hammer_service::session::RxDelivery::NotAccepted { rx_available } => {
+            if offset == 0 && rx_available < send_mss {
+                TcpNodeError::ZeroRwnd
+            } else {
+                TcpNodeError::FifoFull
+            }
+        }
+        hammer_service::session::RxDelivery::InOrder { accepted, .. } => {
+            if accepted.get() == requested {
+                TcpNodeError::Enqueued
+            } else {
+                TcpNodeError::PartiallyEnqueued
+            }
+        }
+        hammer_service::session::RxDelivery::OutOfOrder { accepted, .. } => {
+            if accepted.get() == requested {
+                TcpNodeError::EnqueuedOoo
+            } else {
+                TcpNodeError::FifoFull
+            }
+        }
+    }
 }
 
 impl hammer_runtime::node::NodeErrorCode for TcpNodeError {
@@ -1113,6 +1586,14 @@ impl From<TcpNodeError> for TcpError {
             TcpNodeError::ResetReceived => TcpError::ConnectionClosed,
             TcpNodeError::NoListener => TcpError::NoListener,
             TcpNodeError::BadWindow => TcpError::RcvWnd,
+            TcpNodeError::Enqueued
+            | TcpNodeError::EnqueuedOoo
+            | TcpNodeError::FifoFull
+            | TcpNodeError::PartiallyEnqueued
+            | TcpNodeError::SegmentOld
+            | TcpNodeError::ZeroRwnd => {
+                panic!("TCP packet accounting is not a control-plane error")
+            }
         }
     }
 }
@@ -1130,9 +1611,10 @@ impl From<TcpNodeError> for RuntimeError {
 struct TcpRouteOpaque {
     session_raw: u64,
     owner_worker: u32,
+    connection_index: u32,
     next: u8,
     present: u8,
-    reserved: [u8; 42],
+    reserved: [u8; 38],
 }
 
 const _: () = assert!(std::mem::size_of::<TcpRouteOpaque>() == 56);
@@ -1143,9 +1625,10 @@ impl Default for TcpRouteOpaque {
         Self {
             session_raw: 0,
             owner_worker: 0,
+            connection_index: u32::MAX,
             next: 0,
             present: 0,
-            reserved: [0; 42],
+            reserved: [0; 38],
         }
     }
 }
@@ -1239,15 +1722,17 @@ pub(crate) fn read_tcp_egress_endpoints(
 pub(crate) fn write_session_route_opaque(
     opaque: &mut TcpRouteOpaque,
     session_id: u32,
+    connection_index: u32,
     owner: DataWorkerId,
     next: TcpInputNext,
 ) {
     *opaque = TcpRouteOpaque {
         session_raw: session_id.into(),
         owner_worker: owner.slot() as u32,
+        connection_index,
         next: next as u8,
         present: 1,
-        reserved: [0; 42],
+        reserved: [0; 38],
     };
 }
 

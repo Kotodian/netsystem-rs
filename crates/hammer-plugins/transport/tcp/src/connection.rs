@@ -2,15 +2,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
-use super::TcpInputNext;
-use super::congestion::State;
 use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len, tcp_send_goal_size,
 };
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
-use super::timers::{self, TcpTimerKind, TcpTimerState};
+use super::timers::{self, TCP_TIMER_KIND_COUNT, TcpTimerKind, TcpTimerState};
 use crate::protocol::TcpEcnCodepoint;
 use crate::{
     TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpError, TcpFastOpenCookie,
@@ -18,12 +16,15 @@ use crate::{
     TcpTimestampOption,
 };
 use hammer_infra::align::CacheLineAlignMark;
+use hammer_infra::svm::fifo::Fifo as SvmFifo;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_plugin_session::{IpTransportConnection, IpTransportConnectionId};
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::RxDelivery;
-use hammer_service::transport::congestion::{CongestionController, CongestionMetrics};
+use hammer_service::transport::congestion::{
+    BbrController, CongestionController, CongestionMetrics,
+};
 use hammer_service::transport::{Pacer, TransportConnectionFlags};
 use thiserror::Error;
 
@@ -265,7 +266,7 @@ impl Default for TcpRetransmitTimeoutState {
 #[repr(C)]
 pub struct TcpConnectionCacheline0 {
     cacheline0: CacheLineAlignMark,
-    state: TcpState,
+    pub(super) state: TcpState,
     timers: TcpTimerState,
     pacing_ready: bool,
     local: Option<SocketAddr>,
@@ -273,16 +274,31 @@ pub struct TcpConnectionCacheline0 {
     iss: TcpSeq,
     irs: TcpSeq,
     snd_una: TcpSeq,
-    snd_nxt: TcpSeq,
+    pub(super) snd_nxt: TcpSeq,
     snd_wnd: u32,
     rcv_nxt: TcpSeq,
     rcv_wnd: u32,
     zero_receive_window_sent: bool,
     negotiated_options: TcpNegotiatedOptions,
-    tx_intent_sequence: Option<TcpSeq>,
-    tx_intent_payload_len: u32,
+    pub(super) tx_intent_sequence: Option<TcpSeq>,
+    pub(super) tx_intent_payload_len: u32,
     fast_open_syn_payload_len: u32,
     bytes_in_flight_cached: u32,
+    pub(super) send_mss: u32,
+    psh_pending: bool,
+    psh_sequence: TcpSeq,
+    cwnd_limited_sequence: TcpSeq,
+    burst_acked: u32,
+    deq_pending: bool,
+    delivered_time: f64,
+    received_dupacks: u32,
+    limited_transmit: TcpSeq,
+    pub(super) send_ack_pending: bool,
+    pub(super) retransmit_pending: bool,
+    pub(super) pending_dupacks: u8,
+    pub(super) fin_pending: bool,
+    pub(super) fin_sent: bool,
+    pub(super) fin_received: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -307,9 +323,9 @@ pub struct TcpConnection {
     timestamps: TcpTimestampState,
     keepalive: TcpKeepaliveState,
     ecn: TcpEcnState,
-    congestion: State,
-    recovery: TcpRecoveryState,
-    sack: TcpSackState,
+    congestion: BbrController,
+    pub(super) recovery: TcpRecoveryState,
+    pub(super) sack: TcpSackState,
     time_wait: Duration,
     nagle: bool,
     paws_idle: Duration,
@@ -394,6 +410,21 @@ impl TcpConnection {
                 tx_intent_payload_len: 0,
                 fast_open_syn_payload_len: 0,
                 bytes_in_flight_cached: 0,
+                send_mss: mss.max(1),
+                psh_pending: false,
+                psh_sequence: TcpSeq::from(0),
+                cwnd_limited_sequence: TcpSeq::from(0),
+                burst_acked: 0,
+                deq_pending: false,
+                delivered_time: 0.0,
+                received_dupacks: 0,
+                limited_transmit: TcpSeq::from(0),
+                send_ack_pending: false,
+                retransmit_pending: false,
+                pending_dupacks: 0,
+                fin_pending: false,
+                fin_sent: false,
+                fin_received: false,
             },
             cacheline1: TcpConnectionCacheline1 {
                 cacheline1: CacheLineAlignMark,
@@ -409,7 +440,7 @@ impl TcpConnection {
             timestamps: TcpTimestampState::default(),
             keepalive: TcpKeepaliveState::new(Instant::now()),
             ecn: TcpEcnState::default(),
-            congestion: State::new(policy.congestion, mss.max(1)),
+            congestion: BbrController::new(mss.max(1)),
             recovery: TcpRecoveryState::new(),
             sack: TcpSackState::default(),
             time_wait: policy.time_wait,
@@ -593,11 +624,6 @@ impl TcpConnection {
     }
 
     #[inline]
-    pub(crate) fn congestion(&self) -> &State {
-        &self.congestion
-    }
-
-    #[inline]
     pub fn congestion_metrics(&self) -> CongestionMetrics {
         self.congestion.metrics()
     }
@@ -698,23 +724,6 @@ impl TcpConnection {
     #[inline]
     pub fn recovery(&self) -> &TcpRecoveryState {
         &self.recovery
-    }
-
-    #[inline]
-    pub fn next_node(&self) -> TcpInputNext {
-        match self.state {
-            TcpState::Closed => TcpInputNext::Drop,
-            TcpState::Listen => TcpInputNext::Listen,
-            TcpState::SynSent => TcpInputNext::SynSent,
-            TcpState::Established => TcpInputNext::Established,
-            TcpState::SynRcvd
-            | TcpState::FinWait1
-            | TcpState::FinWait2
-            | TcpState::CloseWait
-            | TcpState::Closing
-            | TcpState::LastAck
-            | TcpState::TimeWait => TcpInputNext::RcvProcess,
-        }
     }
 
     #[inline]
@@ -964,16 +973,11 @@ impl TcpConnection {
         }
         let advanced = acknowledgment > self.snd_una;
         let recovery_ack = self.recovery_ack(acknowledgment);
-        let mut latest_rtt = if advanced {
-            if sack_blocks.is_empty() {
-                self.recovery.on_ack(recovery_ack, &mut self.congestion)
-            } else {
-                self.recovery
-                    .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion)
-            }
-        } else if !sack_blocks.is_empty() {
+        let mut latest_rtt = if self.negotiated_options().sack {
             self.recovery
                 .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion)
+        } else if advanced {
+            self.recovery.on_ack(recovery_ack, &mut self.congestion)
         } else {
             None
         };
@@ -1109,6 +1113,7 @@ impl TcpConnection {
         let capabilities = normalize_tcp_capabilities(capabilities);
         self.negotiated_options = tcp_negotiate_options(local_capabilities, capabilities);
         let negotiated = self.negotiated_options;
+        self.recovery.rack_enabled = negotiated.sack;
         if let Some(max_segment_size) = negotiated.send_max_segment_size.filter(|max| *max != 0) {
             self.congestion.on_mtu_update(u32::from(max_segment_size));
         }
@@ -1339,9 +1344,6 @@ impl TcpConnection {
             self.state = TcpState::Established;
             timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
             self.observe_activity(index, timers, now)?;
-            if packet.payload_len != 0 {
-                self.rcv_nxt = packet.sequence.advance(1 + packet.payload_len as u32);
-            }
             return Ok(Some(self.control_segment(
                 packet.local,
                 packet.remote,
@@ -1375,12 +1377,65 @@ impl TcpConnection {
         }
         let syn_control =
             u32::from(previous_snd_una == self.iss && self.snd_una != previous_snd_una);
-        let payload_acked = acked.saturating_sub(syn_control);
+        let fin_control = u32::from(
+            self.fin_sent && previous_snd_una < self.snd_nxt && self.snd_una == self.snd_nxt,
+        );
+        let payload_acked = acked.saturating_sub(syn_control + fin_control);
         let fast_open_acked = payload_acked.min(self.fast_open_syn_payload_len);
         self.fast_open_syn_payload_len = self
             .fast_open_syn_payload_len
             .saturating_sub(fast_open_acked);
         payload_acked
+    }
+
+    #[inline]
+    pub(crate) fn record_acked_bytes(&mut self, bytes: u32) -> bool {
+        let enqueue = !self.deq_pending;
+        self.deq_pending = true;
+        self.burst_acked = self.burst_acked.checked_add(bytes)
+            .expect("TCP burst ACK cannot exceed retained flight");
+        enqueue
+    }
+
+    #[inline]
+    pub(crate) fn take_burst_acked(&mut self) -> u32 {
+        self.deq_pending = false;
+        std::mem::take(&mut self.burst_acked)
+    }
+
+    #[inline]
+    pub(crate) fn record_flight_drained(&mut self, now: f64) {
+        if self.snd_una == self.snd_nxt {
+            self.delivered_time = now;
+        }
+    }
+
+    /// VPP tcp_input.c:515-526. The ACK burst updates RTO once after the
+    /// matching Session FIFO bytes have been released.
+    pub(crate) fn retransmit_timer_after_ack(
+        &mut self,
+        index: u32,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
+    ) -> RuntimeResult<()> {
+        if self.snd_una == self.snd_nxt
+            || (!self.fin_sent && !self.recovery.has_unacked_data())
+        {
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
+            return Ok(());
+        }
+        let interval = self.retransmit_timeout().retransmit_timeout();
+        timers::update(timers, index, &mut self.timers, TcpTimerKind::Retransmit, interval)
+    }
+
+    /// VPP tcp.c:1434-1443. Pacing rate is connection-local CC output.
+    pub(crate) fn update_tx_pacer(&mut self) {
+        if !self.base.is_tx_paced() {
+            return;
+        }
+        if let Some(rate) = self.congestion.pacing_rate_bytes_per_second() {
+            self.base.pacer.bytes_per_second = rate;
+            self.base.pacer.tokens_per_period = rate as f32 / 1_000_000.0;
+        }
     }
 
     pub(super) fn receive_final_ack(
@@ -1484,6 +1539,130 @@ impl TcpConnection {
         allowed
     }
 
+    /// VPP tcp.c:1100-1196. Ordinary Session FIFO TX stops in recovery;
+    /// recovery sends retained FIFO bytes through TCP custom TX instead.
+    #[inline]
+    pub(crate) fn send_space(&mut self) -> u32 {
+        if self.recovery.in_recovery() || self.state == TcpState::Closed {
+            return 0;
+        }
+        let outstanding = self.snd_una.distance_to(self.snd_nxt);
+        let cwnd = self.congestion.congestion_window();
+        let mut available = cwnd.saturating_sub(outstanding);
+        if self.received_dupacks != 0 || self.recovery.sacked_bytes() != 0 {
+            let packets = if self.negotiated_options().sack {
+                self.recovery.reorder_threshold().saturating_sub(1)
+            } else {
+                2
+            };
+            let limit = packets.saturating_mul(self.send_mss);
+            if self.limited_transmit < self.snd_nxt.advance(0u32.wrapping_sub(limit))
+                || self.limited_transmit > self.snd_nxt
+            {
+                self.limited_transmit = self.snd_nxt;
+            }
+            let sent_limited = self.limited_transmit.distance_to(self.snd_nxt);
+            available = limit.saturating_sub(sent_limited);
+        }
+        if self.snd_wnd < self.send_mss {
+            return if self.snd_wnd <= available { self.snd_wnd } else { 0 };
+        }
+        if available < self.send_mss {
+            return if available < cwnd { 0 } else { available };
+        }
+        available - available % self.send_mss
+    }
+
+    /// VPP tcp_output.c:1326-1339; tcp_tlp.c:49-53. A probe may be shorter
+    /// than MSS, but must fit both the peer window and current cwnd.
+    #[inline]
+    pub(super) fn tlp_new_data_space(&self, unsent: u32) -> u32 {
+        let outstanding = self.snd_una.distance_to(self.snd_nxt);
+        let available = unsent
+            .min(self.snd_wnd.saturating_sub(outstanding))
+            .min(self.send_mss);
+        (self.congestion.congestion_window().saturating_sub(outstanding) >= available)
+            .then_some(available)
+            .unwrap_or(0)
+    }
+
+    /// VPP tcp_output.c:300-329. The worker option cache remains owned by
+    /// TcpWorker; TcpSegment writes options into the final Buffer headroom.
+    pub(crate) fn update_burst_send_vars(
+        &mut self,
+        tx_fifo: &SvmFifo,
+        options_len: usize,
+        now_us: u64,
+    ) {
+        self.send_mss = u32::try_from(self.output_payload_len())
+            .expect("effective TCP MSS fits u32")
+            .checked_sub(u32::try_from(options_len).expect("TCP options fit u32"))
+            .expect("negotiated MSS exceeds TCP options length");
+        assert_ne!(self.send_mss, 0, "TCP effective MSS remains nonzero");
+        if self.snd_una == self.snd_nxt && self.base.is_tx_paced() {
+            self.base.pacer.last_update = now_us;
+            self.base.pacer.bucket = 0;
+        }
+        if self.psh_pending {
+            let queued = u32::try_from(tx_fifo.max_dequeue())
+                .expect("TCP Session TX FIFO size fits u32");
+            self.psh_sequence = self.snd_una.advance(queued.wrapping_sub(1));
+        }
+    }
+
+    /// VPP tcp.c:1372-1380. A second flush keeps the first pending request.
+    pub(crate) fn flush_data(&mut self, tx_fifo: &SvmFifo) {
+        if self.psh_pending {
+            return;
+        }
+        let queued = u32::try_from(tx_fifo.max_dequeue())
+            .expect("TCP Session TX FIFO size fits u32");
+        self.psh_pending = true;
+        self.psh_sequence = self.snd_una.advance(queued.wrapping_sub(1));
+    }
+
+    /// VPP: tcp_output.c:884-978. Only the first Buffer carries the TCP
+    /// header; the payload length includes every chained tail Buffer.
+    #[inline(always)]
+    pub(crate) fn push_one_header(
+        &mut self,
+        buffer: &mut hammer_core::data_plane::Buffer,
+        segment: &TcpSegment,
+        options: &[u8],
+        now: Instant,
+    ) -> RuntimeResult<()> {
+        let payload_len = buffer.current_len() + buffer.total_len_not_including_first();
+        let sequence = self.snd_nxt;
+        let psh = self.psh_pending
+            && self.psh_sequence >= sequence
+            && self.psh_sequence < sequence.advance(payload_len as u32);
+        segment.write_burst_header(buffer, options, sequence, psh)?;
+        if psh {
+            self.psh_pending = false;
+        }
+        self.commit_payload_tx(payload_len, now)
+    }
+
+    /// VPP tcp_cc.h:107-135. Keep this marker connection-local.
+    #[inline(always)]
+    pub(crate) fn update_cwnd_limited(&mut self, max_dequeue: u32) {
+        if self.cwnd_limited_sequence < self.snd_una {
+            self.cwnd_limited_sequence = self.snd_una;
+        }
+        let cwnd = self.congestion.congestion_window();
+        if cwnd > self.snd_wnd {
+            return;
+        }
+        let outstanding = self.snd_una.distance_to(self.snd_nxt);
+        if max_dequeue >= cwnd
+            || outstanding >= cwnd
+            || (cwnd.saturating_sub(outstanding) < self.send_mss
+                && max_dequeue > outstanding)
+        {
+            self.cwnd_limited_sequence = self.snd_nxt;
+        }
+    }
+
     pub(crate) fn tx_segment(
         &mut self,
         payload_len: usize,
@@ -1516,11 +1695,24 @@ impl TcpConnection {
                 payload_len,
             ));
         }
-        self.ensure_state(TcpState::Established)?;
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            && !(self.state == TcpState::FinWait1 && self.fin_pending)
+        {
+            return Err(TcpConnectionError::InvalidState.into());
+        }
         let local = self
             .local()
             .ok_or(TcpConnectionError::MissingLocalAddress)?;
-        let mut flags = self.output_flags(TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
+        let sequence = self.tx_payload_sequence();
+        let mut data_flags = TcpSegmentFlags::ACK;
+        if self.psh_pending
+            && self.psh_sequence >= sequence
+            && self.psh_sequence < sequence.advance(payload_len as u32)
+        {
+            data_flags.insert(TcpSegmentFlags::PSH);
+            self.psh_pending = false;
+        }
+        let mut flags = self.output_flags(data_flags);
         if self.ecn.pending_signals.contains(TcpPendingSignals::CWR) {
             flags.insert(TcpSegmentFlags::CWR);
             self.ecn.pending_signals.remove(TcpPendingSignals::CWR);
@@ -1530,7 +1722,6 @@ impl TcpConnection {
             self.negotiated_options().timestamps,
             flags,
         );
-        let sequence = self.tx_payload_sequence();
         let retransmit = self
             .tx_intent_sequence
             .is_some_and(|sequence| sequence != self.snd_nxt);
@@ -1589,7 +1780,11 @@ impl TcpConnection {
             self.pacing_ready = false;
             return Ok(());
         }
-        self.ensure_state(TcpState::Established)?;
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            && !(self.state == TcpState::FinWait1 && self.fin_pending)
+        {
+            return Err(TcpConnectionError::InvalidState.into());
+        }
         if let Some(intent_sequence) = self.tx_intent_sequence {
             self.clear_tx_intent();
             // An intent below `snd_nxt` retransmits scoreboard-tracked bytes;
@@ -1727,11 +1922,21 @@ impl TcpConnection {
         let acknowledgment = TcpSeq::from(acknowledgment);
         let ack_accepted = self.accepts_ack(acknowledgment);
         let snd_una_before = self.snd_una;
+        let snd_wnd_before = self.snd_wnd;
         let bytes_in_flight_before = self.recovery.bytes_in_flight();
         let rack_timeout_before = self.recovery.rack_timeout(now);
         let zero_window_before = self.snd_wnd == 0;
         self.observe_ack_progress(packet, acknowledgment, sack_blocks)?;
         self.apply_ack(acknowledgment, advertised_window);
+        if ack_accepted && self.snd_una != snd_una_before {
+            self.received_dupacks = 0;
+        } else if ack_accepted
+            && packet.payload_len == 0
+            && self.snd_wnd == snd_wnd_before
+            && self.recovery.has_unacked_data()
+        {
+            self.received_dupacks = self.received_dupacks.saturating_add(1);
+        }
         let recovery_progress = ack_accepted
             && (self.snd_una != snd_una_before
                 || self.recovery.bytes_in_flight() != bytes_in_flight_before
@@ -1740,28 +1945,6 @@ impl TcpConnection {
             recovery_progress || (ack_accepted && zero_window_before != (self.snd_wnd == 0));
         self.observe_activity(index, timers, now)?;
         timers::reset(timers, index, &mut self.timers, TcpTimerKind::DelayedAck);
-        if self.recovery.has_unacked_data() {
-            let interval = self.retransmit_timeout().retransmit_timeout();
-            if self.snd_una != snd_una_before {
-                timers::update(
-                    timers,
-                    index,
-                    &mut self.timers,
-                    TcpTimerKind::Retransmit,
-                    interval,
-                )?;
-            } else {
-                timers::set(
-                    timers,
-                    index,
-                    &mut self.timers,
-                    TcpTimerKind::Retransmit,
-                    interval,
-                )?;
-            }
-        } else {
-            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
-        }
         self.sync_recovery_timers(index, timers, now, recovery_timing_changed)
     }
 
@@ -1802,22 +1985,55 @@ impl TcpConnection {
 
     pub(super) fn process_fin_after_payload(
         &mut self,
+        index: u32,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         packet: &TcpPacket,
     ) -> RuntimeResult<Option<TcpSegment>> {
-        if packet.flags.contains(TcpSegmentFlags::FIN)
-            && packet.sequence.advance(packet.payload_len as u32) == self.rcv_nxt
+        if !packet.flags.contains(TcpSegmentFlags::FIN)
+            || packet.sequence.advance(packet.payload_len as u32) != self.rcv_nxt
         {
-            self.rcv_nxt = self.rcv_nxt.advance(1);
-            self.state = TcpState::CloseWait;
-            return Ok(Some(self.control_segment(
-                packet.local,
-                packet.remote,
-                TcpSegmentFlags::ACK,
-                None,
-                TcpCapabilities::default(),
-            )));
+            return Ok(None);
         }
-        Ok(None)
+        match self.state {
+            TcpState::Established => {
+                self.rcv_nxt = self.rcv_nxt.advance(1);
+                self.fin_received = true;
+                self.state = TcpState::CloseWait;
+                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                    crate::active_tcp_policy().close_wait)?;
+            }
+            TcpState::FinWait1 => {
+                self.rcv_nxt = self.rcv_nxt.advance(1);
+                self.fin_received = true;
+                if self.fin_pending {
+                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                        crate::active_tcp_policy().close_wait)?;
+                } else if self.fin_sent && self.snd_una == self.snd_nxt {
+                    self.state = TcpState::TimeWait;
+                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                        self.time_wait)?;
+                } else {
+                    self.state = TcpState::Closing;
+                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                        crate::active_tcp_policy().closing)?;
+                }
+            }
+            TcpState::FinWait2 => {
+                self.rcv_nxt = self.rcv_nxt.advance(1);
+                self.fin_received = true;
+                self.state = TcpState::TimeWait;
+                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                    self.time_wait)?;
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(self.control_segment(
+            packet.local,
+            packet.remote,
+            TcpSegmentFlags::ACK,
+            None,
+            TcpCapabilities::default(),
+        )))
     }
 
     pub(super) fn receive_close_side(
@@ -1861,68 +2077,23 @@ impl TcpConnection {
         match self.state {
             TcpState::SynRcvd => self.receive_final_ack(index, timers, packet, now),
             TcpState::FinWait1 => {
-                if packet.flags.contains(TcpSegmentFlags::FIN) && packet.sequence == self.rcv_nxt {
-                    self.rcv_nxt = self.rcv_nxt.advance(1);
-                    self.state = if packet
-                        .acknowledgment
-                        .filter(|ack| {
-                            packet.flags.contains(TcpSegmentFlags::ACK)
-                                && self.accepts_ack(*ack)
-                                && *ack == self.snd_nxt
-                        })
-                        .is_some()
-                    {
-                        let time_wait = self.time_wait;
-                        timers::update(
-                            timers,
-                            index,
-                            &mut self.timers,
-                            TcpTimerKind::TimeWait,
-                            time_wait,
-                        )?;
-                        TcpState::TimeWait
-                    } else {
-                        TcpState::Closing
-                    };
-                    return Ok(Some(self.control_segment(
-                        packet.local,
-                        packet.remote,
-                        TcpSegmentFlags::ACK,
-                        None,
-                        TcpCapabilities::default(),
-                    )));
-                }
                 if let Some(acknowledgment) = packet.acknowledgment
                     && packet.flags.contains(TcpSegmentFlags::ACK)
                     && self.accepts_ack(acknowledgment)
                     && acknowledgment == self.snd_nxt
+                    && self.fin_sent
                 {
-                    self.state = TcpState::FinWait2;
+                    if self.fin_received {
+                        self.state = TcpState::Closed;
+                    } else {
+                        self.state = TcpState::FinWait2;
+                        timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                            crate::active_tcp_policy().fin_wait2)?;
+                    }
                 }
                 Ok(None)
             }
-            TcpState::FinWait2 => {
-                if packet.flags.contains(TcpSegmentFlags::FIN) && packet.sequence == self.rcv_nxt {
-                    self.rcv_nxt = self.rcv_nxt.advance(1);
-                    self.state = TcpState::TimeWait;
-                    let time_wait = self.time_wait;
-                    timers::update(
-                        timers,
-                        index,
-                        &mut self.timers,
-                        TcpTimerKind::TimeWait,
-                        time_wait,
-                    )?;
-                    return Ok(Some(self.control_segment(
-                        packet.local,
-                        packet.remote,
-                        TcpSegmentFlags::ACK,
-                        None,
-                        TcpCapabilities::default(),
-                    )));
-                }
-                Ok(None)
-            }
+            TcpState::FinWait2 => Ok(None),
             TcpState::CloseWait => Ok(None),
             TcpState::Closing => {
                 if let Some(acknowledgment) = packet.acknowledgment
@@ -1936,7 +2107,7 @@ impl TcpConnection {
                         timers,
                         index,
                         &mut self.timers,
-                        TcpTimerKind::TimeWait,
+                        TcpTimerKind::WaitClose,
                         time_wait,
                     )?;
                 }
@@ -1947,6 +2118,7 @@ impl TcpConnection {
                     && packet.flags.contains(TcpSegmentFlags::ACK)
                     && self.accepts_ack(acknowledgment)
                     && acknowledgment == self.snd_nxt
+                    && self.fin_sent
                 {
                     self.state = TcpState::Closed;
                 }
@@ -1959,7 +2131,7 @@ impl TcpConnection {
                         timers,
                         index,
                         &mut self.timers,
-                        TcpTimerKind::TimeWait,
+                        TcpTimerKind::WaitClose,
                         time_wait,
                     )?;
                     return Ok(Some(self.control_segment(
@@ -1978,11 +2150,19 @@ impl TcpConnection {
 
     #[inline]
     pub(crate) fn accept_payload(&self, packet: &TcpPacket) -> Option<(usize, u32)> {
-        if packet.payload_len == 0 {
+        self.accept_payload_from(packet.sequence, packet.payload_len)
+    }
+
+    #[inline]
+    pub(crate) fn accept_payload_from(
+        &self,
+        sequence: TcpSeq,
+        payload_len: usize,
+    ) -> Option<(usize, u32)> {
+        if payload_len == 0 {
             return None;
         }
-        let sequence = packet.sequence;
-        let end_sequence = sequence.advance(packet.payload_len as u32);
+        let end_sequence = sequence.advance(payload_len as u32);
         if end_sequence <= self.rcv_nxt {
             return None;
         }
@@ -2014,14 +2194,19 @@ impl TcpConnection {
                     .advance(accepted.get().saturating_add(promoted));
             }
             RxDelivery::OutOfOrder {
-                newest_start,
-                newest_len,
+                newest,
                 ..
             } => {
-                let left = self.rcv_nxt.advance(newest_start);
-                let right = left.advance(newest_len.get());
-                self.sack
-                    .update_range(self.negotiated_options().sack, self.rcv_nxt, left, right);
+                if let Some((start, length)) = newest {
+                    let left = self.rcv_nxt.advance(start);
+                    let right = left.advance(length.get());
+                    self.sack.update_range(
+                        self.negotiated_options().sack,
+                        self.rcv_nxt,
+                        left,
+                        right,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -2041,189 +2226,62 @@ impl TcpConnection {
     }
 
     #[inline]
-    pub(crate) fn has_pending_sack_output(&self) -> bool {
-        self.sack
-            .has_pending_output(self.negotiated_options().timestamps)
-    }
-
-    fn ready_segment(
-        &mut self,
-        has_pending_tx: bool,
-        local_capabilities: TcpCapabilities,
-    ) -> Option<TcpSegment> {
-        if self.state == TcpState::SynSent && !has_pending_tx && !self.recovery.has_unacked_data() {
-            return self.tx_segment(0, local_capabilities).ok();
-        }
-        let local = self.local?;
-        match self.state {
-            TcpState::Established if !has_pending_tx && self.has_pending_sack_output() => {
-                let flags = self.output_flags(TcpSegmentFlags::ACK);
-                let sequence = self.output_sequence(flags);
-                let acknowledgment = self.rcv_nxt();
-                let advertised_window = self.output_receive_window(flags);
-                let capabilities = self.output_capabilities();
-                let sack_blocks = self.sack.take_output(
-                    self.negotiated_options().sack,
-                    self.negotiated_options().timestamps,
-                    flags,
-                );
-                let timestamp = self.next_local_timestamp(self.negotiated_options().timestamps);
-                Some(TcpSegment::new(
-                    local,
-                    self.remote(),
-                    sequence,
-                    acknowledgment,
-                    advertised_window,
-                    flags,
-                    capabilities,
-                    sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
-                    timestamp,
-                    None,
-                    None,
-                    0,
-                ))
-            }
-            TcpState::FinWait1 | TcpState::LastAck if self.snd_una == self.snd_nxt => {
-                self.snd_nxt = self.snd_nxt.advance(1);
-                let flags = TcpSegmentFlags::ACK | TcpSegmentFlags::FIN;
-                let advertised_window = self.output_receive_window(flags);
-                Some(TcpSegment::new(
-                    local,
-                    self.remote(),
-                    self.snd_una(),
-                    self.rcv_nxt(),
-                    advertised_window,
-                    flags,
-                    self.output_capabilities(),
-                    None,
-                    self.next_local_timestamp(self.negotiated_options().timestamps),
-                    None,
-                    None,
-                    0,
-                ))
-            }
-            TcpState::FinWait1 | TcpState::LastAck => {
-                let flags = TcpSegmentFlags::ACK | TcpSegmentFlags::FIN;
-                let advertised_window = self.output_receive_window(flags);
-                Some(TcpSegment::new(
-                    local,
-                    self.remote(),
-                    self.snd_una(),
-                    self.rcv_nxt(),
-                    advertised_window,
-                    flags,
-                    self.output_capabilities(),
-                    None,
-                    self.next_local_timestamp(self.negotiated_options().timestamps),
-                    None,
-                    None,
-                    0,
-                ))
-            }
-            _ => None,
-        }
-    }
-
-    pub(super) fn on_tcp_ready(
+    pub(super) fn on_session_close(
         &mut self,
         index: u32,
         timers: &mut TimerWheel1t2w2048sl<u32>,
-        has_pending_tx: bool,
-        local_capabilities: TcpCapabilities,
-        _: Instant,
-    ) -> RuntimeResult<Option<TcpSegment>> {
-        if self.state == TcpState::Established {
-            if self.recovery.has_unacked_data() || has_pending_tx {
-                let interval = self.retransmit_timeout().retransmit_timeout();
-                timers::set(
-                    timers,
-                    index,
-                    &mut self.timers,
-                    TcpTimerKind::Retransmit,
-                    interval,
-                )?;
-            } else {
-                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
-            }
-            if self.snd_wnd == 0 && has_pending_tx {
-                let interval = self.persist_interval();
-                timers::set(
-                    timers,
-                    index,
-                    &mut self.timers,
-                    TcpTimerKind::Persist,
-                    interval,
-                )?;
-            } else if self.snd_wnd != 0 || !self.recovery.has_unacked_data() {
-                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Persist);
-            }
-            if has_pending_tx {
-                if let Some(interval) = self.pacing_interval() {
-                    timers::set(
-                        timers,
-                        index,
-                        &mut self.timers,
-                        TcpTimerKind::Pacing,
-                        interval,
-                    )?;
-                } else {
-                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
-                }
-            } else {
-                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
-            }
-            let keepalive = if self.keepalive.probes_sent == 0 {
-                self.keepalive.config.idle
-            } else {
-                self.keepalive.config.probe_interval
-            };
-            timers::set(
-                timers,
-                index,
-                &mut self.timers,
-                TcpTimerKind::KeepAlive,
-                keepalive,
-            )?;
-        }
-        let segment = self.ready_segment(has_pending_tx, local_capabilities);
-        if matches!(
-            self.state,
-            TcpState::SynSent | TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
-        ) && (self.state == TcpState::SynSent || self.snd_una != self.snd_nxt)
-        {
-            let interval = self.retransmit_timeout().retransmit_timeout();
-            timers::set(
-                timers,
-                index,
-                &mut self.timers,
-                TcpTimerKind::Retransmit,
-                interval,
-            )?;
-        }
-        if self.state != TcpState::Established {
-            timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
-            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
-        }
-        Ok(segment)
-    }
-
-    #[inline]
-    pub(super) fn on_session_close(&mut self, index: u32, timers: &mut TimerWheel1t2w2048sl<u32>) {
+        tx_queued: bool,
+    ) -> Option<TcpSegment> {
+        let policy = crate::active_tcp_policy();
+        let mut send_fin = false;
         match self.state {
+            TcpState::SynRcvd => {
+                self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
+                self.state = TcpState::FinWait1;
+                send_fin = true;
+                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                    policy.fin_wait1).expect("validated FIN-WAIT-1 interval fits TCP wheel");
+            }
             TcpState::Established => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::FinWait1;
                 timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
                 timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
+                self.fin_pending = tx_queued;
+                send_fin = !tx_queued;
+                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                    policy.fin_wait1).expect("validated FIN-WAIT-1 interval fits TCP wheel");
             }
             TcpState::CloseWait => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
-                self.state = TcpState::LastAck;
                 timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
                 timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
+                self.fin_pending = tx_queued;
+                if !tx_queued {
+                    self.state = TcpState::LastAck;
+                    send_fin = true;
+                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                        policy.last_ack).expect("validated LAST-ACK interval fits TCP wheel");
+                }
+            }
+            TcpState::FinWait1 => {
+                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                    policy.fin_wait1).expect("validated FIN-WAIT-1 interval fits TCP wheel");
             }
             _ => {}
         }
+        if !send_fin {
+            return None;
+        }
+        let local = self.local.expect("closing TCP connection has a local endpoint");
+        let segment = self.control_segment(
+            local, self.remote, TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            None, TcpCapabilities::default(),
+        );
+        self.snd_nxt = self.snd_nxt.advance(1);
+        self.fin_sent = true;
+        self.fin_pending = false;
+        Some(segment)
     }
 
     pub(super) fn on_typed_timer_expiry(
@@ -2239,14 +2297,16 @@ impl TcpConnection {
         }
         let outcome = match kind {
             TcpTimerKind::Retransmit => self.on_retransmit_timer_expiry(local_capabilities)?,
-            TcpTimerKind::Rack => self.on_rack_timer_expiry()?,
+            TcpTimerKind::Rack => self.on_rack_timer_expiry(now)?,
             TcpTimerKind::Tlp => self.on_tlp_timer_expiry()?,
             TcpTimerKind::DelayedAck => {
                 TcpTimerOutcome::segment(self.on_delayed_ack_timer_expiry())
             }
             TcpTimerKind::Persist => self.on_persist_timer_expiry(),
             TcpTimerKind::KeepAlive => self.on_keepalive_timer_expiry(),
-            TcpTimerKind::TimeWait => TcpTimerOutcome::segment(self.on_time_wait_timer_expiry()),
+            TcpTimerKind::WaitClose => TcpTimerOutcome::segment(
+                self.on_wait_close_timer_expiry(index, timers),
+            ),
             TcpTimerKind::Pacing => TcpTimerOutcome::segment(self.on_pacing_timer_expiry()),
         };
 
@@ -2259,6 +2319,7 @@ impl TcpConnection {
                     self.state,
                     TcpState::SynSent
                         | TcpState::Established
+                        | TcpState::CloseWait
                         | TcpState::FinWait1
                         | TcpState::Closing
                         | TcpState::LastAck
@@ -2289,14 +2350,10 @@ impl TcpConnection {
                 }
             }
             TcpTimerKind::Tlp => {
-                if let Some(interval) = self.recovery.tlp_timeout(
-                    self.retransmit_timeout().smoothed_rtt(),
-                    self.retransmit_timeout().retransmit_timeout(),
-                ) {
-                    timers::update(timers, index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
-                } else {
-                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
-                }
+                // VPP tcp_output.c:1370-1378: a PTO yields to a fresh RTO;
+                // it does not arm another PTO before the probe is resolved.
+                self.recovery.disarm_tlp();
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
             }
             TcpTimerKind::Persist => {
                 if self.state == TcpState::Established && self.snd_wnd == 0 {
@@ -2335,7 +2392,7 @@ impl TcpConnection {
                     )?;
                 }
             }
-            TcpTimerKind::DelayedAck | TcpTimerKind::TimeWait => {}
+            TcpTimerKind::DelayedAck | TcpTimerKind::WaitClose => {}
         }
         Ok(outcome)
     }
@@ -2344,10 +2401,16 @@ impl TcpConnection {
         match (self.state, kind) {
             (TcpState::SynSent, _)
             | (TcpState::Established, _)
+            | (TcpState::CloseWait, TcpTimerKind::WaitClose)
+            | (TcpState::FinWait1, TcpTimerKind::WaitClose)
+            | (TcpState::FinWait2, TcpTimerKind::WaitClose)
+            | (TcpState::Closing, TcpTimerKind::WaitClose)
+            | (TcpState::LastAck, TcpTimerKind::WaitClose)
+            | (TcpState::TimeWait, TcpTimerKind::WaitClose)
             | (TcpState::FinWait1, TcpTimerKind::Retransmit)
+            | (TcpState::CloseWait, TcpTimerKind::Retransmit)
             | (TcpState::Closing, TcpTimerKind::Retransmit)
-            | (TcpState::LastAck, TcpTimerKind::Retransmit)
-            | (TcpState::TimeWait, _) => true,
+            | (TcpState::LastAck, TcpTimerKind::Retransmit) => true,
             _ => false,
         }
     }
@@ -2387,7 +2450,8 @@ impl TcpConnection {
             ));
         }
         match self.state {
-            TcpState::Established => {
+            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1
+                if !self.fin_sent => {
                 let now = Instant::now();
                 let Some(sample) = self.recovery.on_retransmission_timeout(
                     now,
@@ -2396,7 +2460,6 @@ impl TcpConnection {
                 ) else {
                     return Ok(TcpTimerOutcome::none());
                 };
-                self.observe_retransmit_timeout();
                 self.tx_intent_sequence = Some(sample.sequence);
                 self.tx_intent_payload_len = sample.payload_len;
                 self.pacing_ready = true;
@@ -2414,7 +2477,7 @@ impl TcpConnection {
                     Some(TcpSegment::new(
                         local,
                         self.remote,
-                        self.snd_una.raw(),
+                        self.snd_nxt.raw().wrapping_sub(1),
                         self.rcv_nxt.raw(),
                         advertised_window,
                         flags,
@@ -2431,19 +2494,15 @@ impl TcpConnection {
         }
     }
 
-    fn on_rack_timer_expiry(&mut self) -> RuntimeResult<TcpTimerOutcome> {
+    fn on_rack_timer_expiry(&mut self, now: Instant) -> RuntimeResult<TcpTimerOutcome> {
         if self.ensure_state(TcpState::Established).is_err() {
             return Ok(TcpTimerOutcome::none());
         }
-        let now = Instant::now();
         self.recovery
             .on_rack_timeout(now, self.snd_nxt, &mut self.congestion);
-        let Some(sample) = self.recovery.take_rack_retransmit() else {
+        if self.recovery.retransmit_candidate().is_none() {
             return Ok(TcpTimerOutcome::none());
-        };
-        self.recovery.on_retransmit_sent(sample.bytes);
-        self.tx_intent_sequence = Some(sample.sequence);
-        self.tx_intent_payload_len = sample.payload_len;
+        }
         self.pacing_ready = true;
         Ok(TcpTimerOutcome::acted(TcpTimerAction::RackRetransmit, None))
     }
@@ -2452,15 +2511,12 @@ impl TcpConnection {
         if self.ensure_state(TcpState::Established).is_err() {
             return Ok(TcpTimerOutcome::none());
         }
-        let Some(sample) = self.recovery.take_tlp_probe() else {
+        if self.recovery.tlp_timeout(
+            self.retransmit_timeout().smoothed_rtt(),
+            self.retransmit_timeout().retransmit_timeout(),
+        ).is_none() {
             return Ok(TcpTimerOutcome::none());
-        };
-        if self.recovery.in_recovery() {
-            self.recovery.on_retransmit_sent(sample.bytes);
         }
-        self.tx_intent_sequence = Some(sample.sequence);
-        self.tx_intent_payload_len = sample.payload_len;
-        self.pacing_ready = true;
         Ok(TcpTimerOutcome::acted(TcpTimerAction::TlpProbe, None))
     }
 
@@ -2503,10 +2559,57 @@ impl TcpConnection {
         TcpTimerOutcome::acted(TcpTimerAction::PersistProbe, None)
     }
 
-    fn on_time_wait_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
-        self.state = TcpState::Closed;
-        None
+    fn on_wait_close_timer_expiry(
+        &mut self,
+        index: u32,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
+    ) -> Option<TcpSegment> {
+        let state = self.state;
+        if !matches!(state, TcpState::CloseWait | TcpState::FinWait1
+            | TcpState::FinWait2 | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait)
+        {
+            return None;
+        }
+        for id in 0..TCP_TIMER_KIND_COUNT as u32 {
+            let kind = TcpTimerKind::from_id(id)
+                .expect("TCP timer count covers every registered kind");
+            timers::reset(timers, index, &mut self.timers, kind);
+        }
+        match state {
+            TcpState::CloseWait if self.fin_pending => {
+                self.snd_nxt = self.snd_una;
+                self.state = TcpState::LastAck;
+                self.fin_pending = false;
+                self.fin_sent = true;
+                let local = self.local.expect("closing TCP has a local endpoint");
+                let segment = self.control_segment(local, self.remote,
+                    TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+                    None, TcpCapabilities::default());
+                self.snd_nxt = self.snd_nxt.advance(1);
+                timers::set(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
+                    crate::active_tcp_policy().last_ack)
+                    .expect("validated LAST-ACK interval fits TCP wheel");
+                Some(segment)
+            }
+            TcpState::FinWait1 if self.fin_pending => {
+                self.state = TcpState::Closed;
+                let local = self.local.expect("closing TCP has a local endpoint");
+                Some(self.control_segment(local, self.remote,
+                    TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+                    None, TcpCapabilities::default()))
+            }
+            TcpState::FinWait2 => {
+                self.state = TcpState::Closed;
+                let local = self.local.expect("closing TCP has a local endpoint");
+                Some(self.control_segment(local, self.remote,
+                    TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+                    None, TcpCapabilities::default()))
+            }
+            _ => {
+                self.state = TcpState::Closed;
+                None
+            }
+        }
     }
 
     fn on_keepalive_timer_expiry(&mut self) -> TcpTimerOutcome {
