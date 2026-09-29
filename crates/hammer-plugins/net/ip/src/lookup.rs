@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use hammer_service::net::throttle::Throttle;
 
-use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
+use hammer_core::data_plane::{
+    BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext,
+};
 use hammer_infra::pool::Pool;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::net::adj::AdjacencyMain;
@@ -882,15 +884,59 @@ impl Node for Ip6LoadBalanceNode {
     }
 }
 
+#[inline(always)]
 fn process_lookup_frame(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
 ) {
-    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        lookup_index(runtime, index, version)
-    })
+    let count = frame.len();
+    let indices = frame.vector_args();
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut offset = 0;
+
+    // VPP ip4_lookup_inline consumes x4/x2/x1 batches. ip6_lookup uses x2/x1
+    // because its graph fanout keeps two output slots in the hot path.
+    if matches!(version, IpVersion::V4) {
+        while offset + 4 <= count {
+            if offset + 8 <= count {
+                prefetch_lookup_packet(runtime, indices[offset + 4], version);
+                prefetch_lookup_packet(runtime, indices[offset + 5], version);
+                prefetch_lookup_packet(runtime, indices[offset + 6], version);
+                prefetch_lookup_packet(runtime, indices[offset + 7], version);
+            }
+            nexts[offset] = lookup_index(runtime, indices[offset], version);
+            nexts[offset + 1] = lookup_index(runtime, indices[offset + 1], version);
+            nexts[offset + 2] = lookup_index(runtime, indices[offset + 2], version);
+            nexts[offset + 3] = lookup_index(runtime, indices[offset + 3], version);
+            offset += 4;
+        }
+    }
+    while offset + 2 <= count {
+        if offset + 4 <= count {
+            prefetch_lookup_packet(runtime, indices[offset + 2], version);
+            prefetch_lookup_packet(runtime, indices[offset + 3], version);
+        }
+        nexts[offset] = lookup_index(runtime, indices[offset], version);
+        nexts[offset + 1] = lookup_index(runtime, indices[offset + 1], version);
+        offset += 2;
+    }
+    if offset < count {
+        nexts[offset] = lookup_index(runtime, indices[offset], version);
+    }
+    runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
+}
+
+#[inline(always)]
+fn prefetch_lookup_packet(runtime: &DataPlaneMain, index: u32, version: IpVersion) {
+    let header_len = match version {
+        IpVersion::V4 => core::mem::size_of::<Ipv4Header>(),
+        IpVersion::V6 => core::mem::size_of::<Ipv6Header>(),
+    };
+    runtime.prefetch_header(index);
+    let packet = runtime.buffer(index).current();
+    hammer_infra::prefetch::prefetch_read_l1_bytes(packet.as_ptr(), header_len);
 }
 
 const IP_FLOW_HASH_SRC_ADDR: u16 = 1 << 0;
@@ -1133,15 +1179,46 @@ fn process_load_balance_v6(
     processed_vectors
 }
 
+#[inline(always)]
 fn process_load_balance_frame(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
 ) {
-    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        load_balance_index(runtime, index, version)
-    })
+    let count = frame.len();
+    let indices = frame.vector_args();
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut offset = 0;
+
+    if matches!(version, IpVersion::V4) {
+        while offset + 4 <= count {
+            if offset + 8 <= count {
+                prefetch_lookup_packet(runtime, indices[offset + 4], version);
+                prefetch_lookup_packet(runtime, indices[offset + 5], version);
+                prefetch_lookup_packet(runtime, indices[offset + 6], version);
+                prefetch_lookup_packet(runtime, indices[offset + 7], version);
+            }
+            nexts[offset] = load_balance_index(runtime, indices[offset], version);
+            nexts[offset + 1] = load_balance_index(runtime, indices[offset + 1], version);
+            nexts[offset + 2] = load_balance_index(runtime, indices[offset + 2], version);
+            nexts[offset + 3] = load_balance_index(runtime, indices[offset + 3], version);
+            offset += 4;
+        }
+    }
+    while offset + 2 <= count {
+        if offset + 4 <= count {
+            prefetch_lookup_packet(runtime, indices[offset + 2], version);
+            prefetch_lookup_packet(runtime, indices[offset + 3], version);
+        }
+        nexts[offset] = load_balance_index(runtime, indices[offset], version);
+        nexts[offset + 1] = load_balance_index(runtime, indices[offset + 1], version);
+        offset += 2;
+    }
+    if offset < count {
+        nexts[offset] = load_balance_index(runtime, indices[offset], version);
+    }
+    runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
 }
 
 #[inline(always)]

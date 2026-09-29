@@ -1,9 +1,8 @@
-use hammer_core::data_plane::{BufferPacketCursor, Frame};
+use hammer_core::data_plane::{BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame};
 use hammer_infra::checksum::internet_checksum;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
-    unlikely,
+    DataPlaneMain, Node, TraceFormatter, add_packet_trace, format_packet_trace, unlikely,
 };
 
 use crate::ip::{IpInputError, IpInputTarget, IpProtocol, IpVersion};
@@ -13,7 +12,6 @@ use crate::protocol::ip::{
     Ipv6FragmentHeader, Ipv6Header,
 };
 use crate::protocol::ip_ecn::IpEcnCodepoint;
-use hammer_service::data_plane::set_index_node_error;
 use hammer_service::feature::FeatureMain;
 use hammer_service::opaque::NetworkOpaque;
 use zerocopy::FromBytes;
@@ -74,12 +72,9 @@ impl Node for Ip4InputNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            ip_input_process_frame(runtime, node_runtime, frame, IpVersion::V4);
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        ip_input_process_frame(runtime, node_runtime, frame, IpVersion::V4);
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -93,12 +88,9 @@ impl Node for Ip6InputNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            ip_input_process_frame(runtime, node_runtime, frame, IpVersion::V6);
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        ip_input_process_frame(runtime, node_runtime, frame, IpVersion::V6);
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -112,33 +104,131 @@ fn ip_input_process_frame(
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
-) -> () {
-    let mut nexts = Vec::with_capacity(frame.len());
-    let drop_slot = match version {
-        IpVersion::V4 => Ip4InputNext::Drop.slot() as u16,
-        IpVersion::V6 => Ip6InputNext::Drop.slot() as u16,
-    };
-    for index in frame.vector_args() {
-        let slot = match next_slot_for_index(runtime, *index, version) {
-            Ok(slot) => slot,
-            Err(_) => drop_slot,
-        };
-        nexts.push(slot);
+) {
+    let count = frame.len();
+    let indices = frame.vector_args();
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut errors = [IpInputError::None; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut offset = 0;
+
+    // VPP ip4_input_inline processes four buffers when the prefetch pipeline
+    // is available. The two-buffer path is also used by ip6-input.
+    if matches!(version, IpVersion::V4) {
+        while offset + 4 <= count {
+            if offset + 12 <= count {
+                runtime.prefetch_header(indices[offset + 8]);
+                runtime.prefetch_header(indices[offset + 9]);
+                runtime.prefetch_header(indices[offset + 10]);
+                runtime.prefetch_header(indices[offset + 11]);
+                prefetch_input_data(runtime, indices[offset + 4], version);
+                prefetch_input_data(runtime, indices[offset + 5], version);
+                prefetch_input_data(runtime, indices[offset + 6], version);
+                prefetch_input_data(runtime, indices[offset + 7], version);
+            }
+            process_input_packet(
+                runtime,
+                indices[offset],
+                version,
+                &mut nexts[offset],
+                &mut errors[offset],
+            )
+            .expect("IP input graph state is initialized");
+            process_input_packet(
+                runtime,
+                indices[offset + 1],
+                version,
+                &mut nexts[offset + 1],
+                &mut errors[offset + 1],
+            )
+            .expect("IP input graph state is initialized");
+            process_input_packet(
+                runtime,
+                indices[offset + 2],
+                version,
+                &mut nexts[offset + 2],
+                &mut errors[offset + 2],
+            )
+            .expect("IP input graph state is initialized");
+            process_input_packet(
+                runtime,
+                indices[offset + 3],
+                version,
+                &mut nexts[offset + 3],
+                &mut errors[offset + 3],
+            )
+            .expect("IP input graph state is initialized");
+            offset += 4;
+        }
     }
-    runtime.enqueue_to_next(node_runtime, frame, nexts.as_slice());
-    ()
+
+    while offset + 2 <= count {
+        if offset + 6 <= count {
+            runtime.prefetch_header(indices[offset + 4]);
+            runtime.prefetch_header(indices[offset + 5]);
+            prefetch_input_data(runtime, indices[offset + 2], version);
+            prefetch_input_data(runtime, indices[offset + 3], version);
+        }
+        process_input_packet(
+            runtime,
+            indices[offset],
+            version,
+            &mut nexts[offset],
+            &mut errors[offset],
+        )
+        .expect("IP input graph state is initialized");
+        process_input_packet(
+            runtime,
+            indices[offset + 1],
+            version,
+            &mut nexts[offset + 1],
+            &mut errors[offset + 1],
+        )
+        .expect("IP input graph state is initialized");
+        offset += 2;
+    }
+
+    if offset < count {
+        process_input_packet(
+            runtime,
+            indices[offset],
+            version,
+            &mut nexts[offset],
+            &mut errors[offset],
+        )
+        .expect("IP input graph state is initialized");
+    }
+
+    finish_input_errors(runtime, indices, &errors[..count]);
+    runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
 }
 
 #[inline(always)]
-fn next_slot_for_index(
+fn input_drop_slot(version: IpVersion) -> u16 {
+    match version {
+        IpVersion::V4 => Ip4InputNext::Drop.slot() as u16,
+        IpVersion::V6 => Ip6InputNext::Drop.slot() as u16,
+    }
+}
+
+#[inline(always)]
+fn prefetch_input_data(runtime: &DataPlaneMain, index: u32, version: IpVersion) {
+    let header_len = match version {
+        IpVersion::V4 => IPV4_HEADER_MIN_LEN,
+        IpVersion::V6 => IPV6_HEADER_LEN,
+    };
+    let packet = runtime.buffer(index).current();
+    hammer_infra::prefetch::prefetch_read_l1_bytes(packet.as_ptr(), header_len);
+}
+
+#[inline(always)]
+fn process_input_packet(
     runtime: &mut DataPlaneMain,
     index: u32,
     version: IpVersion,
-) -> RuntimeResult<u16> {
-    let drop_next = match version {
-        IpVersion::V4 => Ip4InputNext::Drop.slot() as u16,
-        IpVersion::V6 => Ip6InputNext::Drop.slot() as u16,
-    };
+    next: &mut u16,
+    packet_error: &mut IpInputError,
+) -> RuntimeResult<()> {
+    let drop_next = input_drop_slot(version);
     let (traced, classification, ip_ecn) = {
         let buffer = runtime.buffer(index);
         (
@@ -159,7 +249,7 @@ fn next_slot_for_index(
         transport_header_offset,
     ) = match classification {
         Err(_) => {
-            set_index_node_error(runtime, index, IpInputError::BadLength)?;
+            runtime.buffer_mut(index).clear_node_error();
             if unlikely(traced) {
                 let _ = add_packet_trace!(
                     runtime,
@@ -174,24 +264,15 @@ fn next_slot_for_index(
                     },
                 );
             }
-            return Ok(drop_next);
+            *next = drop_next;
+            *packet_error = IpInputError::BadLength;
+            return Ok(());
         }
         Ok(classification) => classification,
     };
-    // Resolve the Node error before borrowing the packet mutably. The Buffer
-    // borrow must not overlap another access through its owning DataPlaneMain.
-    let error = if input_error == IpInputError::None {
-        None
-    } else {
-        Some(runtime.record_current_node_error(input_error)?)
-    };
     {
         let buffer = runtime.buffer_mut(index);
-        if let Some(error) = error {
-            buffer.set_node_error_index(error);
-        } else {
-            buffer.clear_node_error();
-        }
+        buffer.clear_node_error();
         let sw_if_index = hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
         let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
         network.set_packet_cursor(
@@ -296,7 +377,49 @@ fn next_slot_for_index(
             },
         );
     }
-    Ok(resolved)
+    *next = resolved;
+    *packet_error = input_error;
+    Ok(())
+}
+
+#[inline(always)]
+fn finish_input_errors(
+    runtime: &mut DataPlaneMain,
+    indices: &[u32],
+    errors: &[IpInputError],
+) {
+    const INPUT_ERRORS: [IpInputError; 9] = [
+        IpInputError::None,
+        IpInputError::Version,
+        IpInputError::HeaderTooShort,
+        IpInputError::Options,
+        IpInputError::BadChecksum,
+        IpInputError::TimeExpired,
+        IpInputError::FragmentOffsetOne,
+        IpInputError::TooShort,
+        IpInputError::BadLength,
+    ];
+    let mut counts = [0u64; INPUT_ERRORS.len()];
+    for &error in errors {
+        if error != IpInputError::None {
+            counts[error.code() as usize] += 1;
+        }
+    }
+    let mut indexes = [None; INPUT_ERRORS.len()];
+    for (code, &error) in INPUT_ERRORS.iter().enumerate().skip(1) {
+        if counts[code] != 0 {
+            indexes[code] = Some(
+                runtime
+                    .record_current_node_error_count(error, counts[code])
+                    .expect("IP input node error registry remains installed"),
+            );
+        }
+    }
+    for (&index, &error) in indices.iter().zip(errors) {
+        if let Some(error_index) = indexes[error.code() as usize] {
+            runtime.buffer_mut(index).set_node_error_index(error_index);
+        }
+    }
 }
 
 #[inline(always)]

@@ -1,7 +1,7 @@
 use std::mem::{align_of, offset_of, size_of};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hammer_core::data_plane::{Frame, NodeId, NodeNext};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::{DataPlaneMain, Node, NodeRuntime, RuntimeResult};
 use hammer_service::feature::FeatureMain;
@@ -1609,8 +1609,71 @@ impl_ip4_resolution_node!(Ip4IncompleteNode, DpoType::ADJACENCY_INCOMPLETE, fals
 impl_ip6_resolution_node!(Ip6GleanNode, DpoType::ADJACENCY_GLEAN, true);
 impl_ip6_resolution_node!(Ip6IncompleteNode, DpoType::ADJACENCY_INCOMPLETE, false);
 
+#[inline(always)]
+fn prefetch_rewrite_packet(runtime: &DataPlaneMain, index: u32, version: IpNetLink) {
+    let packet = runtime.buffer(index).current();
+    let data = packet.as_ptr();
+    hammer_infra::prefetch::prefetch_write_l1(data.wrapping_sub(hammer_infra::align::CACHE_LINE));
+    match version {
+        IpNetLink::Ip4 => hammer_infra::prefetch::prefetch_read_l1(data),
+        IpNetLink::Ip6 => hammer_infra::prefetch::prefetch_write_l1_bytes(
+            data,
+            core::mem::size_of::<Ipv6Header>(),
+        ),
+    }
+}
+
+#[inline(always)]
+fn process_rewrite_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+    version: IpNetLink,
+) {
+    let count = frame.len();
+    let indices = frame.vector_args();
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut offset = 0;
+    if version == IpNetLink::Ip4 && count >= 6 {
+        runtime.prefetch_header(indices[2]);
+        runtime.prefetch_header(indices[3]);
+        runtime.prefetch_header(indices[4]);
+        runtime.prefetch_header(indices[5]);
+    }
+    while offset + 2 <= count {
+        if offset + 4 <= count {
+            if version == IpNetLink::Ip6 {
+                runtime.prefetch_header(indices[offset + 2]);
+                runtime.prefetch_header(indices[offset + 3]);
+            }
+            prefetch_rewrite_packet(runtime, indices[offset + 2], version);
+            prefetch_rewrite_packet(runtime, indices[offset + 3], version);
+        }
+        if version == IpNetLink::Ip4 && offset + 8 <= count {
+            runtime.prefetch_header(indices[offset + 6]);
+            runtime.prefetch_header(indices[offset + 7]);
+        }
+        nexts[offset] = match version {
+            IpNetLink::Ip4 => rewrite_ip4_buffer(runtime, indices[offset]),
+            IpNetLink::Ip6 => rewrite_ip6_buffer(runtime, indices[offset]),
+        };
+        nexts[offset + 1] = match version {
+            IpNetLink::Ip4 => rewrite_ip4_buffer(runtime, indices[offset + 1]),
+            IpNetLink::Ip6 => rewrite_ip6_buffer(runtime, indices[offset + 1]),
+        };
+        offset += 2;
+    }
+    if offset < count {
+        nexts[offset] = match version {
+            IpNetLink::Ip4 => rewrite_ip4_buffer(runtime, indices[offset]),
+            IpNetLink::Ip6 => rewrite_ip6_buffer(runtime, indices[offset]),
+        };
+    }
+    runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
+}
+
 macro_rules! impl_rewrite_node {
-    ($node:ident, $rewrite:ident) => {
+    ($node:ident, $version:expr) => {
         impl Node for $node {
             fn process(
                 runtime: &mut DataPlaneMain,
@@ -1618,14 +1681,12 @@ macro_rules! impl_rewrite_node {
                 frame: &mut Frame,
             ) -> usize {
                 let count = frame.len();
-                hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-                    $rewrite(runtime, index)
-                });
+                process_rewrite_frame(runtime, node_runtime, frame, $version);
                 count
             }
         }
     };
-    ($node:ident, $rewrite:ident, runtime_data) => {
+    ($node:ident, $version:expr, runtime_data) => {
         impl Node for $node {
             fn process(
                 runtime: &mut DataPlaneMain,
@@ -1633,9 +1694,7 @@ macro_rules! impl_rewrite_node {
                 frame: &mut Frame,
             ) -> usize {
                 let count = frame.len();
-                hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-                    $rewrite(runtime, index)
-                });
+                process_rewrite_frame(runtime, node_runtime, frame, $version);
                 count
             }
 
@@ -1646,10 +1705,10 @@ macro_rules! impl_rewrite_node {
     };
 }
 
-impl_rewrite_node!(Ip4RewriteNode, rewrite_ip4_buffer, runtime_data);
-impl_rewrite_node!(Ip6RewriteNode, rewrite_ip6_buffer, runtime_data);
-impl_rewrite_node!(Ip4RewriteMcastNode, rewrite_ip4_buffer, runtime_data);
-impl_rewrite_node!(Ip6RewriteMcastNode, rewrite_ip6_buffer, runtime_data);
+impl_rewrite_node!(Ip4RewriteNode, IpNetLink::Ip4, runtime_data);
+impl_rewrite_node!(Ip6RewriteNode, IpNetLink::Ip6, runtime_data);
+impl_rewrite_node!(Ip4RewriteMcastNode, IpNetLink::Ip4, runtime_data);
+impl_rewrite_node!(Ip6RewriteMcastNode, IpNetLink::Ip6, runtime_data);
 
 impl Node for Ip4FragmentNode {
     fn process(

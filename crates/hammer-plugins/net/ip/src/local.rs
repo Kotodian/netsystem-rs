@@ -2,14 +2,15 @@ use std::hash::Hasher;
 use std::net::IpAddr;
 
 use crate::protocol::ip::{Ipv4Header, Ipv6Header};
-use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
+use hammer_core::data_plane::{
+    BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext,
+};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
+    DataPlaneMain, Node, TraceFormatter, add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::data_plane::set_index_node_error;
 use hammer_service::feature::FeatureMain;
 use hammer_service::net::{DpoType, NetMain};
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
@@ -140,18 +141,15 @@ impl Node for Ip4LocalNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            process_frame(
-                runtime,
-                node_runtime,
-                frame,
-                LocalStage::Head,
-                IpVersion::V4,
-            );
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        process_frame(
+            runtime,
+            node_runtime,
+            frame,
+            LocalStage::Head,
+            IpVersion::V4,
+        );
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -201,18 +199,15 @@ impl Node for Ip4ReceiveNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            process_frame(
-                runtime,
-                node_runtime,
-                frame,
-                LocalStage::Receive,
-                IpVersion::V4,
-            );
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        process_frame(
+            runtime,
+            node_runtime,
+            frame,
+            LocalStage::Receive,
+            IpVersion::V4,
+        );
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -238,12 +233,9 @@ impl Node for Ip4LocalEndOfArcNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            process_frame(runtime, node_runtime, frame, LocalStage::End, IpVersion::V4);
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        process_frame(runtime, node_runtime, frame, LocalStage::End, IpVersion::V4);
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -304,18 +296,15 @@ impl Node for Ip6LocalNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            process_frame(
-                runtime,
-                node_runtime,
-                frame,
-                LocalStage::Head,
-                IpVersion::V6,
-            );
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        process_frame(
+            runtime,
+            node_runtime,
+            frame,
+            LocalStage::Head,
+            IpVersion::V6,
+        );
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -365,18 +354,15 @@ impl Node for Ip6ReceiveNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            process_frame(
-                runtime,
-                node_runtime,
-                frame,
-                LocalStage::Receive,
-                IpVersion::V6,
-            );
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        process_frame(
+            runtime,
+            node_runtime,
+            frame,
+            LocalStage::Receive,
+            IpVersion::V6,
+        );
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -402,12 +388,9 @@ impl Node for Ip6LocalEndOfArcNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, node_runtime, frame| {
-            let processed_vectors = frame.len();
-            process_frame(runtime, node_runtime, frame, LocalStage::End, IpVersion::V6);
-            processed_vectors
-        };
-        process(runtime, node_runtime, frame)
+        let processed_vectors = frame.len();
+        process_frame(runtime, node_runtime, frame, LocalStage::End, IpVersion::V6);
+        processed_vectors
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
@@ -480,16 +463,135 @@ fn process_frame(
     frame: &mut Frame,
     stage: LocalStage,
     version: IpVersion,
-) -> () {
-    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        match process_index(runtime, index, stage, version) {
-            Ok(slot) => slot,
-            Err(_) => match version {
-                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
-                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-            },
+) {
+    let count = frame.len();
+    let indices = frame.vector_args();
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut errors = [None; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let drop_next = match version {
+        IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+        IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+    };
+    let mut offset = 0;
+
+    while offset + 2 <= count {
+        if offset + 6 <= count {
+            match version {
+                IpVersion::V4 => {
+                    runtime.prefetch_header(indices[offset + 4]);
+                    runtime.prefetch_header(indices[offset + 5]);
+                    prefetch_local_packet(runtime, indices[offset + 4]);
+                    prefetch_local_packet(runtime, indices[offset + 5]);
+                }
+                IpVersion::V6 => {
+                    runtime.prefetch_header_write(indices[offset + 4]);
+                    runtime.prefetch_header_write(indices[offset + 5]);
+                    prefetch_local_packet(runtime, indices[offset + 2]);
+                    prefetch_local_packet(runtime, indices[offset + 3]);
+                }
+            }
         }
-    })
+        process_local_packet(
+            runtime,
+            indices[offset],
+            stage,
+            version,
+            &mut nexts[offset],
+            &mut errors[offset],
+            drop_next,
+        );
+        process_local_packet(
+            runtime,
+            indices[offset + 1],
+            stage,
+            version,
+            &mut nexts[offset + 1],
+            &mut errors[offset + 1],
+            drop_next,
+        );
+        offset += 2;
+    }
+
+    if offset < count {
+        process_local_packet(
+            runtime,
+            indices[offset],
+            stage,
+            version,
+            &mut nexts[offset],
+            &mut errors[offset],
+            drop_next,
+        );
+    }
+
+    finish_local_errors(runtime, indices, &errors[..count]);
+    runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
+}
+
+#[inline(always)]
+fn prefetch_local_packet(runtime: &DataPlaneMain, index: u32) {
+    let packet = runtime.buffer(index).current();
+    hammer_infra::prefetch::prefetch_read_l1(packet.as_ptr());
+}
+
+#[inline(always)]
+fn process_local_packet(
+    runtime: &mut DataPlaneMain,
+    index: u32,
+    stage: LocalStage,
+    version: IpVersion,
+    next: &mut u16,
+    error: &mut Option<IpLocalError>,
+    drop_next: u16,
+) {
+    runtime.buffer_mut(index).clear_node_error();
+    match process_index(runtime, index, stage, version) {
+        Ok((resolved, local_error)) => {
+            *next = resolved;
+            *error = local_error;
+        }
+        Err(_) => {
+            *next = drop_next;
+            *error = None;
+        }
+    }
+}
+
+#[inline(always)]
+fn finish_local_errors(
+    runtime: &mut DataPlaneMain,
+    indices: &[u32],
+    errors: &[Option<IpLocalError>],
+) {
+    const LOCAL_ERRORS: [IpLocalError; 6] = [
+        IpLocalError::BadLength,
+        IpLocalError::BadTransportHeader,
+        IpLocalError::BadChecksum,
+        IpLocalError::UnknownProtocol,
+        IpLocalError::SourceLookupMiss,
+        IpLocalError::SpoofedLocalPacket,
+    ];
+    let mut counts = [0u64; LOCAL_ERRORS.len()];
+    for error in errors.iter().flatten() {
+        counts[error.code() as usize] += 1;
+    }
+    let mut indexes = [None; LOCAL_ERRORS.len()];
+    for (code, &error) in LOCAL_ERRORS.iter().enumerate() {
+        if counts[code] != 0 {
+            indexes[code] = Some(
+                runtime
+                    .record_current_node_error_count(error, counts[code])
+                    .expect("IP local node error registry remains installed"),
+            );
+        }
+    }
+    for (&index, error) in indices.iter().zip(errors) {
+        if let Some(error) = *error
+            && let Some(error_index) = indexes[error.code() as usize]
+        {
+            runtime.buffer_mut(index).set_node_error_index(error_index);
+        }
+    }
 }
 
 #[inline(always)]
@@ -498,7 +600,7 @@ fn process_index(
     index: u32,
     stage: LocalStage,
     version: IpVersion,
-) -> RuntimeResult<u16> {
+) -> RuntimeResult<(u16, Option<IpLocalError>)> {
     let buffer = runtime.buffer(index);
     let current = buffer.current();
     let mut network = *hammer_core::buffer_opaque!(buffer => NetworkOpaque);
@@ -522,11 +624,10 @@ fn process_index(
     let header_offset = network.packet_cursor().network_header_offset();
     let cursor = network.packet_cursor();
     if cursor.packet_len() == 0 {
-        set_index_node_error(runtime, index, IpLocalError::BadLength)?;
-        return Ok(match version {
+        return Ok((match version {
             IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
             IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-        });
+        }, Some(IpLocalError::BadLength)));
     }
     let (protocol, source, destination) = match version {
         IpVersion::V4 => {
@@ -539,7 +640,7 @@ fn process_index(
                 return Err(crate::protocol::ip::IpInputError::Version.into());
             }
             if matches!(stage, LocalStage::End) && header.flags_fragment() & 0x3fff != 0 {
-                return Ok(NodeNext::slot(Ip4LocalNext::Reassembly));
+                return Ok((NodeNext::slot(Ip4LocalNext::Reassembly), None));
             }
             (
                 IpProtocol::from(header.protocol()),
@@ -590,7 +691,7 @@ fn process_index(
         }
     };
     if matches!(stage, LocalStage::End) {
-        return Ok(protocol_next);
+        return Ok((protocol_next, None));
     }
     let first_len = current.len().min(cursor.packet_len());
     let packet = current
@@ -604,7 +705,6 @@ fn process_index(
             transport
         }
         _ => {
-            set_index_node_error(runtime, index, IpLocalError::BadLength)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
@@ -621,7 +721,7 @@ fn process_index(
                     next: resolved,
                 },
             );
-            return Ok(resolved);
+            return Ok((resolved, Some(IpLocalError::BadLength)));
         }
     };
 
@@ -633,7 +733,6 @@ fn process_index(
     ) {
         Ok(transport_len) => transport_len,
         Err(error) => {
-            set_index_node_error(runtime, index, error)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
@@ -650,7 +749,7 @@ fn process_index(
                     next: resolved,
                 },
             );
-            return Ok(resolved);
+            return Ok((resolved, Some(error)));
         }
     };
     let checksum_required = match protocol {
@@ -688,11 +787,10 @@ fn process_index(
             .set(NetworkFlags::L4_CHECKSUM_CORRECT, checksum_correct);
     }
     if checksum_required && !checksum_correct {
-        set_index_node_error(runtime, index, IpLocalError::BadChecksum)?;
-        return Ok(match version {
+        return Ok((match version {
             IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
             IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-        });
+        }, Some(IpLocalError::BadChecksum)));
     }
     let net = NetMain::global()?;
     let source_error = match (source, destination) {
@@ -745,11 +843,10 @@ fn process_index(
         _ => None,
     };
     if let Some(error) = source_error {
-        set_index_node_error(runtime, index, error)?;
-        return Ok(match version {
+        return Ok((match version {
             IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
             IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-        });
+        }, Some(error)));
     }
     refresh_basic_metadata(runtime, index, cursor, transport_len)?;
 
@@ -779,19 +876,18 @@ fn process_index(
             .rx_sw_if_index = interface_index;
         let resolved =
             features.start_feature_arc(arc_index, interface_index, &mut buffer, protocol_next);
-        return Ok(resolved);
+        return Ok((resolved, None));
     }
 
     let resolved = protocol_next;
-    let error = if resolved
+    let local_error = if resolved
         == match version {
             IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Punt),
             IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Punt),
         }
         && matches!(protocol, IpProtocol::Other(_))
     {
-        set_index_node_error(runtime, index, IpLocalError::UnknownProtocol)?;
-        Some(IpLocalError::UnknownProtocol.code())
+        Some(IpLocalError::UnknownProtocol)
     } else {
         None
     };
@@ -803,11 +899,11 @@ fn process_index(
             version: Some(version),
             protocol: Some(protocol),
             transport_header_len: transport_len.unwrap_or_default(),
-            error,
+            error: local_error.map(IpLocalError::code),
             next: resolved,
         },
     );
-    Ok(resolved)
+    Ok((resolved, local_error))
 }
 
 #[inline(always)]
@@ -1084,8 +1180,14 @@ pub(crate) mod tests {
                     crate::protocol::icmp::IcmpErrorMetadata::ipv4_time_exceeded()
                         .write(hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque));
                 }
-                let next = runtime.with_current_node(receive, |runtime| {
-                    process_index(runtime, index, LocalStage::Receive, version)
+                let (next, _) = runtime.with_current_node(receive, |runtime| {
+                    let (next, error) =
+                        process_index(runtime, index, LocalStage::Receive, version)?;
+                    if let Some(error) = error {
+                        let error_index = runtime.record_current_node_error(error)?;
+                        runtime.buffer_mut(index).set_node_error_index(error_index);
+                    }
+                    Ok::<_, RuntimeError>((next, error))
                 })?;
                 let buffer = runtime.buffer(index);
                 let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
