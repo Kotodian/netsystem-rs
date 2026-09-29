@@ -8,7 +8,7 @@ use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{TcpInputNext, TcpNodeError, write_session_route_opaque};
 use hammer_service::opaque::NetworkOpaque;
-use hammer_service::session::{SessionHandle, SessionWorker};
+use hammer_service::session::{SessionHandle, SessionLookup, SessionWorker};
 
 const TCP_LISTENER_BACKLOG: usize = 128;
 
@@ -617,7 +617,9 @@ impl<'a> TcpListener<'a> {
             !closed,
             "accepted TCP child is not closed before publication"
         );
-        self.ip_session.publish(connection_id, session)?;
+        self.ip_session
+            .lookup_main()
+            .add_connection(&connection_id, session.into());
         self.finish_pending(packet);
         Ok(Some(session))
     }

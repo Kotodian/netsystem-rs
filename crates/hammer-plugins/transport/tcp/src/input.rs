@@ -34,7 +34,7 @@ struct TcpInputDispatch {
 impl NodeNext for TcpInputDispatch {
     #[inline(always)]
     fn slot(self) -> u16 {
-        self.next.slot()
+        u16::try_from(self.next.slot()).expect("TCP input next slot fits u16")
     }
 }
 
@@ -652,11 +652,13 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
         };
         let state = if let Some(connection_index) = connection_index {
             let worker = main.worker(runtime.thread_index())?;
-            worker.connection(connection_index).map(|connection| connection.state())
+            worker
+                .connection(connection_index)
+                .map(|connection| (connection_index, connection.state()))
         } else {
             None
         };
-        let Some(state) = state else {
+        let Some((connection_index, state)) = state else {
             return resolve_error_next_with_runtime(
                 runtime,
                 index,

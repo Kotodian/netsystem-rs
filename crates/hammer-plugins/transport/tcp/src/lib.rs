@@ -53,7 +53,7 @@ use thiserror::Error;
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_plugin_session::{
-    IpSessionEndpoint, IpSessionMain, IpTransportConnectionId, IpTransportEndpoint,
+    IpSessionEndpoint, IpTransportConnectionId, IpTransportEndpoint,
     IpTransportEndpointConfig, IpTransportMain,
 };
 use hammer_service::session::node::SessionQueueNode;
@@ -271,18 +271,6 @@ impl TcpMain {
         if let Some(index) = index {
             listeners.remove(index);
         }
-    }
-
-    pub fn publish_connection(
-        &self,
-        sessions: &IpSessionMain,
-        worker_index: u32,
-        connection_index: u32,
-    ) -> Result<(), SessionError> {
-        let Some(connection) = self.connection(connection_index, worker_index) else {
-            return Err(SessionError::NoSession);
-        };
-        sessions.publish(connection.base.endpoint, connection.base.session)
     }
 }
 
@@ -1190,7 +1178,7 @@ fn tcp_session_update_time(
                 .expect("expired TCP timer retains its connection");
             let sequence = connection.tx_intent_sequence
                 .expect("payload retransmit timer selected its sequence");
-            let offset = connection.snd_una().distance_to(sequence);
+            let offset = TcpSeq::from(connection.snd_una()).distance_to(sequence);
             let length = connection.tx_intent_payload_len.min(connection.send_mss);
             let written = worker.prepare_segment(
                 runtime, sessions, token.index, offset, length, true,

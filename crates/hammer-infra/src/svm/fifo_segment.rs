@@ -902,7 +902,7 @@ impl SvmFifoSegment {
         }
     }
 
-    pub fn fifo(&mut self, slice: u32, fifo: u32) -> Option<&Fifo> {
+    pub fn fifo(&self, slice: u32, fifo: u32) -> Option<&Fifo> {
         self.slices.get(slice as usize)?.fifos.get(fifo)
     }
 

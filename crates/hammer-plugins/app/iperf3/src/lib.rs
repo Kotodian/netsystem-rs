@@ -14,8 +14,8 @@ pub use protocol::{
 hammer_component_macros::declare_plugin!(
     name = "iperf3",
     load_after = ["session", "tcp"],
-    init_functions = [__INIT_FN_IPERF3_INIT],
-    config_functions = [__CONFIG_FN_IPERF3_CONFIG],
+    init_functions = [main::__INIT_FN_IPERF3_INIT],
+    config_functions = [main::__CONFIG_FN_IPERF3_CONFIG],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [],

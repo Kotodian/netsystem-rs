@@ -631,7 +631,7 @@ impl TcpRecoveryState {
     pub(crate) fn commit_retransmit(&mut self, sequence: TcpSeq, sent_at: Instant) {
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
-            let sample = *self.sent_sample(index)
+            let sample = self.sent_sample(index)
                 .expect("retransmit sample remains in the connection pool");
             cursor = sample.next;
             if sample.sequence != sequence {
@@ -666,7 +666,7 @@ impl TcpRecoveryState {
         if let Some((start, retransmit_end)) = retransmitted {
             let mut cursor = self.sample_head;
             while let Some(index) = cursor {
-                let sample = *self.sent_sample(index)
+                let sample = self.sent_sample(index)
                     .expect("TLP sample remains allocated during probe publication");
                 cursor = sample.next;
                 if sample.overlaps(start, retransmit_end) {

@@ -1956,7 +1956,8 @@ impl SessionWorker {
 
     /// VPP: session.c:657-680, `session_dequeue_notify`.
     fn notify_tx_dequeue(&mut self, runtime: &DataPlaneMain, handle: SessionHandle) {
-        let session = self.session_from_handle(handle)
+        assert_eq!(handle.worker_index, self.worker_index);
+        let session = self.sessions.get(handle.session_index)
             .expect("dequeue notification retains its Session");
         let Some(index) = session.application_worker() else {
             return;
@@ -2028,7 +2029,10 @@ impl SessionWorker {
     /// VPP: `session_enqueue_notify_inline`, session.c:626-648.
     #[inline(always)]
     fn queue_rx_notification(&mut self, handle: SessionHandle, is_connectionless: bool) -> Option<u32> {
-        let session = self.session_from_handle(handle)?;
+        if handle.worker_index != self.worker_index {
+            return None;
+        }
+        let session = self.sessions.get(handle.session_index)?;
         let app_worker_index = session.application_worker()?;
         let application = ApplicationMain::global()
             .expect("Application Main initializes before Session RX notification");
@@ -2036,9 +2040,6 @@ impl SessionWorker {
         // event slot; detach waits for WorkerBarrier before removing it.
         let app_worker = unsafe { application.worker(app_worker_index) }
             .expect("an attached Session retains its AppWorker");
-        let session = self
-            .session_from_handle(handle)
-            .expect("RX notification retains its Session");
         self.program_io_event(
             app_worker,
             session,

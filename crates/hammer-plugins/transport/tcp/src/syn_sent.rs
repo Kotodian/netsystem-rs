@@ -291,16 +291,20 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             } else {
                 *error = Some(TcpNodeError::SegmentOld);
             }
+            let local_capabilities = tcp
+                .lookup
+                .pending_open_capabilities(session_id)
+                .unwrap_or_default();
             let connection = tcp
                 .connections
-                .get(connection_index)
+                .get_mut(connection_index)
                 .expect("SYN-ACK input retains its TCP connection");
             control = Some(connection.control_segment(
                 packet.local,
                 packet.remote,
                 crate::TcpSegmentFlags::ACK,
                 None,
-                tcp.lookup.pending_open_capabilities(session_id).unwrap_or_default(),
+                local_capabilities,
             ));
             keep_current = false;
         };

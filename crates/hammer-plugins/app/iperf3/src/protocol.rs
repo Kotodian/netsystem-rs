@@ -239,7 +239,7 @@ impl ControlParser {
 
     #[inline(always)]
     pub fn state_bytes(value: ControlState) -> [u8; CONTROL_STATE_SIZE] {
-        StateRecord { value: value as u8 }.to_bytes()
+        [value as u8]
     }
 }
 

@@ -190,7 +190,8 @@ impl TcpWorker {
             .expect("custom TX retains the TCP connection");
         let pending = usize::from(connection.pending_dupacks);
         if pending == 0 {
-            let outstanding = connection.snd_una.distance_to(connection.snd_nxt) as usize;
+            let outstanding =
+                TcpSeq::from(connection.snd_una()).distance_to(connection.snd_nxt) as usize;
             let unsent = sessions.session_from_handle(connection.base.session)
                 .and_then(|session| session.tx_fifo())
                 .expect("custom TX retains its Session TX FIFO")
@@ -304,7 +305,8 @@ impl TcpWorker {
         let connection = self.connections.get_mut(connection_index)
             .expect("custom TX retains the TCP connection");
         if retransmit {
-            connection.tx_intent_sequence = Some(connection.snd_una.advance(offset));
+            connection.tx_intent_sequence =
+                Some(TcpSeq::from(connection.snd_una()).advance(offset));
         }
         let segment = connection.tx_segment(copied, TcpCapabilities::default())
             .expect("custom TX retains a data-capable TCP connection");
@@ -395,7 +397,9 @@ impl TcpWorker {
         let sack = connection.negotiated_options().sack;
         let no_sack_first = connection.recovery.no_sack_first_pending();
         let no_sack_end = connection.recovery.recovery_end_sequence();
-        let mut no_sack_sequence = connection.tx_intent_sequence.unwrap_or(connection.snd_una());
+        let mut no_sack_sequence = connection
+            .tx_intent_sequence
+            .unwrap_or(TcpSeq::from(connection.snd_una()));
         let handle = connection.base.session;
         let outstanding = connection.snd_nxt().wrapping_sub(connection.snd_una()) as usize;
         let available = sessions.session_from_handle(handle)
@@ -433,7 +437,7 @@ impl TcpWorker {
             } else {
                 no_sack_sequence
             });
-            let offset = connection.snd_una.distance_to(sequence);
+            let offset = TcpSeq::from(connection.snd_una()).distance_to(sequence);
             let remaining = sequence.distance_to(sample.end_sequence)
                 .min(if sack { u32::MAX } else { sequence.distance_to(no_sack_end) });
             let requested = remaining.min(send_mss).min(send_space);

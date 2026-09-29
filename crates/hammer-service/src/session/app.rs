@@ -523,7 +523,11 @@ impl<'segment> AppWorker<'segment> {
             let event = unsafe { (&*slot.get())[consumed] };
             let event_type = SessionEventType::try_from(event.event_type)
                 .expect("AppWorker received a registered Session event type");
-            let payload: [u64; 2] = event.into();
+            // VPP session_types.h:476-492: these fields overlay as_u64[2].
+            let payload = [
+                u64::from(event.session_index) | (u64::from(event.worker_index) << 32),
+                event.rpc_sequence,
+            ];
             let handle = if matches!(
                 event_type,
                 SessionEventType::BuiltinRx

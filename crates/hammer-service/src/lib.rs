@@ -69,7 +69,7 @@ hammer_runtime::__declare_registration_image!(
         binary_api::__INIT_FN_EXIT_BINARY_API,
     ];
     worker_init_functions = [
-        session::__INIT_FN_SESSION_WORKER_INIT,
+        session::core::__INIT_FN_SESSION_WORKER_INIT,
     ];
     num_workers_change_functions = [];
     api_init_functions = [vpe_api::__INIT_FN_VPE_API_HOOKUP];

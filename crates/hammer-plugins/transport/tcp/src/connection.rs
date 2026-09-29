@@ -389,6 +389,7 @@ impl TcpConnection {
                 endpoint,
                 pacer: Pacer::default(),
                 opaque: 0,
+                cacheline_end: CacheLineAlignMark,
             },
             cacheline0: TcpConnectionCacheline0 {
                 cacheline0: CacheLineAlignMark,
@@ -2010,8 +2011,9 @@ impl TcpConnection {
                         crate::active_tcp_policy().close_wait)?;
                 } else if self.fin_sent && self.snd_una == self.snd_nxt {
                     self.state = TcpState::TimeWait;
+                    let time_wait = self.time_wait;
                     timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                        self.time_wait)?;
+                        time_wait)?;
                 } else {
                     self.state = TcpState::Closing;
                     timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
@@ -2022,8 +2024,9 @@ impl TcpConnection {
                 self.rcv_nxt = self.rcv_nxt.advance(1);
                 self.fin_received = true;
                 self.state = TcpState::TimeWait;
+                let time_wait = self.time_wait;
                 timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    self.time_wait)?;
+                    time_wait)?;
             }
             _ => return Ok(None),
         }
