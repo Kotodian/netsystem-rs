@@ -5,9 +5,9 @@ use std::{sync::OnceLock, thread::ThreadId};
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
 
-use crate::config::WorkerScheduler;
+use crate::config::worker::WorkerScheduler;
 #[cfg(target_os = "linux")]
-use crate::config::{WorkerCpu, WorkerNuma};
+use crate::config::{CpuConfig, WorkerNuma};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::worker_thread::WorkerThread;
 use crate::DataWorkerId;
@@ -106,6 +106,8 @@ impl ThreadMain {
                 count: crate::config::worker::worker_count(),
             }
         })?;
+        let cpu = crate::config::worker::cpu();
+        let scheduler = WorkerScheduler::default();
         #[cfg(target_os = "linux")]
         {
             self.configure_fields(
@@ -113,8 +115,8 @@ impl ThreadMain {
                 crate::config::worker::stack_size(),
                 crate::config::worker::max_blocking_threads(),
                 crate::config::worker::idle_slice(),
-                crate::config::worker::cpu(),
-                crate::config::worker::scheduler(),
+                cpu,
+                &scheduler,
                 crate::config::worker::numa(),
             )
         }
@@ -125,7 +127,7 @@ impl ThreadMain {
                 crate::config::worker::stack_size(),
                 crate::config::worker::max_blocking_threads(),
                 crate::config::worker::idle_slice(),
-                crate::config::worker::scheduler(),
+                &scheduler,
             )
         }
     }
@@ -138,7 +140,7 @@ impl ThreadMain {
         stack_size: usize,
         max_blocking_threads: usize,
         idle_slice: Duration,
-        cpu: &WorkerCpu,
+        cpu: &CpuConfig,
         scheduler: &WorkerScheduler,
         numa: &WorkerNuma,
     ) -> RuntimeResult<()> {
@@ -148,13 +150,10 @@ impl ThreadMain {
         );
         let worker_count_usize = worker_count as usize;
         Self::validate_thread_fields(worker_count_usize, stack_size, max_blocking_threads)?;
-        cpu.validate(worker_count_usize)?;
+        cpu.validate()?;
         scheduler.validate()?;
         numa.validate()?;
-        let cores = self.worker_cpu_indices(worker_count_usize, cpu)?;
-        let main_cpu = cpu
-            .main_core
-            .or_else(|| usize::try_from(unsafe { libc::sched_getcpu() }).ok());
+        let (main_cpu, cores) = self.worker_cpu_indices(worker_count_usize, cpu)?;
         self.worker_threads.push(WorkerThread::new(
             0,
             "main",
@@ -168,7 +167,14 @@ impl ThreadMain {
             None,
             false,
         ));
-        for (slot, cpu_index) in cores.into_iter().enumerate() {
+        crate::worker_thread::apply_current_thread_setup(
+            0,
+            main_cpu.and_then(|cpu| u32::try_from(cpu).ok()),
+            main_cpu.map(crate::numa::node_for_cpu).transpose()?,
+            scheduler,
+            false,
+        )?;
+        for (slot, cpu_index) in cores.iter_set().enumerate() {
             let thread_index =
                 u32::try_from(slot + 1).map_err(|_| RuntimeError::WorkerCountOverflow {
                     count: worker_count_usize,
@@ -270,35 +276,70 @@ impl ThreadMain {
     }
 
     #[cfg(target_os = "linux")]
-    fn worker_cpu_indices(&self, count: usize, cpu: &WorkerCpu) -> RuntimeResult<Vec<usize>> {
+    fn worker_cpu_indices(
+        &self,
+        count: usize,
+        cpu: &CpuConfig,
+    ) -> RuntimeResult<(Option<usize>, Bitmap)> {
         let mut available = self.cpu_core_bitmap.clone();
-        for reserved in [cpu.main_core, cpu.app_core].into_iter().flatten() {
-            if !available.clear(reserved) {
-                return Err(RuntimeError::CpuUnavailable { cpu: reserved });
+        for _ in 0..cpu.skip_cores {
+            let skipped = available
+                .first_set()
+                .ok_or(RuntimeError::WorkerCpuExhausted { worker: 0 })?;
+            available.clear(skipped);
+        }
+
+        let main_cpu = cpu
+            .main_core
+            .map(|configured| self.resolve_cpu(configured, cpu.relative))
+            .transpose()?
+            .or_else(|| usize::try_from(unsafe { libc::sched_getcpu() }).ok());
+        if let Some(main_cpu) = main_cpu {
+            if !available.clear(main_cpu) {
+                return Err(RuntimeError::CpuUnavailable { cpu: main_cpu });
             }
         }
 
-        if !cpu.worker_cores.is_empty() {
-            for (worker, &configured) in cpu.worker_cores.iter().enumerate() {
+        if !cpu.corelist_workers.is_empty() {
+            let mut workers = Bitmap::new();
+            for (worker, configured) in cpu.corelist_workers.iter_set().enumerate() {
+                let configured = self.resolve_cpu(configured, cpu.relative)?;
                 if !available.clear(configured) {
                     return Err(RuntimeError::WorkerCpuUnavailable {
                         worker,
                         cpu: configured,
                     });
                 }
+                workers.set(configured);
             }
-            return Ok(cpu.worker_cores.clone());
+            return Ok((main_cpu, workers));
         }
 
-        let mut cores = Vec::with_capacity(count);
+        let mut cores = Bitmap::new();
         for worker in 0..count {
-            let cpu = available
-                .first_set()
-                .ok_or(RuntimeError::WorkerCpuExhausted { worker })?;
-            available.clear(cpu);
-            cores.push(cpu);
+            let cpu_index_zero_available = available.clear(0);
+            let cpu_index = available.first_set().or_else(|| {
+                (!cpu.relative && cpu_index_zero_available).then_some(0)
+            });
+            let cpu_index = cpu_index.ok_or(RuntimeError::WorkerCpuExhausted { worker })?;
+            available.clear(cpu_index);
+            if cpu_index_zero_available && cpu_index != 0 {
+                available.set(0);
+            }
+            cores.set(cpu_index);
         }
-        Ok(cores)
+        Ok((main_cpu, cores))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve_cpu(&self, configured: usize, relative: bool) -> RuntimeResult<usize> {
+        if !relative {
+            return Ok(configured);
+        }
+        self.cpu_core_bitmap
+            .iter_set()
+            .nth(configured)
+            .ok_or(RuntimeError::CpuUnavailable { cpu: configured })
     }
 
     #[inline]

@@ -1960,8 +1960,8 @@ plugins = ["tuntap", "icmp"]
 [memory]
 main_heap_size = "256 MiB"
 
-[worker]
-count = 1
+[cpu]
+workers = 1
 
 [worker.buffer]
 slots_per_numa = 4096

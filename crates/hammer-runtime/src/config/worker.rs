@@ -1,15 +1,8 @@
-//! `[worker]` config section: dataplane worker thread model + CPU/scheduler/NUMA.
+//! `[cpu]` and `[worker]` startup configuration.
 //!
-//! Main thread does not run packets. Worker threads run the packet graph.
-//! The `app` runtime (app session FIFO/message queue) runs on its own core, distinct
-//! from both the main (control) core and the worker (dataplane) cores — the
-//! three are independent, mirroring VPP's separation of main-core, worker
-//! cores, and any control/app work that must not contend with packet processing.
-//!
-//! Platform surfaces:
-//! - Linux: `[worker.cpu]` (main/app/worker cores), `[worker.scheduler]`
-//!   (policy/priority), `[worker.numa]`.
-//! - macOS: `[worker.scheduler]` (qos). No CPU affinity or NUMA on XNU.
+//! The `[cpu]` section owns the VPP-style CPU topology.
+//! `[worker]` owns Data Worker resource sizes; it does not select CPUs or
+//! determine the number of Data Workers.
 //!
 //! Defaults are derived from `hammer-service`/`hammer-runtime`/`hammer-core`
 //! production constants (see per-field doc comments for sources).
@@ -22,14 +15,17 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use hammer_component_macros::config_function;
-use hammer_infra::PageSize;
+use hammer_infra::{PageSize, bitmap::Bitmap};
 use serde::de::DeserializeOwned;
+use serde::de::{Deserializer, SeqAccess, Visitor};
+use serde::ser::{SerializeSeq, Serializer};
+use std::fmt;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
 // hammer-service/src/service.rs
-pub(crate) const WORKER_THREADS: usize = 2;
 pub(crate) const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_WORKER_COUNT: usize = 2;
 pub(crate) const MAX_BLOCKING_THREADS: usize = 4;
 // hammer-runtime/src/spawn.rs
 pub(crate) const WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
@@ -43,16 +39,13 @@ const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
 const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
 
-static COUNT: OnceLock<usize> = OnceLock::new();
 static STACK_SIZE: OnceLock<usize> = OnceLock::new();
 static MAX_BLOCKING: OnceLock<usize> = OnceLock::new();
 static IDLE_SLICE: OnceLock<Duration> = OnceLock::new();
 static BUFFER: OnceLock<WorkerBuffer> = OnceLock::new();
 static HANDOFF: OnceLock<WorkerHandoff> = OnceLock::new();
 static APP_SESSION: OnceLock<WorkerAppSession> = OnceLock::new();
-static SCHEDULER: OnceLock<WorkerScheduler> = OnceLock::new();
-#[cfg(target_os = "linux")]
-static CPU: OnceLock<WorkerCpu> = OnceLock::new();
+static CPU: OnceLock<CpuConfig> = OnceLock::new();
 #[cfg(target_os = "linux")]
 static NUMA: OnceLock<WorkerNuma> = OnceLock::new();
 
@@ -80,11 +73,10 @@ fn take_value<T: DeserializeOwned>(
 }
 
 pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
-    if COUNT.get().is_some() {
+    if STACK_SIZE.get().is_some() {
         return Err(RuntimeError::WorkerConfigurationAlreadyInitialized);
     }
 
-    let count = take_value(&mut section, "count", &["workers"])?.unwrap_or(WORKER_THREADS);
     let stack_size = take_value(&mut section, "stack_size", &[])?.unwrap_or(WORKER_STACK_SIZE);
     let max_blocking_threads =
         take_value(&mut section, "max_blocking_threads", &[])?.unwrap_or(MAX_BLOCKING_THREADS);
@@ -99,10 +91,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     let handoff: WorkerHandoff = take_value(&mut section, "handoff", &[])?.unwrap_or_default();
     let app_session: WorkerAppSession =
         take_value(&mut section, "app_session", &[])?.unwrap_or_default();
-    let scheduler: WorkerScheduler =
-        take_value(&mut section, "scheduler", &[])?.unwrap_or_default();
-    #[cfg(target_os = "linux")]
-    let cpu: WorkerCpu = take_value(&mut section, "cpu", &[])?.unwrap_or_default();
     #[cfg(target_os = "linux")]
     let numa: WorkerNuma = take_value(&mut section, "numa", &[])?.unwrap_or_default();
 
@@ -110,9 +98,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
         return Err(RuntimeError::WorkerConfigurationFieldUnknown {
             field: name.clone(),
         });
-    }
-    if count == 0 {
-        return Err(RuntimeError::WorkerCountZero);
     }
     if stack_size == 0 {
         return Err(RuntimeError::WorkerStackSizeZero);
@@ -123,33 +108,29 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     buffer.validate()?;
     handoff.validate()?;
     app_session.validate()?;
-    scheduler.validate()?;
     #[cfg(target_os = "linux")]
-    {
-        cpu.validate(count)?;
-        numa.validate()?;
-    }
+    numa.validate()?;
 
-    assert!(COUNT.set(count).is_ok());
     assert!(STACK_SIZE.set(stack_size).is_ok());
     assert!(MAX_BLOCKING.set(max_blocking_threads).is_ok());
     assert!(IDLE_SLICE.set(idle_slice).is_ok());
     assert!(BUFFER.set(buffer).is_ok());
     assert!(HANDOFF.set(handoff).is_ok());
     assert!(APP_SESSION.set(app_session).is_ok());
-    assert!(SCHEDULER.set(scheduler).is_ok());
     #[cfg(target_os = "linux")]
-    {
-        assert!(CPU.set(cpu).is_ok());
-        assert!(NUMA.set(numa).is_ok());
-    }
+    assert!(NUMA.set(numa).is_ok());
     Ok(())
 }
 
 pub fn worker_count() -> usize {
-    *COUNT
-        .get()
-        .expect("worker configuration is installed before lifecycle initialization")
+    CPU.get()
+        .expect("CPU configuration is installed before worker startup")
+        .worker_count()
+}
+
+pub(crate) fn cpu() -> &'static CpuConfig {
+    CPU.get()
+        .expect("CPU configuration is installed before thread setup")
 }
 
 pub(crate) fn stack_size() -> usize {
@@ -186,18 +167,6 @@ pub(crate) fn app_session() -> &'static WorkerAppSession {
     APP_SESSION
         .get()
         .expect("worker configuration is installed before App Session setup")
-}
-
-pub(crate) fn scheduler() -> &'static WorkerScheduler {
-    SCHEDULER
-        .get()
-        .expect("worker configuration is installed before thread setup")
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn cpu() -> &'static WorkerCpu {
-    CPU.get()
-        .expect("worker configuration is installed before CPU setup")
 }
 
 #[cfg(target_os = "linux")]
@@ -323,66 +292,179 @@ impl WorkerAppSession {
     }
 }
 
-/// CPU pinning (Linux only). The three core slots are independent:
-/// `main_core` runs the control thread (no packets), `app_core` runs the app
-/// session FIFO/message queue runtime, and `worker_cores` run the dataplane packet graph.
-#[cfg(target_os = "linux")]
+/// VPP-style CPU section. `workers` and `corelist_workers` are mutually
+/// exclusive: a core bitmap determines the worker count from its set bits.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct WorkerCpu {
+pub struct CpuConfig {
+    /// Number of Data Workers when no explicit worker core list is supplied.
+    pub workers: Option<usize>,
     /// Core for the control (main) thread. Does not run packets.
+    #[serde(alias = "main-core")]
     pub main_core: Option<usize>,
-    /// Core for the app session FIFO/message queue runtime. Independent of worker cores.
-    pub app_core: Option<usize>,
-    /// Cores for dataplane worker threads. When empty, the runtime pins
-    /// workers automatically (skipping main/app cores). When set, its length
-    /// must match `worker.count`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub worker_cores: Vec<usize>,
+    /// Explicit Data Worker cores, corresponding to VPP `corelist-workers`.
+    #[serde(
+        alias = "corelist-workers",
+        default,
+        deserialize_with = "deserialize_corelist",
+        serialize_with = "serialize_corelist",
+        skip_serializing_if = "bitmap_is_empty"
+    )]
+    pub corelist_workers: Bitmap,
+    /// Number of available CPUs to skip before assigning main/worker CPUs.
+    #[serde(alias = "skip-cores")]
+    pub skip_cores: usize,
+    /// Interpret CPU numbers relative to the process affinity mask.
+    pub relative: bool,
 }
 
-#[cfg(target_os = "linux")]
-impl Default for WorkerCpu {
+fn deserialize_corelist<'de, D>(deserializer: D) -> Result<Bitmap, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CoreListVisitor;
+
+    impl<'de> Visitor<'de> for CoreListVisitor {
+        type Value = Bitmap;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a CPU number sequence or a VPP corelist range string")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bitmap = Bitmap::new();
+            while let Some(core) = sequence.next_element::<usize>()? {
+                bitmap.set(core);
+            }
+            Ok(bitmap)
+        }
+
+        fn visit_str<E>(self, ranges: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            parse_corelist_ranges(ranges)
+        }
+
+        fn visit_string<E>(self, ranges: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&ranges)
+        }
+    }
+
+    deserializer.deserialize_any(CoreListVisitor)
+}
+
+fn parse_corelist_ranges<E>(ranges: &str) -> Result<Bitmap, E>
+where
+    E: serde::de::Error,
+{
+    let mut bitmap = Bitmap::new();
+    for range in ranges.split(',') {
+        let range = range.trim();
+        if range.is_empty() {
+            return Err(E::custom("cpu.corelist-workers contains an empty item"));
+        }
+        if let Some((first, last)) = range.split_once('-') {
+            let first = first.trim().parse::<usize>().map_err(|_| {
+                E::custom("cpu.corelist-workers contains an invalid range")
+            })?;
+            let last = last
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| E::custom("cpu.corelist-workers contains an invalid range"))?;
+            if first > last {
+                return Err(E::custom("cpu.corelist-workers range is descending"));
+            }
+            for core in first..=last {
+                bitmap.set(core);
+            }
+        } else {
+            let core = range.parse::<usize>().map_err(|_| {
+                E::custom("cpu.corelist-workers contains an invalid CPU number")
+            })?;
+            bitmap.set(core);
+        }
+    }
+    Ok(bitmap)
+}
+
+fn serialize_corelist<S>(bitmap: &Bitmap, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut sequence = serializer.serialize_seq(None)?;
+    for core in bitmap.iter_set() {
+        sequence.serialize_element(&core)?;
+    }
+    sequence.end()
+}
+
+fn bitmap_is_empty(bitmap: &Bitmap) -> bool {
+    bitmap.is_empty()
+}
+
+impl Default for CpuConfig {
     fn default() -> Self {
         Self {
+            workers: None,
             main_core: None,
-            app_core: None,
-            worker_cores: Vec::new(),
+            corelist_workers: Bitmap::new(),
+            skip_cores: 0,
+            relative: false,
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-impl WorkerCpu {
-    pub(crate) fn validate(&self, worker_count: usize) -> RuntimeResult<()> {
-        let mut cores = std::collections::HashSet::new();
-        for slot in self.main_core.into_iter().chain(self.app_core) {
-            if !cores.insert(slot) {
+impl CpuConfig {
+    pub(crate) fn worker_count(&self) -> usize {
+        self.corelist_workers
+            .is_empty()
+            .then(|| self.workers.unwrap_or(DEFAULT_WORKER_COUNT))
+            .unwrap_or_else(|| self.corelist_workers.count_set())
+    }
+
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
+        if self.workers == Some(0) || self.worker_count() == 0 {
+            return Err(RuntimeError::WorkerCountZero);
+        }
+        if !self.corelist_workers.is_empty() && self.workers.is_some() {
+            return Err(RuntimeError::config_validation(
+                "cpu.workers and cpu.corelist_workers are mutually exclusive",
+            ));
+        }
+        if self.skip_cores != 0 && self.main_core.is_none() {
+            return Err(RuntimeError::config_validation(
+                "cpu.main_core is required when cpu.skip_cores is set",
+            ));
+        }
+        if !self.corelist_workers.is_empty() && self.main_core.is_none() {
+            return Err(RuntimeError::config_validation(
+                "cpu.main_core is required when cpu.corelist_workers is set",
+            ));
+        }
+        if self.relative && self.main_core.is_none() {
+            return Err(RuntimeError::config_validation(
+                "cpu.main_core is required in relative mode",
+            ));
+        }
+        if let Some(main_core) = self.main_core {
+            if self.corelist_workers.is_set(main_core) {
                 return Err(RuntimeError::config_validation(format!(
-                    "worker.cpu core {slot} assigned to more than one role"
+                    "cpu core {main_core} assigned to more than one role"
                 )));
             }
-        }
-        for core in &self.worker_cores {
-            if !cores.insert(*core) {
-                return Err(RuntimeError::config_validation(format!(
-                    "worker.cpu core {core} assigned to more than one role"
-                )));
-            }
-        }
-        if !self.worker_cores.is_empty() && self.worker_cores.len() != worker_count {
-            return Err(RuntimeError::config_validation(format!(
-                "worker.cpu.worker_cores length ({}) must match worker.count ({})",
-                self.worker_cores.len(),
-                worker_count
-            )));
         }
         Ok(())
     }
 }
 
-/// Scheduling. Linux: policy + priority. macOS: QoS class. The two shapes are
-/// discriminated by target.
+/// Resolved scheduler policy retained by each runtime thread descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerScheduler {
@@ -419,14 +501,14 @@ impl WorkerScheduler {
                 Other | Batch | Idle => {
                     if self.priority != 0 {
                         return Err(RuntimeError::config_validation(
-                            "worker.scheduler.priority must be 0 unless policy is fifo/rr",
+                            "worker scheduler priority must be 0 unless policy is fifo/rr",
                         ));
                     }
                 }
                 Fifo | Rr => {
                     if self.priority < 1 || self.priority > 99 {
                         return Err(RuntimeError::config_validation(
-                            "worker.scheduler.priority must be 1..=99 for fifo/rr",
+                            "worker scheduler priority must be 1..=99 for fifo/rr",
                         ));
                     }
                 }
@@ -486,6 +568,16 @@ impl WorkerNuma {
     pub(crate) fn validate(&self) -> RuntimeResult<()> {
         Ok(())
     }
+}
+
+#[config_function(name = "runtime_cpu_config", section = "cpu", early = true)]
+fn configure_cpu(config: CpuConfig) -> RuntimeResult<()> {
+    if CPU.get().is_some() {
+        return Err(RuntimeError::WorkerConfigurationAlreadyInitialized);
+    }
+    config.validate()?;
+    assert!(CPU.set(config).is_ok());
+    Ok(())
 }
 
 #[config_function(name = "runtime_worker_config", section = "worker", early = true)]

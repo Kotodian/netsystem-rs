@@ -40,6 +40,11 @@ impl<I> Bitmap<I> {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
+
+    #[inline]
     pub fn clear_all(&mut self) {
         for word in self.words.iter_mut() {
             *word = 0;

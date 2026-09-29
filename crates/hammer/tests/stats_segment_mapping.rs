@@ -475,11 +475,11 @@ impl HammerDaemon {
 
     fn worker_config() -> String {
         format!(
-            "[worker]\ncount = {WORKER_COUNT}\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\n"
+            "[cpu]\nworkers = {WORKER_COUNT}\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\n"
         )
     }
 
-    /// Starts a daemon whose `[worker]` section is exactly `worker_config`.
+    /// Starts a daemon whose CPU/worker configuration is exactly `worker_config`.
     fn start_with_worker_config(worker_config: &str) -> Self {
         Self::start_with_config(worker_config, "")
     }
@@ -1283,12 +1283,12 @@ fn buffer_pools_follow_worker_numa_nodes_on_huge_pages() {
         .filter(|cpu| *cpu != first_cpu && *cpu != second_cpu)
         .take(2)
         .collect();
-    let mut worker_config = String::from("[worker]\ncount = 2\n\n[worker.cpu]\n");
-    if let [main_cpu, app_cpu] = spare[..] {
-        worker_config.push_str(&format!("main_core = {main_cpu}\napp_core = {app_cpu}\n"));
-    }
+    let [main_cpu, _] = spare[..] else {
+        panic!("two non-worker CPUs are required for explicit VPP-style placement");
+    };
+    let mut worker_config = format!("[cpu]\nmain_core = {main_cpu}\n");
     worker_config.push_str(&format!(
-        "worker_cores = [{first_cpu}, {second_cpu}]\n\n[worker.numa]\nenabled = true\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\npage_size = \"default-hugepage\"\n"
+        "corelist_workers = [{first_cpu}, {second_cpu}]\n\n[worker.numa]\nenabled = true\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\npage_size = \"default-hugepage\"\n"
     ));
 
     let mut daemon = HammerDaemon::start_with_worker_config(&worker_config);

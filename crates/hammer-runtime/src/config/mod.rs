@@ -10,8 +10,7 @@ pub mod worker;
 
 pub use stats::StatsConfig;
 pub use trace::{Trace, TraceInput};
-#[cfg(target_os = "macos")]
-pub use worker::QosClass;
+pub use worker::CpuConfig;
 #[cfg(target_os = "linux")]
-pub use worker::{SchedulerPolicy, WorkerCpu, WorkerNuma};
-pub use worker::{WorkerAppSession, WorkerBuffer, WorkerHandoff, WorkerScheduler};
+pub use worker::WorkerNuma;
+pub use worker::{WorkerAppSession, WorkerBuffer, WorkerHandoff};

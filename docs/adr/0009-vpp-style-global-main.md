@@ -856,7 +856,7 @@ struct ConfigFunction {
 | ThreadMain 的数量与栈配置 | `u32`、`usize` | 直接表达线程数量和栈大小，不新增聚合配置类型 |
 | 可用 CPU core 与 CPU socket/NUMA node 集合 | `Bitmap`，即现有 `Bitmap<usize>` | `hammer_infra::bitmap`；保留 `cpu_core_bitmap` 与 `cpu_socket_bitmap`，复用其 `set`、`clear`、`is_set`、`count_set`、`iter_set` |
 | global / per-main init 调用进度 | `Bitmap` | `hammer_infra::bitmap`；注册期建立稳定 callback 索引映射；调用前 `set`，错误不清位；映射尚需实现证明，不复用临时排序位置 |
-| CPU、调度、NUMA 配置输入 | `WorkerCpu`、`WorkerScheduler`、`WorkerNuma` | 当前配置模块已有字段类型；配置输入与运行期可用资源 bitmap 是不同事实 |
+| CPU、NUMA 配置输入 | `CpuConfig`、`WorkerNuma` | `CpuConfig` 对应独立 `[cpu]` section；配置输入与运行期可用资源 bitmap 是不同事实 |
 | DataPlaneMain 的 graph | `NodeMain`、`NodeEntry`、`NodeId`、`NodeRuntime` | `hammer_runtime::node`、`hammer_core::data_plane` |
 | DataPlaneMain 的 Buffer 构造输入 | `DataPlaneBufferConfig` | `hammer_runtime::data_plane::config` |
 | DataPlaneMain 的 handoff、trace、file | `DataPlaneHandoffWorker`、`DataPlaneTrace`；`FileMode::Async` 拥有现有 `AsyncFileMain`，`Sync` 使用已有全局 `FileMain` | `hammer_runtime::handoff`、`trace`、`file`；不复制 File registry/poller storage |

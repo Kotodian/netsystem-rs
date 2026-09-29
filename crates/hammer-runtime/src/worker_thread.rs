@@ -7,7 +7,7 @@ use std::time::Duration;
 use hammer_core::data_plane::NodeId;
 use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 
-use crate::config::WorkerScheduler;
+use crate::config::worker::WorkerScheduler;
 use crate::error::{RuntimeError, RuntimeResult};
 
 fn data_worker_entry(_: u32) -> RuntimeResult<()> {
@@ -289,7 +289,7 @@ impl WorkerThread {
     }
 }
 
-fn apply_current_thread_setup(
+pub(crate) fn apply_current_thread_setup(
     thread_index: u32,
     cpu_index: Option<u32>,
     numa_node: Option<u32>,
@@ -336,7 +336,7 @@ fn apply_current_thread_setup(
 
 #[cfg(target_os = "linux")]
 fn apply_scheduler(scheduler: &WorkerScheduler) -> RuntimeResult<()> {
-    use crate::config::SchedulerPolicy;
+    use crate::config::worker::SchedulerPolicy;
     use thread_priority::{
         NormalThreadSchedulePolicy, RealtimeThreadSchedulePolicy, ThreadPriority,
         ThreadPriorityOsValue, ThreadPriorityValue, ThreadSchedulePolicy,
@@ -369,7 +369,7 @@ fn apply_scheduler(scheduler: &WorkerScheduler) -> RuntimeResult<()> {
 
 #[cfg(target_os = "macos")]
 fn apply_qos(scheduler: &WorkerScheduler) -> RuntimeResult<()> {
-    use crate::config::QosClass;
+    use crate::config::worker::QosClass;
 
     let qos = match scheduler.qos {
         QosClass::UserInteractive => libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
