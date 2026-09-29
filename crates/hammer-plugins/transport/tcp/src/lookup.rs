@@ -10,7 +10,7 @@ use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::pool::Pool;
 use hammer_runtime::DataWorkerId;
 
-use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
+use crate::{TcpConnection, TcpState, TransportConnectionKey};
 
 pub type TcpLookupId = u32;
 
@@ -35,7 +35,6 @@ struct TcpPendingRouteEntry {
     local: Option<SocketAddr>,
     remote: SocketAddr,
     owner: DataWorkerId,
-    next: TcpInputNext,
     capabilities: TcpCapabilities,
 }
 
@@ -46,7 +45,6 @@ struct TcpConnectionRouteEntry {
     local: Option<SocketAddr>,
     remote: SocketAddr,
     owner: DataWorkerId,
-    next: TcpInputNext,
 }
 
 impl TcpConnectionRouteEntry {
@@ -57,7 +55,6 @@ impl TcpConnectionRouteEntry {
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
-        next: TcpInputNext,
     ) -> Self {
         Self {
             session_id,
@@ -65,7 +62,6 @@ impl TcpConnectionRouteEntry {
             local,
             remote,
             owner,
-            next,
         }
     }
 
@@ -105,7 +101,6 @@ impl TcpPendingRouteEntry {
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
-        next: TcpInputNext,
         capabilities: TcpCapabilities,
     ) -> Self {
         Self {
@@ -113,7 +108,6 @@ impl TcpPendingRouteEntry {
             local,
             remote,
             owner,
-            next,
             capabilities,
         }
     }
@@ -510,10 +504,8 @@ impl TcpConnectionRouteIndex {
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
-        next: TcpInputNext,
     ) {
-        let entry =
-            TcpConnectionRouteEntry::new(session_id, connection_id, local, remote, owner, next);
+        let entry = TcpConnectionRouteEntry::new(session_id, connection_id, local, remote, owner);
         let key: u64 = session_id.into();
         if let Some(raw) = self.session_slots.lookup(&key) {
             let entry_index = pool_index_from_bihash_value(raw);
@@ -609,7 +601,7 @@ impl TcpConnectionRouteIndex {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
+    ) -> Option<(u32, DataWorkerId)> {
         let entry_index = match (local, remote) {
             (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
                 self.tuple_slots_v4.lookup(&TransportConnectionKey::new(
@@ -633,7 +625,7 @@ impl TcpConnectionRouteIndex {
         }
         .map(pool_index_from_bihash_value)?;
         let entry = self.entries.get(entry_index)?;
-        Some((entry.session_id, entry.owner, entry.next))
+        Some((entry.session_id, entry.owner))
     }
 
     fn forget_session(&mut self, session_id: u32) {
@@ -668,7 +660,6 @@ impl Clone for TcpConnectionRouteIndex {
                 entry.local,
                 entry.remote,
                 entry.owner,
-                entry.next,
             );
         }
         cloned
@@ -693,10 +684,9 @@ impl TcpPendingRouteIndex {
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
-        next: TcpInputNext,
         capabilities: TcpCapabilities,
     ) {
-        let entry = TcpPendingRouteEntry::new(session_id, local, remote, owner, next, capabilities);
+        let entry = TcpPendingRouteEntry::new(session_id, local, remote, owner, capabilities);
         let key: u64 = session_id.into();
         if let Some(raw) = self.session_slots.lookup(&key) {
             let entry_index = pool_index_from_bihash_value(raw);
@@ -756,7 +746,7 @@ impl TcpPendingRouteIndex {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
+    ) -> Option<(u32, DataWorkerId)> {
         let entry_index = match (local, remote) {
             (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
                 self.tuple_slots_v4.lookup(&TransportConnectionKey::new(
@@ -780,7 +770,7 @@ impl TcpPendingRouteIndex {
         }
         .map(pool_index_from_bihash_value)?;
         let entry = self.entries.get(entry_index)?;
-        Some((entry.session_id, entry.owner, entry.next))
+        Some((entry.session_id, entry.owner))
     }
 
     #[inline]
@@ -848,7 +838,6 @@ impl Clone for TcpPendingRouteIndex {
                 entry.local,
                 entry.remote,
                 entry.owner,
-                entry.next,
                 entry.capabilities,
             );
         }
@@ -926,10 +915,9 @@ impl TcpLookupState {
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
-        next: TcpInputNext,
     ) {
         self.connections
-            .upsert(session_id, connection_id, local, remote, owner, next);
+            .upsert(session_id, connection_id, local, remote, owner);
     }
 
     #[inline]
@@ -939,11 +927,10 @@ impl TcpLookupState {
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
-        next: TcpInputNext,
         capabilities: TcpCapabilities,
     ) {
         self.pending
-            .upsert(session_id, local, remote, owner, next, capabilities);
+            .upsert(session_id, local, remote, owner, capabilities);
     }
 
     #[inline]
@@ -952,7 +939,7 @@ impl TcpLookupState {
         local: SocketAddr,
         remote: SocketAddr,
         check_listener_pending: bool,
-    ) -> (Option<(u32, DataWorkerId, TcpInputNext)>, bool) {
+    ) -> (Option<(u32, DataWorkerId)>, bool) {
         let route = self
             .connections
             .lookup_by_tuple(local, remote)
@@ -1006,7 +993,6 @@ impl TcpLookupState {
                     connection.local(),
                     connection.remote(),
                     connection.owner_worker(),
-                    connection.next_node(),
                     pending_capabilities.unwrap_or_default(),
                 );
                 false
@@ -1018,7 +1004,6 @@ impl TcpLookupState {
                     connection.local(),
                     connection.remote(),
                     connection.owner_worker(),
-                    connection.next_node(),
                 );
                 false
             }

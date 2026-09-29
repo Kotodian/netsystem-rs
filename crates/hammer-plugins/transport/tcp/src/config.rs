@@ -9,7 +9,13 @@ const TCP_WINDOW: u32 = u16::MAX as u32;
 const TCP_INITIAL_RTO: Duration = Duration::from_millis(50);
 const TCP_MIN_RTO: Duration = Duration::from_millis(50);
 const TCP_MAX_RTO: Duration = Duration::from_secs(60);
-const TCP_TIME_WAIT: Duration = Duration::from_secs(600);
+const TCP_ALLOCATION_RETRY: Duration = Duration::from_millis(100);
+const TCP_CLOSE_WAIT: Duration = Duration::from_secs(2);
+const TCP_FIN_WAIT1: Duration = Duration::from_secs(60);
+const TCP_FIN_WAIT2: Duration = Duration::from_secs(30);
+const TCP_LAST_ACK: Duration = Duration::from_secs(30);
+const TCP_CLOSING: Duration = Duration::from_secs(30);
+const TCP_TIME_WAIT: Duration = Duration::from_secs(10);
 const TCP_PAWS_IDLE: Duration = Duration::from_secs(24 * 86_400);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(75);
 const KEEPALIVE_PROBE_INTERVAL: Duration = Duration::from_secs(75);
@@ -39,6 +45,16 @@ pub struct TcpPluginConfig {
     #[serde(with = "humantime_serde")]
     pub time_wait: Duration,
     #[serde(with = "humantime_serde")]
+    pub close_wait: Duration,
+    #[serde(with = "humantime_serde")]
+    pub fin_wait1: Duration,
+    #[serde(with = "humantime_serde")]
+    pub fin_wait2: Duration,
+    #[serde(with = "humantime_serde")]
+    pub last_ack: Duration,
+    #[serde(with = "humantime_serde")]
+    pub closing: Duration,
+    #[serde(with = "humantime_serde")]
     pub paws_idle: Duration,
     pub retransmit: Retransmit,
     pub keepalive: Keepalive,
@@ -53,6 +69,11 @@ impl Default for TcpPluginConfig {
             congestion: CongestionAlgorithm::Bbr,
             nagle: true,
             time_wait: TCP_TIME_WAIT,
+            close_wait: TCP_CLOSE_WAIT,
+            fin_wait1: TCP_FIN_WAIT1,
+            fin_wait2: TCP_FIN_WAIT2,
+            last_ack: TCP_LAST_ACK,
+            closing: TCP_CLOSING,
             paws_idle: TCP_PAWS_IDLE,
             retransmit: Retransmit::default(),
             keepalive: Keepalive::default(),
@@ -83,6 +104,27 @@ impl TcpPluginConfig {
                 "plugin.tcp.time_wait must be non-zero",
             ));
         }
+        if self.close_wait.is_zero() || self.fin_wait1.is_zero()
+            || self.fin_wait2.is_zero() || self.last_ack.is_zero()
+            || self.closing.is_zero()
+        {
+            return Err(RuntimeError::config_validation(
+                "plugin.tcp WAITCLOSE durations must be non-zero",
+            ));
+        }
+        let max_interval = crate::timers::TCP_TIMER_RESOLUTION
+            * crate::timers::TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS as u32;
+        if [self.time_wait, self.close_wait, self.fin_wait1, self.fin_wait2,
+            self.last_ack, self.closing, self.retransmit.initial,
+            self.retransmit.min, self.retransmit.max,
+            self.retransmit.allocation_retry, self.keepalive.idle,
+            self.keepalive.probe_interval]
+            .into_iter().any(|interval| interval > max_interval)
+        {
+            return Err(RuntimeError::config_validation(
+                "plugin.tcp timer interval exceeds the TCP wheel range",
+            ));
+        }
         if self.paws_idle.is_zero() {
             return Err(RuntimeError::config_validation(
                 "plugin.tcp.paws_idle must be non-zero",
@@ -103,6 +145,8 @@ pub struct Retransmit {
     pub min: Duration,
     #[serde(with = "humantime_serde")]
     pub max: Duration,
+    #[serde(with = "humantime_serde")]
+    pub allocation_retry: Duration,
 }
 
 impl Default for Retransmit {
@@ -111,6 +155,7 @@ impl Default for Retransmit {
             initial: TCP_INITIAL_RTO,
             min: TCP_MIN_RTO,
             max: TCP_MAX_RTO,
+            allocation_retry: TCP_ALLOCATION_RETRY,
         }
     }
 }
@@ -130,6 +175,11 @@ impl Retransmit {
         if self.max.is_zero() {
             return Err(RuntimeError::config_validation(
                 "plugin.tcp.retransmit.max must be non-zero",
+            ));
+        }
+        if self.allocation_retry.is_zero() {
+            return Err(RuntimeError::config_validation(
+                "plugin.tcp.retransmit.allocation_retry must be non-zero",
             ));
         }
         if self.min > self.initial {

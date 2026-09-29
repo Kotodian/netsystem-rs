@@ -3,10 +3,32 @@ use hammer_runtime::{
     DataPlaneMain, DataWorkerId, DriverNode, File, Node, NodeMain, NodeRuntime, RuntimeError,
     RuntimeResult,
 };
+use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 
 use crate::session::{SessionQueueError, app, core};
 
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
+
+/// VPP: session_node.c, `SESSION_QUEUE_ERROR_NO_BUFFER`.
+#[derive(Clone, Copy)]
+pub(crate) enum SessionQueueNodeError {
+    Tx,
+    Timer,
+    NoBuffer,
+}
+
+impl NodeErrorCode for SessionQueueNodeError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
+}
+
+const SESSION_QUEUE_ERROR_DESCRIPTORS: [NodeErrorDescriptor; 3] = [
+    NodeErrorDescriptor::new("tx", NodeErrorSeverity::Info, "Packets transmitted"),
+    NodeErrorDescriptor::new("timer", NodeErrorSeverity::Info, "Timer events"),
+    NodeErrorDescriptor::new("no-buffer", NodeErrorSeverity::Error, "No Buffer available"),
+];
 
 /// VPP: session_input.c:350-405.
 #[hammer_component_macros::graph_node(
@@ -93,6 +115,7 @@ pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
         return Ok(node);
     }
     let node = runtime.nodes().try_register_driver(SessionQueueNode)?;
+    runtime.register_node_errors(node, &SESSION_QUEUE_ERROR_DESCRIPTORS)?;
     runtime.nodes().set_node_state(node, NodeState::Disabled)?;
     Ok(node)
 }
@@ -192,13 +215,16 @@ impl Node for SessionQueueNode {
         session_worker
             .dispatch_control_events(runtime, session_main)
             .expect("registered Session control handlers accept their events");
-        session_worker
-            .dispatch_io_events(runtime, session_main)
+        let transmitted = session_worker
+            .dispatch_io_events(runtime, data, session_main)
             .expect("registered Session transport handles its IO events");
         session_worker.schedule_pending_app_events(runtime);
-        let packets = session_worker.flush_pending_tx_buffers(runtime, data, frame);
+        session_worker.flush_pending_tx_buffers(runtime, data, frame);
+        runtime
+            .record_current_node_error_count(SessionQueueNodeError::Tx, transmitted as u64)
+            .expect("session-queue registers its TX counter");
         session_worker.update_state(runtime);
-        packets
+        transmitted
     }
 }
 

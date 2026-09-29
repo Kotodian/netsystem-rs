@@ -41,16 +41,20 @@ pub fn register_tcp4_rcv_process(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
     if let Some(node) = runtime.nodes().node_by_name("tcp4-rcv-process") {
         return Ok(node);
     }
-    runtime.nodes().try_register_internal_with_next_names(
+    let node = runtime.nodes().try_register_internal_with_next_names(
         Tcp4RcvProcessNode::new(),
         &TcpRcvProcessNext::NEXT_NAMES,
-    )
+    )?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 pub fn register_tcp6_rcv_process(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(Tcp6RcvProcessNode::new(), &["tcp6-output", "drop"])
+        .try_register_internal_with_next_names(Tcp6RcvProcessNode::new(), &["tcp6-output", "drop"])?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 impl Node for Tcp4RcvProcessNode {
@@ -96,7 +100,9 @@ fn tcp_rcv_process_frame<const IS_IP4: bool>(
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
+    // VPP tcp_input.c:2009-2365 classifies one packet before its drop exit.
     for &index in frame.vector_args() {
+        let mut error = None;
         if tcp_rcv_process_index::<IS_IP4>(
             runtime,
             node_runtime,
@@ -104,6 +110,7 @@ fn tcp_rcv_process_frame<const IS_IP4: bool>(
             &mut output,
             &mut nexts,
             &mut out_len,
+            &mut error,
         )
         .is_err()
         {
@@ -116,6 +123,10 @@ fn tcp_rcv_process_frame<const IS_IP4: bool>(
                 TcpRcvProcessNext::Drop,
                 index,
             );
+        }
+        if let Some(error) = error {
+            runtime.record_current_node_error(error)
+                .expect("TCP receive-process node registers its packet error");
         }
     }
     if out_len != 0 {
@@ -130,6 +141,17 @@ fn tcp_rcv_process_frame<const IS_IP4: bool>(
         .expect("TCP Main initializes before receive processing")
         .protocol();
     sessions.flush_enqueue_events(runtime, protocol);
+    if crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before receive processing")
+        .worker(runtime.thread_index())
+        .expect("receive processing runs on its TCP worker")
+        .handle_postponed_dequeues(runtime, sessions)
+        .is_err()
+    {
+        runtime.record_current_node_error(TcpNodeError::TimerUpdateFailed)
+            .expect("TCP input owns its timer node error");
+    }
     ()
 }
 
@@ -166,6 +188,7 @@ fn tcp_rcv_process_index<const IS_IP4: bool>(
     _: &mut Frame,
     _: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     _: &mut usize,
+    error: &mut Option<TcpNodeError>,
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
     if packet.local.is_ipv4() != IS_IP4 {
@@ -182,7 +205,7 @@ fn tcp_rcv_process_index<const IS_IP4: bool>(
         let sessions = &mut *sessions;
         let tcp = &mut *tcp;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
-            let _ = runtime.record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing);
+            *error = Some(TcpNodeError::RcvProcessSessionRouteMissing);
             TcpNodeError::RcvProcessSessionRouteMissing
         })?;
         let handle = SessionHandle {
@@ -193,59 +216,98 @@ fn tcp_rcv_process_index<const IS_IP4: bool>(
             .session_from_handle(handle)
             .map(|session| session.connection_index())
             .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
-        let (control, ack_advanced, acked_tx_len, established_with_payload) = {
+        let (control, acked_tx_len, receive_payload, prior_state, state) = {
             let crate::worker::TcpWorker {
                 connections,
                 timer_wheel: timers,
                 ..
             } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::RcvProcessSessionMissing);
+                *error = Some(TcpNodeError::RcvProcessSessionMissing);
                 TcpNodeError::RcvProcessSessionMissing
             })?;
-            let previous_state = connection.state();
             let previous_snd_una = connection.snd_una();
+            let prior_state = connection.state();
             let control = connection.receive_close_side(
                 connection_index,
                 timers,
                 &packet,
                 std::time::Instant::now(),
             )?;
-            let established = connection.state() == crate::TcpState::Established;
             (
                 control,
-                connection.snd_una() != previous_snd_una,
                 connection.take_acked_tx_len(previous_snd_una),
-                previous_state == crate::TcpState::SynRcvd
-                    && established
-                    && packet.payload_len != 0,
+                packet.payload_len != 0
+                    && matches!(connection.state(),
+                        crate::TcpState::Established
+                            | crate::TcpState::FinWait1
+                            | crate::TcpState::FinWait2),
+                prior_state,
+                connection.state(),
             )
         };
         if acked_tx_len != 0 {
-            let tx = sessions
-                .session_from_handle(handle)
-                .and_then(|session| session.tx_fifo())
-                .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
-            assert_eq!(
-                tx.drop_dequeue(acked_tx_len as usize),
-                acked_tx_len as usize
+            tcp.program_dequeue(connection_index, acked_tx_len);
+        }
+        if prior_state != state && state == crate::TcpState::Closed {
+            if packet.flags.contains(crate::TcpSegmentFlags::RST) {
+                sessions.transport_reset(runtime, handle, connection_index)?;
+            }
+            sessions.transport_closed(runtime, handle, connection_index)?;
+            tcp.program_cleanup(connection_index);
+        } else if prior_state == crate::TcpState::Closing
+            && state == crate::TcpState::TimeWait
+        {
+            sessions.transport_closed(runtime, handle, connection_index)?;
+        }
+        if receive_payload {
+            let decision = tcp
+                .connections
+                .get(connection_index)
+                .expect("receive input retains its TCP connection")
+                .accept_payload(&packet);
+            if let Some((trim, offset)) = decision {
+                crate::expose_payload(runtime, index, &packet, trim)?;
+                let delivery = sessions.enqueue_rx(runtime, handle, index, offset)?;
+                let requested = packet.payload_len.saturating_sub(trim) as u32;
+                let send_mss = tcp.connections.get(connection_index)
+                    .expect("receive input retains its TCP connection").send_mss;
+                *error = Some(crate::payload_node_error(
+                    delivery, requested, send_mss, offset,
+                ));
+                tcp.connections
+                    .get_mut(connection_index)
+                    .expect("receive input retains its TCP connection")
+                    .receive_payload(packet.sequence, trim as u32, delivery)?;
+            } else {
+                *error = Some(TcpNodeError::SegmentOld);
+            }
+            tcp.program_ack(
+                runtime,
+                sessions,
+                connection_index,
+                decision.is_none_or(|(_, offset)| offset != 0),
             );
         }
-        if ack_advanced
-            && sessions
-                .session_from_handle(handle)
-                .and_then(|session| session.tx_fifo())
-                .is_some_and(|fifo| fifo.max_dequeue() != 0)
-        {
-            sessions.enqueue_ready(handle, tcp.protocol)?;
-        }
-        if established_with_payload {
-            {
-                let buffer = runtime.buffer_mut(index);
-                buffer.advance(packet.payload_offset as isize);
-                buffer.truncate(packet.payload_len)?;
+        let fin_control = {
+            let crate::worker::TcpWorker { connections, timer_wheel, .. } = &mut *tcp;
+            let connection = connections.get_mut(connection_index)
+                .expect("receive input retains its TCP connection");
+            connection.process_fin_after_payload(connection_index, timer_wheel, &packet)?
+        };
+        if fin_control.is_some() {
+            tcp.program_ack(runtime, sessions, connection_index, false);
+            let state = tcp.connections.get(connection_index)
+                .expect("FIN retains its TCP connection").state();
+            if state == crate::TcpState::TimeWait {
+                if sessions.session_from_handle(handle)
+                    .and_then(|session| session.rx_fifo())
+                    .is_some_and(|fifo| fifo.max_dequeue() != 0)
+                {
+                    sessions.flush_enqueue_events(runtime, tcp.protocol);
+                }
+                sessions.transport_closed(runtime, handle, connection_index)?;
             }
-            sessions.enqueue_rx(runtime, handle, index, 0)?;
         }
         (control, connection_index)
     };

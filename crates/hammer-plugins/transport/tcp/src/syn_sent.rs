@@ -7,7 +7,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 use super::TcpError;
 use super::TcpNodeError;
 use super::segment::tcp_packet;
-use hammer_service::session::{ApplicationMain, RxDelivery, SessionEventType, SessionHandle, SessionState};
+use hammer_service::session::{ApplicationMain, SessionEventType, SessionHandle, SessionState};
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -41,15 +41,19 @@ pub fn register_tcp4_syn_sent(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> 
     if let Some(node) = runtime.nodes().node_by_name("tcp4-syn-sent") {
         return Ok(node);
     }
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(Tcp4SynSentNode::new(), &TcpSynSentNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(Tcp4SynSentNode::new(), &TcpSynSentNext::NEXT_NAMES)?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 pub fn register_tcp6_syn_sent(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(Tcp6SynSentNode::new(), &["tcp6-output", "drop"])
+        .try_register_internal_with_next_names(Tcp6SynSentNode::new(), &["tcp6-output", "drop"])?;
+    crate::register_tcp_node_errors(runtime, node)?;
+    Ok(node)
 }
 
 impl Node for Tcp4SynSentNode {
@@ -95,7 +99,9 @@ fn tcp_syn_sent_frame<const IS_IP4: bool>(
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
+    // VPP tcp_input.c:1700-1921 classifies one packet before its drop exit.
     for &index in frame.vector_args() {
+        let mut error = None;
         match tcp_syn_sent_index::<IS_IP4>(
             runtime,
             node_runtime,
@@ -103,6 +109,7 @@ fn tcp_syn_sent_frame<const IS_IP4: bool>(
             &mut output,
             &mut nexts,
             &mut out_len,
+            &mut error,
         ) {
             Ok(true) => {
                 emit_local(
@@ -129,9 +136,28 @@ fn tcp_syn_sent_frame<const IS_IP4: bool>(
                 );
             }
         }
+        if let Some(error) = error {
+            runtime.record_current_node_error(error)
+                .expect("TCP SYN-SENT node registers its packet error");
+        }
     }
     if out_len != 0 {
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
+    }
+    let session_main = hammer_service::session::SessionMain::global()
+        .expect("Session Main initializes before TCP SYN-SENT input");
+    let sessions = unsafe { session_main.worker_mut(runtime) }
+        .expect("TCP SYN-SENT input runs on its Session worker");
+    let main = crate::TCP_MAIN.get()
+        .expect("TCP Main initializes before SYN-SENT input");
+    sessions.flush_enqueue_events(runtime, main.protocol());
+    if main.worker(runtime.thread_index())
+        .expect("SYN-SENT input runs on its TCP worker")
+        .handle_postponed_dequeues(runtime, sessions)
+        .is_err()
+    {
+        runtime.record_current_node_error(crate::TcpNodeError::TimerUpdateFailed)
+            .expect("TCP input owns its timer node error");
     }
     ()
 }
@@ -169,6 +195,7 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
     _: &mut Frame,
     _: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     _: &mut usize,
+    error: &mut Option<TcpNodeError>,
 ) -> RuntimeResult<bool> {
     let packet = tcp_packet(runtime, index)?;
     if packet.local.is_ipv4() != IS_IP4 {
@@ -186,7 +213,7 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
         let tcp = &mut *tcp;
         let mut keep_current = true;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
-            let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
+            *error = Some(TcpNodeError::SynSentSessionRouteMissing);
             TcpNodeError::SynSentSessionRouteMissing
         })?;
         let handle = SessionHandle {
@@ -197,7 +224,7 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             .session_from_handle(handle)
             .map(|session| session.connection_index())
             .ok_or(TcpNodeError::SynSentSessionMissing)?;
-        let (control, acked_tx_len, established, established_with_payload) = {
+        let (mut control, acked_tx_len, established, established_with_payload) = {
             let crate::worker::TcpWorker {
                 connections,
                 lookup,
@@ -208,7 +235,7 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing);
+                *error = Some(TcpNodeError::SynSentSessionMissing);
                 TcpNodeError::SynSentSessionMissing
             })?;
             let previous_snd_una = connection.snd_una();
@@ -231,11 +258,7 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             )
         };
         if acked_tx_len != 0 {
-            let tx = sessions
-                .session_from_handle(handle)
-                .and_then(|session| session.tx_fifo())
-                .ok_or(TcpNodeError::SynSentSessionMissing)?;
-            assert_eq!(tx.drop_dequeue(acked_tx_len as usize), acked_tx_len as usize);
+            tcp.program_dequeue(connection_index, acked_tx_len);
         }
         if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
             tcp.lookup.remember_fast_open_cookie(
@@ -246,15 +269,39 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             );
         }
         if established_with_payload {
-            {
-                let buffer = runtime.buffer_mut(index);
-                buffer.advance(packet.payload_offset as isize);
-                buffer.truncate(packet.payload_len)?;
+            let payload_sequence = packet.sequence.advance(1);
+            let decision = tcp
+                .connections
+                .get(connection_index)
+                .expect("SYN-ACK input retains its TCP connection")
+                .accept_payload_from(payload_sequence, packet.payload_len);
+            if let Some((trim, offset)) = decision {
+                crate::expose_payload(runtime, index, &packet, trim)?;
+                let delivery = sessions.enqueue_rx(runtime, handle, index, offset)?;
+                let requested = packet.payload_len.saturating_sub(trim) as u32;
+                let send_mss = tcp.connections.get(connection_index)
+                    .expect("SYN-ACK input retains its TCP connection").send_mss;
+                *error = Some(crate::payload_node_error(
+                    delivery, requested, send_mss, offset,
+                ));
+                tcp.connections
+                    .get_mut(connection_index)
+                    .expect("SYN-ACK input retains its TCP connection")
+                    .receive_payload(payload_sequence, trim as u32, delivery)?;
+            } else {
+                *error = Some(TcpNodeError::SegmentOld);
             }
-            let enqueue = sessions.enqueue_rx(runtime, handle, index, 0)?;
-            if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                sessions.enqueue_ready(handle, main.protocol())?;
-            }
+            let connection = tcp
+                .connections
+                .get(connection_index)
+                .expect("SYN-ACK input retains its TCP connection");
+            control = Some(connection.control_segment(
+                packet.local,
+                packet.remote,
+                crate::TcpSegmentFlags::ACK,
+                None,
+                tcp.lookup.pending_open_capabilities(session_id).unwrap_or_default(),
+            ));
             keep_current = false;
         };
         if established {
@@ -298,10 +345,7 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
             .egress_mut();
         egress.connection_index = connection_index;
         egress.worker_index = worker_index;
-        let core_sessions = hammer_service::session::SessionMain::global()?;
-        // SAFETY: TCP output runs on this Data Worker's owning thread.
-        let core_worker = unsafe { core_sessions.worker_mut(runtime) }?;
-        core_worker.add_pending_tx_buffer(
+        sessions.add_pending_tx_buffer(
             runtime,
             allocated,
             tcp.tco_next_node[usize::from(!packet.local.is_ipv4())],

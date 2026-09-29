@@ -93,6 +93,52 @@ fn fifo_ooo_gap_overlap_and_wrap_are_ordered() {
 }
 
 #[test]
+fn fifo_ooo_merges_duplicate_and_adjacent_ranges() {
+    let (mut segment, index) = allocated_fifo(4097);
+    let fifo = segment.fifo(0, index).expect("fifo");
+
+    assert_eq!(fifo.enqueue_ooo(4, &[4, 5, 6, 7]).unwrap().start, Some(4));
+    let merged = fifo.enqueue_ooo(6, &[6, 7, 8, 9]).unwrap();
+    assert_eq!((merged.start, merged.len), (Some(4), 6));
+    assert_eq!(fifo.enqueue_ooo(4, &[4, 5, 6, 7]).unwrap().start, None);
+    assert_eq!(fifo.enqueue_ooo(0, &[0, 1, 2, 3]).unwrap().delivered, 6);
+
+    let mut received = [0; 10];
+    assert_eq!(fifo.dequeue(received.len(), &mut received), received.len());
+    assert_eq!(received, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn fifo_ooo_promotes_across_chunk_after_in_order_fill() {
+    let (mut segment, index) = allocated_fifo(8192);
+    let fifo = segment.fifo(0, index).expect("fifo");
+    let prefix = vec![0x11; 4092];
+    let future = [0x22; 16];
+
+    assert_eq!(fifo.enqueue_ooo(4092, &future).unwrap().accepted, 16);
+    assert_eq!(fifo.max_dequeue(), 0);
+    assert_eq!(fifo.enqueue_ooo(0, &prefix).unwrap().delivered, 16);
+    let mut received = vec![0; prefix.len() + future.len()];
+    assert_eq!(fifo.dequeue(received.len(), &mut received), received.len());
+    assert_eq!(&received[..prefix.len()], prefix.as_slice());
+    assert_eq!(&received[prefix.len()..], future.as_slice());
+}
+
+#[test]
+fn fifo_ooo_capacity_rejection_preserves_published_tail() {
+    let (mut segment, index) = allocated_fifo(4096);
+    let fifo = segment.fifo(0, index).expect("fifo");
+    let future = [0x22; 16];
+    let prefix = vec![0x11; 4080];
+
+    assert_eq!(fifo.enqueue_ooo(4080, &future).unwrap().accepted, 16);
+    assert!(fifo.enqueue_ooo(4081, &future).is_err());
+    assert_eq!(fifo.max_dequeue(), 0);
+    assert_eq!(fifo.enqueue_ooo(0, &prefix).unwrap().delivered, 16);
+    assert_eq!(fifo.max_dequeue(), 4096);
+}
+
+#[test]
 fn fifo_segmented_enqueue_failure_does_not_publish_partial_bytes() {
     let (mut segment, index) = allocated_fifo(4096);
     let fifo = segment.fifo(0, index).expect("fifo");

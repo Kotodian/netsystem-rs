@@ -14,38 +14,6 @@ pub use options::{
 };
 pub use segment::{TcpHeader, TcpSegmentHeader, tcp_header};
 
-/// Network-layer facts consumed by TCP after IP input has parsed a packet.
-///
-/// TCP owns these values so it does not link the IP implementation merely to
-/// inspect packet metadata already recorded in `NetworkOpaque`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum TcpIpVersion {
-    V4,
-    V6,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum TcpIpProtocol {
-    Icmpv4,
-    Tcp,
-    Udp,
-    Icmpv6,
-    Other(u8),
-}
-
-impl From<u8> for TcpIpProtocol {
-    #[inline(always)]
-    fn from(value: u8) -> Self {
-        match value {
-            1 => Self::Icmpv4,
-            6 => Self::Tcp,
-            17 => Self::Udp,
-            58 => Self::Icmpv6,
-            other => Self::Other(other),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[repr(u8)]
 pub enum TcpEcnCodepoint {

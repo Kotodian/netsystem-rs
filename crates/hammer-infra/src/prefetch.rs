@@ -30,6 +30,25 @@ pub fn prefetch_read_l1<T>(ptr: *const T) {
 #[inline(always)]
 pub fn prefetch_read_l1<T>(_ptr: *const T) {}
 
+/// Prefetch up to four cache lines, matching VPP's CLIB_PREFETCH size rule.
+#[inline(always)]
+pub fn prefetch_read_l1_bytes(ptr: *const u8, bytes: usize) {
+    const CACHE_LINE: usize = crate::align::CACHE_LINE;
+    debug_assert!(bytes <= 4 * CACHE_LINE);
+    if bytes > 0 {
+        prefetch_read_l1(ptr);
+    }
+    if bytes > CACHE_LINE {
+        prefetch_read_l1(ptr.wrapping_add(CACHE_LINE));
+    }
+    if bytes > 2 * CACHE_LINE {
+        prefetch_read_l1(ptr.wrapping_add(2 * CACHE_LINE));
+    }
+    if bytes > 3 * CACHE_LINE {
+        prefetch_read_l1(ptr.wrapping_add(3 * CACHE_LINE));
+    }
+}
+
 #[cfg(target_arch = "x86")]
 #[inline(always)]
 pub fn prefetch_write_l1<T>(ptr: *const T) {
@@ -69,6 +88,25 @@ pub fn prefetch_write_l1<T>(ptr: *const T) {
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
 pub fn prefetch_write_l1<T>(_ptr: *const T) {}
+
+/// Prefetch up to four cache lines, matching VPP's CLIB_PREFETCH size rule.
+#[inline(always)]
+pub fn prefetch_write_l1_bytes(ptr: *const u8, bytes: usize) {
+    const CACHE_LINE: usize = crate::align::CACHE_LINE;
+    debug_assert!(bytes <= 4 * CACHE_LINE);
+    if bytes > 0 {
+        prefetch_write_l1(ptr);
+    }
+    if bytes > CACHE_LINE {
+        prefetch_write_l1(ptr.wrapping_add(CACHE_LINE));
+    }
+    if bytes > 2 * CACHE_LINE {
+        prefetch_write_l1(ptr.wrapping_add(2 * CACHE_LINE));
+    }
+    if bytes > 3 * CACHE_LINE {
+        prefetch_write_l1(ptr.wrapping_add(3 * CACHE_LINE));
+    }
+}
 
 // L2 prefetch hints. Used by batched buffer alloc/free and node loops that
 // walk several buffers ahead of the one being touched: a single buffer header

@@ -106,6 +106,16 @@ impl Default for TcpSackState {
 
 impl TcpSackState {
     #[inline]
+    pub(super) fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    #[inline]
+    pub(super) fn reset_output_position(&mut self) {
+        self.output_pos = 0;
+    }
+
+    #[inline]
     pub(crate) fn update_range(
         &mut self,
         enabled: bool,

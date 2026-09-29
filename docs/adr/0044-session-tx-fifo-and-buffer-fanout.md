@@ -1,7 +1,7 @@
 # ADR-0044: Session TX FIFO、Buffer 链、输出扇出与 TCP RX OOO
 
 - 日期：2026-09-28
-- 状态：Proposed；仅设计，未修改实现
+- 状态：实施中；源码审查与未完成项见 `docs/reviews/issue-364-adr-0044.md`
 - 前置：ADR-0037、ADR-0038、ADR-0039、ADR-0042、ADR-0043
 - 取代：上述 ADR 中关于 `TxMode`/`TransportTxMode`、单包 TX、TX 参数快照、
   `SessionTxPacket` 和 TX output next 的设计；并更正 TCP RX 对 FIFO OOO segment
@@ -30,11 +30,16 @@
 | `src/vnet/session/transport.h:21-55,75-90,204-208,330-369`；`src/vnet/tcp/tcp.c:1171-1196,1372-1380,1402-1431` | transport 实时给出 `snd_space/tx_offset/snd_mss/flags`，TX_FLUSH 通知 TCP 的 PSH 逻辑，pacer 在 Session TX 前后由 connection 更新。 |
 | `src/vnet/tcp/tcp.c:1128-1196`；`src/vnet/tcp/tcp_output.c:1804-2065,2070-2186` | TCP 普通 FIFO TX 在 recovery 中停止；custom TX 除重传和 ACK 外，还会按 recovery/PRR 预算直接从同一 Session TX FIFO packetize 未发送的新数据。其 packet 计数用于 frame 预算，ACK buffer 分配失败不改变 `tcp_send_acks` 的计数。 |
 | `src/vnet/tcp/tcp_output.c:884-1035`；`src/vnet/tcp/tcp.c:1590-1630,1743-1749` | TCP `push_header` 对整个 packet 批次更新 sequence、拥塞和重传 timer；TCP 注册 4/6 两个 output edge，worker 缓存对应 next，以便 ACK、重传和 timer control packet 进入同一 Session pending 列。 |
+| `src/vnet/tcp/tcp.c:789-799,1703-1707`；`src/vnet/tcp/tcp_rack.c:174-485,506-805`；`src/vnet/tcp/tcp_bt.c:1710-1742`；`src/vnet/tcp/tcp_output.c:2125-2148` | VPP 的 RACK 仅在启用并协商 SACK 后使用 byte tracker；按最新交付传输的发送时序、RTT 与重排窗口判丢，REO timer 安排重传，不直接完成一个样本。VPP 默认关闭；Hammer 按产品要求默认开启，但仍以 SACK 协商为门槛。 |
 | `src/vnet/session/transport.h:81-88,183-191`；`src/vnet/session/session_node.c:1496-1504,1884-1893` | `flush_data` 只在 TX_FLUSH 分支、普通 TX 参数计算之前调用；RX IO event 调用 transport 的 `app_rx_evt`，它不是 AppWorker RX callback。未提供 RX callback 的 transport 在 VPP 是成功的 no-op。 |
 | `src/vnet/session/session.h:917-975`；`src/vnet/tcp/tcp.c:1372-1401` | TCP flush 从 Session TX FIFO 的 consumer 可读量确定 `psh_seq`；App RX 只在曾发送零窗口时检查 RX FIFO 空间，阈值为 `clamp(size >> 3, 4 KiB, 128 KiB)`，不足时请求 dequeue 通知，否则发送 ACK。 |
 | `src/vnet/tcp/tcp_output.c:917-930,1037-1058`；`src/vnet/tcp/tcp_types.h:115-125,490-499` | PSH 仅写入覆盖 `psh_seq` 的 TCP 段；独立 ACK 使用 Session 的 pending buffer/next，不构造应用通知或新的 Session TX event。ACK buffer 分配失败时 VPP 更新接收窗口并计 TCP worker `no_buffer`，不是 Session Queue node error。 |
 | `src/vnet/tcp/tcp_input.c:494-545,885-895,1407-1412,2365-2370`；`src/vnet/session/session.c:738-749` | ACK 不逐包直接 drop Session TX FIFO：TCP worker 先合并 `burst_acked` 到 `pending_deq_acked`，输入 burst 结束后每 connection 只 drop 一次，触发应用 dequeue 通知，再重排、更新重传 timer 和 pacer。 |
+| `src/vnet/tcp/tcp_input.c:2726-2772,3006-3235` | TCP input 从当前连接的 `state` 与过滤后的 FIN/SYN/RST/ACK 查 dispatch 表；表项同时给出 next 与 enum 错误，未列出的组合为 `DISPATCH`/drop。跨 worker 报文先交给目标 TCP input 再查表，不在 tuple lookup 中缓存 next。Hammer 的无连接 pending ACK 仍须交给现有 listen 握手路径，因为它没有可查的 TCP connection state。 |
+| `src/vnet/tcp/tcp_inlines.h:282-377`；`src/vnet/tcp/tcp_input.c:2896-2960` | `tcp4/6-input-nolookup` 与普通 input 共用解析、批处理及状态分发表；区别仅是从 Buffer 预选的 TCP connection index 直接取本 worker 的连接，不做 tuple/session lookup。Hammer 的预选索引只存 TCP secondary opaque，不扩展通用 IP opaque。 |
 | `src/vnet/tcp/tcp_input.c:977-1101,1147-1210,1361-1412` | TCP RX 先按 `rcv_nxt` 区分旧包、重叠、未来和按序数据。未来字节按相对 `rcv_nxt` 的 offset 写入 **Session RX FIFO 自身的 OOO segment**，不推进 `rcv_nxt`、不发应用 RX event；按序写入时 FIFO 收集相邻 OOO segment，返回值含补洞后连续可读字节。乱序发 DUPACK；FIN 仅在 `seq_end == rcv_nxt` 时接受。 |
+| `src/vnet/tcp/tcp_input.c:1361-1412,2260-2370` | established 与 receive-process 都先处理 ACK、再将 payload 交给 Session，最后按**原 packet 的** `seq_end == rcv_nxt` 判断 FIN；`FIN_WAIT_1` 有 `FINPNDG` 时不能直接进入 `CLOSING`，`FIN_WAIT_2` 有未读 RX 数据时先 flush RX 通知再通知 transport closed。input frame 尾部依次 flush RX、处理 postponed TX dequeue、处理 pending disconnect/reset，随后释放原 Buffer。 |
+| `src/vnet/tcp/tcp_sack.h:127-147`；`src/vnet/tcp/tcp_input.c:494-545,875-892` | `ac.bytes_acked` 是 ACK 反馈分类的结果，只有非零时把 connection 首次排入 `pending_deq_acked` 并累加 `burst_acked`；不是每 packet 在 service 直接 drop FIFO，也不能把未获 ACK 处理接受的序号差误当成 dequeue 字节。 |
 | `src/vnet/session/session.h:685-829`；`src/vnet/session/session.c:690-715` | `session_enqueue_stream_connection` 的 `queue_event=1` 仅用于按序路径，Session worker 合并同一 burst 的 RX 通知并在 TCP input node 末尾 flush；OOO 路径以 `queue_event=0` 返回。多 Buffer 链按同一逻辑 offset 继续写入 FIFO。 |
 | `src/svm/svm_fifo.c:171-340,593-726,833-930`；`src/svm/fifo_types.h:105-106`；`src/vnet/session/transport.c:1205-1210` | FIFO 的 `ooo_segment_add` 负责相邻/重叠区间合并，`svm_fifo_enqueue` 补洞并收集 OOO segment。TCP 创建 Session FIFO 后初始化 RX 的 OOO enqueue **chunk lookup**、TX 的 OOO dequeue **chunk lookup**；两者不是 segment 索引。TCP SACK 查询 FIFO **合并后的 newest OOO segment**，不是刚收到的 packet 区间。 |
 | `src/vnet/tcp/tcp_error.def:22-26,51`；`src/vnet/tcp/tcp_input.c:1001-1101,1160-1210` | `ENQUEUED`、`ENQUEUED_OOO`、`FIFO_FULL`、`PARTIALLY_ENQUEUED`、`SEGMENT_OLD`、`ZERO_RWND` 是 TCP input node 的逐包分类/计数，不是 service `SessionError` 或数值 retval。 |
@@ -100,7 +105,7 @@ VPP 路径均以 `third_party/vpp/src/` 为根。
 | `tcp/rcv_process.rs`、`tcp/syn_sent.rs` 固定 offset 零；`receive_open_reply` 在 enqueue 前推进 `rcv_nxt` | `vnet/tcp/tcp_input.c:1147-1210,1897-1907,2260-2271` | 三个 data-bearing input 分支复用旧/重叠/未来/按序判断，仅按 FIFO 实际可读推进 `rcv_nxt` |
 | `infra/svm/fifo.rs` 用临时 `Vec` 重建 OOO 区间、把 segment 索引误写进 chunk lookup、返回未合并写入范围；共享引用下通过非 `UnsafeCell` 字段写 head/newest | `svm/svm_fifo.c:171-340,593-726,833-930`、`svm/fifo_types.h:105-106` | 原位更新已有 `Pool<OooSegment>`/list，无 packet-path `Vec`；chunk lookup 仅定位 FIFO chunk；两个可变 list 索引纳入 producer-owned `UnsafeCell`，返回 newest 合并区间 |
 | `service/session/core.rs::enqueue_rx` 把链 chunk 的 min/max 拼作一个 segment | `vnet/session/session.h:685-829`、`vnet/tcp/tcp_input.c:1081-1096` | 同一 packet 的链偏移连续推进，以最后一次 FIFO OOO 插入的 newest 标记为准；仅按序排应用 RX event |
-| `tcp/established.rs`、`rcv_process.rs`、`syn_sent.rs` 每个 ACK 直接 `drop_dequeue`/`enqueue_ready` | `vnet/tcp/tcp_input.c:494-545,1407-1412,2365-2370`、`vnet/session/session.c:738-749` | worker 在 burst 内合并 ACK；末尾一次 Session TX FIFO drop、应用 dequeue 通知、reschedule/timer/pacer 更新 |
+| `tcp/established.rs`、`rcv_process.rs`、`syn_sent.rs` 每个 ACK 直接 `drop_dequeue`/`enqueue_ready` | `vnet/tcp/tcp_sack.h:127-147`、`vnet/tcp/tcp_input.c:494-545,875-892,1407-1412,2365-2370`、`vnet/session/session.c:738-749` | ACK 反馈给出 `bytes_acked`，worker 在 burst 内合并；末尾每 connection 一次 Session TX FIFO drop、应用 dequeue 通知、reschedule/timer/pacer 更新。service 不重新推算 TCP ACK 字节数 |
 | `service/session/core.rs::tx_fifo_peek_and_send` 一次只发送一个 Buffer，预留 60 字节 | `vnet/session/session_node.c:976-1677` | 一个 event 按 frame 预算生成多个 MSS/Buffer chain，首 Buffer 预留 140 字节，一次批量 `push_header` |
 | `service/session/core.rs::SessionIoDispatch` 合并 RX/TX 并返回 `(usize,bool)`；Session 类型等于 protocol | `vnet/session/session.c:1819-1921`、`session_node.c:1858-1910` | protocol 只注册 RX/control/time；IPv4/IPv6 Session type 各注册 TX/next，保留真实 TX outcome |
 | `tcp/lib.rs::send_params` 调用旧 `tx_payload_budget`，混入 pacing/Nagle/intent；缺 VPP Limited Transmit 和真实 `snd_mss` | `vnet/tcp/tcp.c:1100-1196`、`vnet/session/session_node.c:1530-1588` | TCP 给出即时 MSS/CC/peer window/offset；dupACK/SACK 尚未进入 recovery 时按 VPP 限额 Limited Transmit，通用 pacer 仅由 Session TX 扣账 |
@@ -1516,6 +1521,87 @@ runtime.record_current_node_error(error)?;
 // FIN follows payload processing; only seq_end == current rcv_nxt is accepted.
 ```
 
+FIN 不能由旧 `receive_close_side` 在入队前用 `packet.sequence == rcv_nxt`
+直接消费。`packet.sequence` 指向 payload 起点；同一个 packet 的 data 先写入
+Session RX FIFO 并按**实际连续交付量**推进 `rcv_nxt`，随后才比较原 packet 的
+`seq_end`（VPP `tcp_inlines.h:370-371` 定义为 `seq_number + data_len`，不含 FIN）。
+已有 `process_fin_after_payload` 与 `receive_close_side` 应收敛到这个
+顺序；不新建一份 FIN 处理状态。`FIN_WAIT_1` 还必须保留 VPP 的 `FINPNDG`
+分支，`FIN_WAIT_2` 有未读 RX 字节时必须先 flush enqueue event，之后才向
+Session 报告 transport closed。来源：`tcp_input.c:977-997,1361-1412,2260-2370`。
+
+```rust
+// VPP tcp_input.c:977-997,1361-1412,2260-2370.
+// In established/receive-process, run this only after ACK and payload RX.
+let fin_ready = packet.flags.contains(TcpSegmentFlags::FIN) && {
+    let connection = tcp.connections.get(connection_index)
+        .expect("validated TCP input retains the connection");
+    packet.sequence.advance(packet.payload_len as u32) == connection.rcv_nxt
+};
+if fin_ready {
+    let state = tcp.connections.get(connection_index)
+        .expect("validated TCP input retains the connection").state();
+    match state {
+        TcpState::Established => {
+            {
+                let connection = tcp.connections.get_mut(connection_index)
+                    .expect("FIN retains TCP connection");
+                connection.rcv_nxt = connection.rcv_nxt.advance(1);
+                connection.set_state(TcpState::CloseWait);
+                // Existing WAITCLOSE timer is updated to closewait_time here.
+            }
+            tcp.program_ack(runtime, sessions, connection_index, false);
+            tcp.program_disconnect(connection_index);
+        }
+        TcpState::FinWait1 => {
+            let fin_pending = {
+                let connection = tcp.connections.get_mut(connection_index)
+                    .expect("FIN retains TCP connection");
+                connection.rcv_nxt = connection.rcv_nxt.advance(1);
+                let pending = connection.fin_pending();
+                if pending {
+                    connection.mark_fin_received();
+                    // Remain FIN_WAIT_1; WAITCLOSE uses closewait_time.
+                } else {
+                    connection.set_state(TcpState::Closing);
+                    // WAITCLOSE uses closing_time.
+                }
+                pending
+            };
+            if !fin_pending {
+                tcp.program_ack(runtime, sessions, connection_index, false);
+            }
+        }
+        TcpState::FinWait2 => {
+            {
+                let connection = tcp.connections.get_mut(connection_index)
+                    .expect("FIN retains TCP connection");
+                connection.rcv_nxt = connection.rcv_nxt.advance(1);
+                connection.set_state(TcpState::TimeWait);
+                // Reset existing timers; set WAITCLOSE to timewait_time here.
+            }
+            tcp.program_ack(runtime, sessions, connection_index, false);
+            if sessions.session_from_handle(handle)
+                .and_then(Session::rx_fifo)
+                .expect("FIN retains Session RX FIFO").max_dequeue() != 0
+            {
+                sessions.flush_enqueue_events(runtime, tcp.protocol);
+            }
+            sessions.transport_closed(runtime, handle, connection_index)
+                .expect("FIN_WAIT_2 transport retains its Session");
+        }
+        _ => { /* existing state-specific FIN handling remains TCP-owned */ }
+    }
+}
+```
+
+上面的 FIN 片段说明**执行位置和状态结果**；`fin_pending`、
+`mark_fin_received` 表示现有 FIN pending 标志的读写，不批准为此新增公开
+TCP helper。连接状态和 timer 在短作用域内更新；借用结束后才调用 worker
+的 ACK、disconnect 或 service 通知。`SynRcvd`、
+`CloseWait`、`Closing`、`LastAck`、`TimeWait` 的分支保持 VPP
+`tcp_input.c:2275-2360` 的各自语义，不把所有 FIN 压成一个 close helper。
+
 按序 enqueue 返回的 `accepted + promoted` 才是 `rcv_nxt` 增量。VPP
 `tcp_input.c:1013-1029,1075-1076` 的 `bytes_in` 是独立统计：按序计本包实际写入量，
 成功的 OOO 入队计本包 data_len，即使与已有 OOO segment 重叠；本 ADR 不为此
@@ -1689,12 +1775,12 @@ let bytes_acked = {
     let TcpWorker { connections, timer_wheel, .. } = &mut *tcp;
     let connection = connections.get_mut(connection_index)
         .expect("input retains its TCP connection");
-    let snd_una_before = connection.snd_una();
+    // Target return: the existing ACK feedback's ac.bytes_acked; do not
+    // derive it afterward from FIFO capacity or a second ACK interpretation.
     connection.receive_ack_with_timers(
         connection_index, timer_wheel, &packet, acknowledgment,
         advertised_window, sack_blocks, now,
-    )?;
-    snd_una_before.distance_to(connection.snd_una())
+    )?
 };
 if bytes_acked != 0 {
     tcp.program_dequeue(connection_index, bytes_acked);
@@ -1836,7 +1922,11 @@ impl TcpWorker {
 }
 ```
 
-上述 per-packet ACK 示例中的 `receive_ack_with_timers` 在目标中只保留
+上述 per-packet ACK 示例将已有 `receive_ack_with_timers` 的返回值从 `()`
+改为 `u32`，值就是本次被接受的 ACK 反馈的 `bytes_acked`。这只修改已有
+TCP 私有方法，不新增 ACK carrier，也不让 service 重做 ACK/SACK 分类；
+VPP `tcp_sack.h:127-147`、`tcp_input.c:875-892` 是来源。
+`receive_ack_with_timers` 在目标中只保留
 ACK/SACK、RTT、loss/CC 与不依赖最终 FIFO head 的 timer 处理；其现有
 retransmit/pacer 更新必须从该方法移走，集中在 `handle_postponed_dequeues`。
 借用时将 `connections` 与 `timer_wheel` 解构成不相交字段，不能一边持有
@@ -2276,8 +2366,8 @@ transport 返回超过 burst 的 packet 数，均是 owner 不变量，带 Sessi
 | `Transport` 的即时 `send_params`、`flush_data`、`app_rx_event`、`custom_tx`、批量 `push_header` / service trait，由 TCP 实现 | 当前单包 TX、空 `flush_data`/`custom_tx`、RX `NotSupported` 不能承载 VPP 接线 | TCP plugin 在 owner worker 单态化调用；无 RX hook 是成功 no-op；Buffer 不足是 node/worker 资源路径，非新 `SessionError` |
 | `TransportTxTarget` / service | 同一 custom TX 入口在 VPP 注册期分别接 connection 或 internal Session；不能把 `void *`、IP 类型或运行时 `TxMode` 带进 service | 仅单态化入口构造；注册模式与 variant 不符为插件注册 bug，不返回数值错误 |
 | `OooResult` 语义、`RxDelivery::OutOfOrder.newest: Option<_>`、`Fifo` 的 OOO 元数据原位操作 / infra 与 service | 当前每包区间与临时 `Vec` 不是 FIFO 合并结果；按序总写入量不能反推 copied/promoted，segment 索引污染 chunk lookup，普通 `u32` 下从 `&Fifo` 写 list 索引不合法 | offset-zero 复用既有 `OooResult` 分离 copied/promoted，chunk lookup 只服务 chunk；容量不足归 TCP input node `FifoFull`，不增控制面错误 |
-| TCP existing connection/worker 的 PSH、ACK burst、reset state、timer/cleanup 字段与方法 / TCP plugin | 旧 packetized 路径直接 ACK/drop、默认 PSH，pending 列没有消费，timer/cleanup 分离 | TCP input/output owner 处理；timer wheel 的 Rust 可恢复失败保留已有 `TcpNodeError::TimerUpdateFailed`，必须清理 pending 队列后上报 |
-| TCP congestion 的 slow-start 事实与 recovery 的 dupACK/SACK/reorder 事实 / TCP plugin 私有契约 | 现有 `send_goal_size`/`tx_payload_budget` 不能重现 `tcp_cc_update_cwnd_limited` 的半窗口分支和 `tcp_snd_space_inline` 的 Limited Transmit | 只供 `TcpConnection::send_space` 与 `update_cwnd_limited` 使用；BBR 仍是既有连接私有算法，不把 CC 状态或新调度类型带进 service |
+| TCP existing connection/worker 的 PSH、ACK burst、reset state、timer/cleanup 字段与方法；现有 `receive_ack_with_timers` 返回 `bytes_acked: u32` / TCP plugin | 旧 packetized 路径直接 ACK/drop、默认 PSH，pending 列没有消费，timer/cleanup 分离；原 ACK 方法返回 `()` 丢掉 VPP `ac.bytes_acked` | TCP input/output owner 处理；只从已接受的 ACK 反馈向 worker pending 列传字节数，service 不分类 TCP ACK；timer wheel 的 Rust 可恢复失败保留已有 `TcpNodeError::TimerUpdateFailed`，必须清理 pending 队列后上报 |
+| transport congestion 的 BBR 状态与 TCP recovery 的 dupACK/SACK/reorder 事实 / `hammer-service::transport::congestion::CongestionController` trait | 现有 `send_goal_size`/`tx_payload_budget` 不能重现 `tcp_cc_update_cwnd_limited` 的半窗口分支和 `tcp_snd_space_inline` 的 Limited Transmit | `TcpConnection` 直接持有 service 的 `BbrController`，通过 trait 静态分派；TCP 不再保留私有函数表或状态擦除层，CC 不进入 Session 调度 |
 
 `session_transport_delete_request`/`session_stream_connect_notify` 的 Rust 对应入口在
 ADR-0040 的 Session 生命周期范围内；本 ADR 的 SYN-RCVD/SYN-SENT RST 代码不能
@@ -2332,4 +2422,5 @@ subscriber 通知与 AppWorker dequeue event 均由 service 在同一次
    ACK 后零窗口 persist/RTO 切换、timer token 在 cleanup 后失效跳过、cleanup
    队头未来时间不越过、FIN/RST 同一 burst 去重及原状态通知、
    send params 不重复执行旧 pacing 门控、datagram 部分/完整 record、output next 4/6 和
-   pending flush 的多 frame 扇出。当前仅写 ADR，未运行编译、测试、静态检查或 CI。
+   pending flush 的多 frame 扇出。当前已有部分实现，但 review 文档列出的
+   Session/TCP/FIFO 缺口尚未全部修复；未运行编译、测试、静态检查或 CI。

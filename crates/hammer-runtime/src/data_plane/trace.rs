@@ -87,16 +87,26 @@ impl DataPlaneMain {
         &self,
         error: E,
     ) -> RuntimeResult<NodeErrorIndex> {
+        self.record_current_node_error_count(error, 1)
+    }
+
+    /// Record a batch of occurrences classified by the current node.
+    #[inline]
+    pub fn record_current_node_error_count<E: NodeErrorCode>(
+        &self,
+        error: E,
+        count: u64,
+    ) -> RuntimeResult<NodeErrorIndex> {
         let node = self
             .current_node()
             .ok_or(RuntimeError::NodeDispatchContextMissing)?;
         let index = self.nodes.node_error_index(node, error.local_code())?;
-        if let Some(entry) = self.node_error_stats_entry_index.get() {
+        if count != 0 && let Some(entry) = self.node_error_stats_entry_index.get() {
             StatsMain::global()?.segment.increment_simple_counter(
                 entry,
                 self.thread_index(),
                 u32::from(index.get()),
-                1,
+                count,
             );
         }
         Ok(index)
