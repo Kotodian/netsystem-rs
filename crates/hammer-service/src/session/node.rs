@@ -57,7 +57,7 @@ impl Node for SessionInputNode {
         let session_worker = unsafe { session_main.worker_mut(runtime) }
             .expect("session-input runs only on a configured Data Worker");
         let pending = match app::ApplicationMain::global() {
-            Some(application_main) => match application_main.flush_worker_events(session_worker) {
+            Some(application_main) => match application_main.flush_worker_events(runtime, session_worker) {
                 Ok(pending) => pending,
                 Err(_) => true,
             },

@@ -1027,7 +1027,12 @@ fn tcp_session_control(
                 worker_index,
             );
         }
-        _ => unreachable!("TCP transport control receives only half-close, close, or reset"),
+        SessionEventType::Cleanup => {
+            let mut worker = tcp.worker(runtime.thread_index())
+                .map_err(|source| SessionError::TransportOpFailed { source })?;
+            worker.release_connection(connection_index);
+        }
+        _ => unreachable!("TCP transport control receives only half-close, close, reset, or cleanup"),
     }
     Ok(())
 }
@@ -1116,7 +1121,7 @@ fn tcp_session_update_time(
     {
         let mut worker = tcp.worker(runtime.thread_index())
             .map_err(|source| SessionError::TransportOpFailed { source })?;
-        worker.handle_cleanups(std::time::Instant::now(), sessions);
+        worker.handle_cleanups(runtime, std::time::Instant::now(), sessions)?;
     }
     <TcpMain as Transport<IpTransportEndpointConfig>>::update_time(tcp, now, worker_index);
     let mut worker = tcp

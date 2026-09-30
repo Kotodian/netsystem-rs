@@ -26,7 +26,7 @@ use hammer_runtime::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::app::ApplicationMain;
+use super::app::{ApplicationMain, SessionCleanup};
 use super::error::{SessionError, SessionQueueError};
 use super::segment_manager::{SegmentManager, SegmentManagerError, SegmentManagerMain};
 use crate::transport::{Transport, TransportSendParams, TransportTxTarget};
@@ -1082,10 +1082,10 @@ impl SessionWorker {
                                         >= u8::from(SessionState::TransportDeleted)
                                         && !session.flags.half_open
                                     {
-                                        self.queue_application_event(
+                                        self.queue_cleanup_event(
                                             runtime,
                                             handle,
-                                            SessionEventType::Cleanup,
+                                            SessionCleanup::Session,
                                         );
                                     }
                                     Ok(())
@@ -1821,6 +1821,19 @@ impl SessionWorker {
         index
     }
 
+    /// VPP: `session_program_transport_ctrl_evt`, session.c:223-245.
+    pub(crate) fn program_close(&mut self, runtime: &DataPlaneMain, handle: SessionHandle) {
+        self.allocate_control_event(SessionEvent::from((SessionEventType::Close, handle)));
+        if self.state() == SessionWorkerState::Interrupt {
+            runtime
+                .set_node_interrupt_pending(
+                    self.queue_node
+                        .expect("session-queue installs before Session close"),
+                )
+                .expect("registered session-queue accepts an interrupt");
+        }
+    }
+
     pub fn allocate_new_event(&mut self, event: SessionEvent) -> u32 {
         let index = self.event_elements.insert(SessionEventElement {
             event,
@@ -2203,6 +2216,89 @@ impl SessionWorker {
         Ok(())
     }
 
+    /// VPP: `session_transport_delete_request`, session.c:1064-1121. The
+    /// plugin removes its concrete lookup entry before this generic step.
+    pub fn transport_delete_request(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        connection_index: u32,
+    ) -> Result<bool, SessionError> {
+        let session = self
+            .session_from_handle(handle)
+            .ok_or(SessionError::NoSession)?;
+        assert_eq!(session.connection_index(), connection_index);
+        let state = session.load_state();
+        if state == SessionState::TransportDeleted {
+            return Ok(true);
+        }
+        session.store_state(SessionState::TransportDeleted);
+        let attached = self.queue_cleanup_event(runtime, handle, SessionCleanup::Transport);
+        if attached {
+            if state == SessionState::AppClosed {
+                self.program_close(runtime, handle);
+            } else if state == SessionState::Closed {
+                self.queue_cleanup_event(runtime, handle, SessionCleanup::Session);
+            }
+        } else {
+            self.cleanup(handle)
+                .expect("unattached Session remains allocated until transport deletion");
+        }
+        Ok(attached)
+    }
+
+    /// VPP: `session_input.c:277-296`. The application has observed transport
+    /// cleanup before its protocol-specific cleanup runs on this worker.
+    pub(crate) fn finish_transport_cleanup(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        handle: SessionHandle,
+    ) -> Result<(), SessionError> {
+        let session = self
+            .session_from_handle(handle)
+            .ok_or(SessionError::NoSession)?;
+        let protocol = session.transport_protocol();
+        let dispatch = SessionMain::global()?
+            .transport_control(protocol)
+            .ok_or(SessionError::TransportNotRegistered)?;
+        dispatch(self, runtime, handle.session_index, SessionEventType::Cleanup)?;
+        self.session_mut(handle.session_index)
+            .expect("transport cleanup retains its Session")
+            .detach_transport();
+        Ok(())
+    }
+
+    fn queue_cleanup_event(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        cleanup: SessionCleanup,
+    ) -> bool {
+        let session = self
+            .session_from_handle(handle)
+            .expect("cleanup retains its Session");
+        let Some(app_worker_index) = session.application_worker() else {
+            return false;
+        };
+        let application = ApplicationMain::global()
+            .expect("Application Main remains initialized while Session is attached");
+        // SAFETY: this Session worker exclusively executes its AppWorker event slot.
+        let app_worker = unsafe { application.worker(app_worker_index) }
+            .expect("attached Session retains its AppWorker");
+        app_worker.add_event_custom(
+            handle.worker_index,
+            &SessionEvent {
+                event_type: SessionEventType::Cleanup.into(),
+                postponed: 0,
+                session_index: handle.session_index,
+                worker_index: cleanup as u32,
+                rpc_sequence: 0,
+            },
+        );
+        self.program_app_worker(runtime, app_worker_index);
+        true
+    }
+
     fn queue_application_event(
         &mut self,
         runtime: &DataPlaneMain,
@@ -2346,6 +2442,32 @@ impl Session {
         SessionState::from(self.state.load(Ordering::Acquire))
     }
 
+    /// VPP: `session_close`, session.c:1540-1574. App close intent is
+    /// independent of transport-initiated Session state transitions.
+    pub fn close(&mut self) {
+        if self.flags.app_closed {
+            return;
+        }
+        self.flags.app_closed = true;
+        self.flags.close_pending = true;
+        if u8::from(self.load_state()) < u8::from(SessionState::Closing) {
+            if let Some(fifo) = self.tx_fifo() {
+                fifo.clear_deq_notification();
+            }
+            self.store_state(SessionState::Closing);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn take_close_request(&mut self) -> bool {
+        std::mem::take(&mut self.flags.close_pending)
+    }
+
+    #[inline(always)]
+    pub(crate) const fn app_closed(&self) -> bool {
+        self.flags.app_closed
+    }
+
     #[inline(always)]
     pub fn opaque(&self) -> &u32 {
         &self.opaque
@@ -2401,6 +2523,12 @@ impl Session {
     #[inline(always)]
     pub const fn connection_index(&self) -> u32 {
         self.connection_index
+    }
+
+    #[inline(always)]
+    pub(crate) fn detach_transport(&mut self) {
+        self.connection_index = SESSION_INDEX_INVALID;
+        self.store_state(SessionState::TransportDeleted);
     }
 
     #[inline(always)]
@@ -2837,6 +2965,8 @@ pub struct SessionFlags {
     pub connectionless: bool,
     pub half_open: bool,
     pub migrating: bool,
+    pub app_closed: bool,
+    close_pending: bool,
     pub rx_event: bool,
     pub rx_ready: bool,
     pub tx_ready: bool,
@@ -2899,7 +3029,44 @@ impl From<(SessionEventType, SessionHandle)> for SessionEvent {
 
 #[cfg(test)]
 mod event_tests {
-    use super::{SessionEvent, SessionEventType, SessionHandle};
+    use super::{Session, SessionEvent, SessionEventType, SessionHandle, SessionState};
+
+    #[test]
+    fn application_close_requests_one_transport_control_event() {
+        let mut session = Session::new(
+            SessionHandle {
+                session_index: 7,
+                worker_index: 1,
+            },
+            SessionState::Ready,
+            0,
+            0,
+            0,
+        );
+        session.close();
+        assert_eq!(session.load_state(), SessionState::Closing);
+        assert!(session.app_closed());
+        assert!(session.take_close_request());
+        session.close();
+        assert!(!session.take_close_request());
+    }
+
+    #[test]
+    fn application_close_preserves_transport_deleted_state() {
+        let mut session = Session::new(
+            SessionHandle {
+                session_index: 7,
+                worker_index: 1,
+            },
+            SessionState::TransportDeleted,
+            0,
+            0,
+            0,
+        );
+        session.close();
+        assert_eq!(session.load_state(), SessionState::TransportDeleted);
+        assert!(session.take_close_request());
+    }
 
     #[test]
     fn session_event_matches_vpp_record_size() {
@@ -3273,8 +3440,12 @@ impl SessionMain {
         let slot = usize::from(session_type);
         let tx_entries = unsafe { &mut *self.session_tx.get() };
         let next_entries = unsafe { &mut *self.session_type_to_next.get() };
-        tx_entries.resize(slot + 1, None);
-        next_entries.resize(slot + 1, None);
+        if tx_entries.len() <= slot {
+            tx_entries.resize(slot + 1, None);
+        }
+        if next_entries.len() <= slot {
+            next_entries.resize(slot + 1, None);
+        }
         assert!(tx_entries[slot].is_none() && next_entries[slot].is_none());
         tx_entries[slot] = Some(tx);
         next_entries[slot] = Some(output_next);
@@ -3594,8 +3765,7 @@ impl SessionMain {
         if entry.handle != session {
             return Err(SessionError::NoSession);
         }
-        entry.connection_index = SESSION_INDEX_INVALID;
-        entry.store_state(SessionState::TransportDeleted);
+        entry.detach_transport();
         Ok(())
     }
 

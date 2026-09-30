@@ -15,6 +15,7 @@ use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQError, SvmMsgQ
 use hammer_infra::svm::queue::SvmQueueConditionalWait;
 use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
 use hammer_infra::sync::SpinLock;
+use hammer_runtime::DataPlaneMain;
 use hammer_runtime::config::worker::worker_count;
 
 use super::core::{
@@ -505,6 +506,7 @@ impl<'segment> AppWorker<'segment> {
     pub fn flush_events(
         &self,
         application: &Application<'_>,
+        runtime: &mut DataPlaneMain,
         session_worker: &mut SessionWorker,
     ) -> Result<bool, ApplicationError> {
         let worker = session_worker.worker_index();
@@ -648,7 +650,7 @@ impl<'segment> AppWorker<'segment> {
                                 let session = session_worker
                                     .session_mut(handle.session_index)
                                     .expect("accepted Session remains allocated after callback");
-                                let app_closed = matches!(
+                                let app_closed = session.app_closed() || matches!(
                                     state,
                                     SessionState::AppClosed
                                         | SessionState::Closed
@@ -713,16 +715,24 @@ impl<'segment> AppWorker<'segment> {
                             {
                                 session.set_rx_ready(false);
                             }
-                            if event_type == SessionEventType::Disconnected {
-                                let session = session_worker
-                                    .session_mut(handle.session_index)
-                                    .expect("validated disconnect Session remains allocated");
-                                (application.disconnected)(session);
-                            } else {
-                                let session = session_worker
-                                    .session_mut(handle.session_index)
-                                    .expect("validated reset Session remains allocated");
-                                (application.reset)(session);
+                            if !session_worker
+                                .session(handle.session_index)
+                                .expect("validated Session remains allocated")
+                                .app_closed()
+                            {
+                                // VPP session_input.c:221-237 suppresses repeated
+                                // close notifications after the app requests close.
+                                if event_type == SessionEventType::Disconnected {
+                                    let session = session_worker
+                                        .session_mut(handle.session_index)
+                                        .expect("validated disconnect Session remains allocated");
+                                    (application.disconnected)(session);
+                                } else {
+                                    let session = session_worker
+                                        .session_mut(handle.session_index)
+                                        .expect("validated reset Session remains allocated");
+                                    (application.reset)(session);
+                                }
                             }
                         }
                     }
@@ -751,6 +761,10 @@ impl<'segment> AppWorker<'segment> {
                                     .session_mut(handle.session_index)
                                     .expect("Application cleanup retains its Session")
                                     .detach_application();
+                            } else {
+                                session_worker
+                                    .finish_transport_cleanup(runtime, handle)
+                                    .expect("registered transport completes its cleanup after the Application callback");
                             }
                         }
                         // VPP session_input.c:282-305 skips the application
@@ -822,6 +836,17 @@ impl<'segment> AppWorker<'segment> {
                     }
                     _ => panic!("AppWorker received unsupported Session event {event_type:?}"),
                 }
+            }
+            // VPP: `session_close`, session.c:1540-1574, and
+            // `session_program_transport_ctrl_evt`, session.c:223-245.
+            // The callback's mutable Session borrow ends before the local
+            // worker control list receives the Close request.
+            if valid_session
+                && session_worker
+                    .session_mut(handle.session_index)
+                    .is_some_and(Session::take_close_request)
+            {
+                session_worker.program_close(runtime, handle);
             }
             consumed += 1;
         }
@@ -1365,6 +1390,7 @@ impl<'app> ApplicationMain<'app> {
     /// worker visits only AppWorkers whose first event set its pending bit.
     pub fn flush_worker_events(
         &self,
+        runtime: &mut DataPlaneMain,
         session_worker: &mut SessionWorker,
     ) -> Result<bool, ApplicationError> {
         let mut pending = session_worker.pending_app_workers().first_set();
@@ -1378,7 +1404,7 @@ impl<'app> ApplicationMain<'app> {
             // worker execution excludes Main Thread detach.
             let application = unsafe { self.application(app_worker.application) }
                 .expect("pending AppWorker retains its owning Application");
-            if !app_worker.flush_events(application, session_worker)? {
+            if !app_worker.flush_events(application, runtime, session_worker)? {
                 session_worker.clear_pending_app_worker(worker);
             }
             pending = session_worker.pending_app_workers().next_set(index);

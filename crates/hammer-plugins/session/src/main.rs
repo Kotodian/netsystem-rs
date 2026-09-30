@@ -6,13 +6,13 @@ use hammer_runtime::DataPlaneMain;
 use hammer_service::session::app::{ApplicationError, ApplicationEventResult, ApplicationMain};
 use hammer_service::session::{
     SessionEndpoint, SessionError, SessionHandle, SessionLookup, SessionMain, SessionQueueNext,
-    SessionState, SessionTxDispatch,
+    SessionState, SessionTxDispatch, SessionWorker,
 };
 use hammer_service::transport::{Transport, TransportMain};
 
 use crate::config::IpSessionConfig;
 use crate::endpoint::{
-    ENDPOINT_INVALID_INDEX, IpSessionEndpoint, IpSessionEndpointConfig,
+    ENDPOINT_INVALID_INDEX, IpSessionEndpoint, IpSessionEndpointConfig, IpTransportConnectionId,
     IpTransportEndpoint, IpTransportEndpointConfig,
 };
 use crate::lookup::{IpSessionFamily, IpSessionLookup};
@@ -534,20 +534,24 @@ impl IpSessionMain {
 
     /// # Safety
     /// The runtime must exclusively own the session's worker slot.
-    pub unsafe fn notify_deleted(
+    pub fn notify_deleted(
         &self,
-        runtime: &mut DataPlaneMain,
+        runtime: &DataPlaneMain,
+        sessions: &mut SessionWorker,
         session: SessionHandle,
         connection_index: u32,
-    ) -> Result<(), SessionError> {
-        let Some(entry) =
-            (unsafe { self.session.worker_mut(runtime)? }).session(session.session_index)
-        else {
+        connection: &IpTransportConnectionId,
+    ) -> Result<bool, SessionError> {
+        let Some(entry) = sessions.session_from_handle(session) else {
             return Err(SessionError::NoSession);
         };
         if entry.handle() != session || entry.connection_index() != connection_index {
             return Err(SessionError::NoSession);
         }
-        unsafe { self.session.detach_transport(runtime, session) }
+        // VPP session.c:1064-1121 removes the Session lookup before posting
+        // application transport cleanup; a reused tuple must not erase a new
+        // Session's handle.
+        self.lookup.remove_connection_if_current(connection, session.into());
+        sessions.transport_delete_request(runtime, session, connection_index)
     }
 }

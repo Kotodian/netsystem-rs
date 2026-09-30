@@ -427,6 +427,7 @@ fn interface_route_dpo(
     proto: DpoProto,
     child: DpoId,
     flags: FibEntryFlags,
+    sw_if_index: u32,
 ) -> DpoId {
     let net = NetMain::global().expect("interface route requires the network Main");
     let mut load_balance = LoadBalanceDpo::new(
@@ -444,6 +445,25 @@ fn interface_route_dpo(
     let dpo = net
         .create_load_balance(main, proto, load_balance)
         .expect("interface route DPO registration is installed");
+    // VPP fib_entry_src.c installs the path list's uRPF interfaces on the LB.
+    let urpf_interface = if flags.contains(FibEntryFlags::ATTACHED) {
+        Some(sw_if_index)
+    } else if flags.contains(FibEntryFlags::LOOSE_URPF_EXEMPT) {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(interface) = urpf_interface {
+        let urpf = net
+            .create_urpf_list(vec![interface])
+            .expect("interface route uRPF list creation is installed");
+        assert_eq!(
+            net.set_load_balance_urpf(dpo, urpf)
+                .expect("interface route load-balance accepts its uRPF list"),
+            Some(())
+        );
+        net.unlock_urpf_list(urpf);
+    }
     net.unlock_dpo(child);
     dpo
 }
@@ -466,6 +486,7 @@ fn ip4_add_interface_routes(
         DpoProto::IP4,
         local,
         FibEntryFlags::CONNECTED | FibEntryFlags::LOCAL,
+        sw_if_index,
     );
     let family = IP4_MAIN
         .get()
@@ -533,6 +554,7 @@ fn ip4_add_interface_routes(
             DpoProto::IP4,
             connected,
             FibEntryFlags::CONNECTED | FibEntryFlags::ATTACHED,
+            sw_if_index,
         );
         family
             .fib_table_mut(fib_index)
@@ -552,6 +574,7 @@ fn ip4_add_interface_routes(
                     DpoProto::IP4,
                     drop,
                     FibEntryFlags::DROP | FibEntryFlags::LOOSE_URPF_EXEMPT,
+                    sw_if_index,
                 );
                 family
                     .fib_table_mut(fib_index)
@@ -594,8 +617,13 @@ fn ip4_add_interface_routes(
                 adjacency.dpo(&net.dpo_main(), index)
             };
             update_adjacency_output_config(sw_if_index, DpoProto::IP4);
-            let attached_dpo =
-                interface_route_dpo(main, DpoProto::IP4, attached, FibEntryFlags::ATTACHED);
+            let attached_dpo = interface_route_dpo(
+                main,
+                DpoProto::IP4,
+                attached,
+                FibEntryFlags::ATTACHED,
+                sw_if_index,
+            );
             family
                 .fib_table_mut(fib_index)
                 .add_route(
@@ -681,6 +709,7 @@ fn ip6_add_interface_routes(
         DpoProto::IP6,
         local,
         FibEntryFlags::CONNECTED | FibEntryFlags::LOCAL,
+        sw_if_index,
     );
     let family = IP6_MAIN
         .get()
@@ -744,6 +773,7 @@ fn ip6_add_interface_routes(
             DpoProto::IP6,
             connected,
             FibEntryFlags::CONNECTED | FibEntryFlags::ATTACHED,
+            sw_if_index,
         );
         family
             .fib_table_mut(fib_index)
@@ -1795,6 +1825,13 @@ mod tests {
                 .lookup_exact(ip4_connected)
                 .is_some()
         );
+        let source_dpo = IP4_MAIN
+            .get()
+            .unwrap()
+            .forwarding_dpo(0, Ipv4Addr::new(192, 0, 2, 2))
+            .unwrap();
+        let urpf = net.load_balance_urpf(source_dpo).unwrap();
+        assert_eq!(net.urpf_check(urpf, sw_if_index), Some(true));
         interfaces
             .set_software_flags(&mut data_plane, sw_if_index, SwInterfaceFlags::empty())
             .unwrap();
@@ -1867,6 +1904,13 @@ mod tests {
                 .lookup_exact(ip6_connected)
                 .is_some()
         );
+        let source_dpo = IP6_MAIN
+            .get()
+            .unwrap()
+            .forwarding_dpo(0, "2001:db8::2".parse().unwrap())
+            .unwrap();
+        let urpf = net.load_balance_urpf(source_dpo).unwrap();
+        assert_eq!(net.urpf_check(urpf, sw_if_index), Some(true));
         interfaces
             .set_software_flags(&mut data_plane, sw_if_index, SwInterfaceFlags::empty())
             .unwrap();

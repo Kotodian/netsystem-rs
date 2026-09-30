@@ -363,7 +363,7 @@ fn on_rx(app_session: &mut Session) {
                     Ok(inspected) => inspected,
                     Err(_) => {
                         session.phase = SessionPhase::Closing;
-                        app_session.store_state(SessionState::AppClosed);
+                        app_session.close();
                         return;
                     }
                 };
@@ -426,7 +426,7 @@ fn on_rx(app_session: &mut Session) {
                     }
                     ControlAction::Close => {
                         session.phase = SessionPhase::Closing;
-                        app_session.store_state(SessionState::AppClosed);
+                        app_session.close();
                         return;
                     }
                 }
@@ -460,7 +460,7 @@ fn on_disconnect(app_session: &mut Session) {
         .get_mut(index)
         .expect("iperf3 Session record remains live until Session cleanup");
     session.phase = SessionPhase::Closing;
-    app_session.store_state(SessionState::AppClosed);
+    app_session.close();
 }
 
 fn on_reset(session: &mut Session) {

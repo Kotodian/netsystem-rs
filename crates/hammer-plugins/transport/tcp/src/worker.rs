@@ -4,8 +4,9 @@ use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 use hammer_infra::fifo_queue::FifoQueue;
 use hammer_infra::pool::Pool;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
+use hammer_plugin_session::IpSessionMain;
 use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeResult};
-use hammer_service::session::{SessionQueueNext, SessionWorker};
+use hammer_service::session::{SessionError, SessionHandle, SessionQueueNext, SessionWorker};
 
 use super::lookup::TcpLookupState;
 use super::timers::{self, TCP_TIMER_EXPIRY_BUDGET, TCP_TIMER_KIND_COUNT, TcpTimerKind, TcpTimerToken};
@@ -43,6 +44,7 @@ pub struct TcpWorker {
 struct TcpCleanupRequest {
     free_time: Instant,
     connection_index: u32,
+    session: SessionHandle,
 }
 
 // VPP: tcp.c:1722, tcp_cfg.cleanup_time defaults to 0.1 seconds.
@@ -58,46 +60,82 @@ const _: () = {
 impl TcpWorker {
     /// VPP: tcp.c:345-355, tcp_program_cleanup.
     pub(super) fn program_cleanup(&mut self, connection_index: u32) {
+        let session = self.connections.get(connection_index)
+            .expect("scheduled TCP cleanup retains its connection")
+            .base.session;
         self.pending_cleanups.push_back(TcpCleanupRequest {
             free_time: self.last_timer_update + TCP_CLEANUP_TIME,
             connection_index,
+            session,
         });
     }
 
     /// VPP: tcp.c:1335-1358, tcp_handle_cleanups. A cancelled timer token
     /// remains harmless in the pending timer FIFO after this pool removal.
-    pub(super) fn handle_cleanups(&mut self, now: Instant, sessions: &SessionWorker) {
+    pub(super) fn handle_cleanups(
+        &mut self,
+        runtime: &DataPlaneMain,
+        now: Instant,
+        sessions: &mut SessionWorker,
+    ) -> Result<(), SessionError> {
+        let ip_session = IpSessionMain::global()?;
         while !self.pending_cleanups.is_empty() {
             if !self.pending_cleanups.front().is_some_and(|request| request.free_time <= now) {
                 break;
             }
-            let connection_index = self.pending_cleanups.front()
-                .expect("due TCP cleanup remains queued").connection_index;
-            let Some(connection) = self.connections.get_mut(connection_index) else {
+            let request = self.pending_cleanups.front()
+                .expect("due TCP cleanup remains queued");
+            let connection_index = request.connection_index;
+            let Some(connection) = self.connections.get(connection_index) else {
                 self.pending_cleanups.pop_front();
                 continue;
             };
-            if sessions.session_from_handle(connection.base.session).is_some() {
-                // The Session owner must first complete its delete-request;
-                // retaining this due request cannot race that lifecycle step.
-                break;
+            if connection.base.session != request.session {
+                self.pending_cleanups.pop_front();
+                continue;
             }
-            self.pending_cleanups.pop_front();
-            for id in 0..TCP_TIMER_KIND_COUNT as u32 {
-                let kind = TcpTimerKind::from_id(id)
-                    .expect("TCP timer count covers every registered kind");
-                timers::reset(
-                    &mut self.timer_wheel,
+            let endpoint = connection.base.endpoint;
+            let attached = if sessions.session_from_handle(request.session).is_some() {
+                ip_session.notify_deleted(
+                    runtime,
+                    sessions,
+                    request.session,
                     connection_index,
-                    connection.timer_state_mut(),
-                    kind,
-                );
+                    &endpoint,
+                )?
+            } else {
+                ip_session.lookup_main()
+                    .remove_connection_if_current(&endpoint, request.session.into());
+                false
+            };
+            self.pending_cleanups.pop_front();
+            if !attached {
+                self.release_connection(connection_index);
             }
-            let session_index = connection.base.session.session_index;
-            self.lookup.forget_session(session_index);
-            self.lookup.forget_pending_open(session_index);
-            self.remove_connection(connection_index);
         }
+        Ok(())
+    }
+
+    /// VPP: `tcp_connection_cleanup`, tcp.c:250-288. The Session lookup was
+    /// removed before this transport-owned connection and its timers.
+    pub(crate) fn release_connection(&mut self, connection_index: u32) {
+        let Some(connection) = self.connections.get_mut(connection_index) else {
+            return;
+        };
+        for id in 0..TCP_TIMER_KIND_COUNT as u32 {
+            let kind = TcpTimerKind::from_id(id)
+                .expect("TCP timer count covers every registered kind");
+            timers::reset(
+                &mut self.timer_wheel,
+                connection_index,
+                connection.timer_state_mut(),
+                kind,
+            );
+        }
+        let session_index = connection.base.session.session_index;
+        self.lookup.forget_session(session_index);
+        self.lookup.forget_pending_open(session_index);
+        self.remove_connection(connection_index);
     }
 
     /// VPP: tcp_output.c:1058-1089. ACKs enter Session custom TX once;
