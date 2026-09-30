@@ -80,12 +80,22 @@ impl DataPlaneMain {
         let output = runtime.block_on(async {
             tokio::pin!(future);
             let mut processing = Vec::new();
+            let mut queue_signal_interval = tokio::time::interval(Duration::from_micros(400));
+            queue_signal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            queue_signal_interval.tick().await;
             loop {
                 // VPP main.c:1497-1512: main-thread RPCs run once before File.
                 poll_main_thread_futures(&mut processing);
+                // VPP main.c:1585-1586 checks the API queues from the main
+                // loop, then signals the API Process if work is pending.
+                if let Some(callback) = self.queue_signal_callback {
+                    callback(self)?;
+                }
                 self.nodes.restore_processes(Instant::now())?;
+                let queue_signal_enabled = self.queue_signal_callback.is_some();
                 tokio::select! {
                     _ = MAIN_THREAD_FUTURES_READY.notified() => {}
+                    _ = queue_signal_interval.tick(), if queue_signal_enabled => {}
                     output = &mut future => break Ok(output),
                     readiness = self.next_file_readiness() => {
                         readiness?;

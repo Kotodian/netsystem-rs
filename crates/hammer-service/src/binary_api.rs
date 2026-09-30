@@ -295,22 +295,32 @@ fn binary_api_clnt(
 ) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
     let api = ApiMain::current();
     let mapped = api.is_mapped();
-    let initialized = (|| {
-        control::setup_message_id_table(api);
-        hammer_runtime::init::run_api_init(main)
-    })();
+    control::setup_message_id_table(api);
+    let initialized = hammer_runtime::init::run_api_init(main);
+    let events = if mapped && initialized.is_ok() {
+        Some(main.process_events())
+    } else {
+        None
+    };
+    if events.as_ref().is_some_and(Result::is_ok) {
+        main.set_queue_signal_callback(memclnt_queue_callback);
+    }
     async move {
         initialized?;
-        if !mapped {
+        let Some(mut events) = events.transpose()? else {
             return Ok(());
-        }
+        };
         let scan_interval = Duration::from_secs(10);
         let mut next_scan = Instant::now() + scan_interval;
         loop {
             let drain_started = Instant::now();
+            let mut queue_empty = false;
             loop {
                 match memclnt::receive() {
-                    Ok(false) => break,
+                    Ok(false) => {
+                        queue_empty = true;
+                        break;
+                    }
                     Ok(true) => (),
                     Err(
                         source @ SvmQueueError::SignalAfterCommit {
@@ -333,16 +343,53 @@ fn binary_api_clnt(
                     break;
                 }
             }
+            // VPP memclnt_api.c:384-425 waits for a queue event when drained;
+            // its no-vector branch pauses for 10us after the dispatch budget.
+            let sleep_time = if queue_empty {
+                Duration::from_secs(20)
+            } else {
+                Duration::from_micros(10)
+            };
+            let wake_at = (Instant::now() + sleep_time).min(next_scan);
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some((QUEUE_SIGNAL_EVENT, _)) => api.clear_queue_signal_pending(),
+                    Some((event_type, _)) => {
+                        tracing::warn!(event_type, "unknown memory API Process event");
+                    }
+                    None => return Ok(()),
+                },
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+            }
             let now = Instant::now();
             if now >= next_scan {
-                hammer_runtime::worker_thread_barrier_sync!({
-                    api.dead_client_scan(now);
-                });
+                // VPP memclnt_api.c:473-476: the liveness scan has no barrier.
+                api.dead_client_scan(now);
                 next_scan = Instant::now() + scan_interval;
             }
-            let wake_at = (Instant::now() + Duration::from_micros(400)).min(next_scan);
-            tokio::task::yield_now().await;
-            tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)).await;
         }
     }
+}
+
+const QUEUE_SIGNAL_EVENT: u64 = 1;
+
+/// VPP: `memclnt_queue_callback`, memory_api.c:31-87.
+fn memclnt_queue_callback(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let api = ApiMain::current();
+    if !api.mark_queue_signal_pending() {
+        return Ok(());
+    }
+    let queue = unsafe { api.shmem_header().input_queue() };
+    if !queue.is_nonempty_relaxed() {
+        api.clear_queue_signal_pending();
+        return Ok(());
+    }
+    let node = __PROCESS_NODE_BINARY_API
+        .process_node_index()
+        .expect("Binary API Process node is registered before queue signals");
+    if let Err(error) = main.signal_process(node, QUEUE_SIGNAL_EVENT, 0) {
+        api.clear_queue_signal_pending();
+        return Err(error);
+    }
+    Ok(())
 }

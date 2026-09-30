@@ -420,6 +420,14 @@ impl SvmQueue {
         Ok(self.len()? == 0)
     }
 
+    /// A lock-free occupancy hint for a main-loop queue signal callback.
+    /// VPP: `memclnt_queue_callback`, memory_api.c:60-70. Consumers still
+    /// acquire the shared queue lock before removing an element.
+    #[inline(always)]
+    pub fn is_nonempty_relaxed(&self) -> bool {
+        self.cursize.load(Ordering::Relaxed) != 0
+    }
+
     pub fn is_full(&self) -> Result<bool, SvmQueueError> {
         let guard = self.lock()?;
         Ok(guard.queue.cursize.load(Ordering::Relaxed) == self.maxsize)

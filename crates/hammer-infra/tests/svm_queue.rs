@@ -57,17 +57,20 @@ fn queue_uses_shared_inline_slots_and_stack_typed_receive() {
     ));
     let attached = unsafe { SvmQueue::attach(base, bytes) }.expect("attach same mapping");
     assert_eq!(attached, address);
+    assert!(!queue.is_nonempty_relaxed());
     assert!(queue.can_send());
     assert!(matches!(queue.try_sub_element::<u64>(), Ok(None)));
     queue
         .add_element(&42_u64, SvmQueueConditionalWait::Wait)
         .expect("enqueue address-sized element");
+    assert!(queue.is_nonempty_relaxed());
     assert_eq!(
         queue
             .sub_element::<u64>(SvmQueueConditionalWait::Nowait)
             .expect("stack receive"),
         42
     );
+    assert!(!queue.is_nonempty_relaxed());
     if size_of::<usize>() == queue.element_size() {
         let payload = [0x5A_u8; 32];
         let address = payload.as_ptr() as usize;
@@ -100,6 +103,7 @@ fn queue_uses_shared_inline_slots_and_stack_typed_receive() {
             .add_element(&index, SvmQueueConditionalWait::Nowait)
             .expect("fill queue");
     }
+    assert!(queue.is_nonempty_relaxed());
     assert!(!queue.can_send());
     assert!(matches!(
         queue.add_element(&99_u64, SvmQueueConditionalWait::Nowait),
@@ -113,6 +117,7 @@ fn queue_uses_shared_inline_slots_and_stack_typed_receive() {
             index
         );
     }
+    assert!(!queue.is_nonempty_relaxed());
     assert!(matches!(
         queue.sub_element::<u32>(SvmQueueConditionalWait::Nowait),
         Err(SvmQueueError::ElementSizeMismatch {

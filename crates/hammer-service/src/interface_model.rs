@@ -1566,6 +1566,7 @@ pub fn interface_main_init() -> RuntimeResult<()> {
     );
     match hammer_runtime::PluginMain::global() {
         Ok(plugins) => {
+            let mut consumed_images = Vec::new();
             for plugin in plugins.loaded_plugins() {
                 let image = match plugins.get_plugin_symbol::<InterfaceRegistrationImage>(
                     &plugin,
@@ -1575,9 +1576,14 @@ pub fn interface_main_init() -> RuntimeResult<()> {
                     Err(hammer_runtime::PluginError::SymbolLookup { .. }) => continue,
                     Err(error) => return Err(error.into()),
                 };
+                // dlsym on a plugin handle may resolve the symbol in a dependency.
+                if consumed_images.contains(&image) {
+                    continue;
+                }
                 // SAFETY: the service-owned export has this concrete type and
                 // PluginMain keeps its defining DSO mapped for process life.
                 interfaces.consume_registration_image(unsafe { &*image })?;
+                consumed_images.push(image);
             }
         }
         Err(hammer_runtime::PluginError::MainUnavailable) => {}

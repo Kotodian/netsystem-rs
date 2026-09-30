@@ -234,7 +234,10 @@ fn process_input_packet(
         (
             buffer.trace_handle().is_some(),
             match version {
-                IpVersion::V4 => classify_ipv4_input(buffer.current()),
+                IpVersion::V4 => classify_ipv4_input(
+                    buffer.current(),
+                    buffer.current_len() + buffer.total_len_not_including_first(),
+                ),
                 IpVersion::V6 => classify_ipv6_input(buffer.current()),
             },
             ip_ecn_from_packet(buffer.current(), version),
@@ -248,7 +251,7 @@ fn process_input_packet(
         network_header_len,
         transport_header_offset,
     ) = match classification {
-        Err(_) => {
+        Err(error) => {
             runtime.buffer_mut(index).clear_node_error();
             if unlikely(traced) {
                 let _ = add_packet_trace!(
@@ -258,14 +261,14 @@ fn process_input_packet(
                         version: None,
                         protocol: None,
                         input_target: None,
-                        input_error: Some(IpInputError::BadLength),
+                        input_error: Some(error),
                         packet_len: 0,
                         next: drop_next,
                     },
                 );
             }
             *next = drop_next;
-            *packet_error = IpInputError::BadLength;
+            *packet_error = error;
             return Ok(());
         }
         Ok(classification) => classification,
@@ -302,7 +305,7 @@ fn process_input_packet(
         packet_len,
         next: drop_next,
     });
-    let resolved = match input_target {
+    let fallback_next = match input_target {
         IpInputTarget::Drop => drop_next,
         IpInputTarget::Punt => match version {
             IpVersion::V4 => Ip4InputNext::Punt.slot() as u16,
@@ -312,43 +315,13 @@ fn process_input_packet(
             IpVersion::V4 => Ip4InputNext::Options.slot() as u16,
             IpVersion::V6 => Ip6InputNext::Options.slot() as u16,
         },
-        IpInputTarget::Lookup => {
-            let default_next = match version {
-                IpVersion::V4 => Ip4InputNext::Lookup.slot() as u16,
-                IpVersion::V6 => Ip6InputNext::Lookup.slot() as u16,
-            };
-            let arc_index = unsafe {
-                match version {
-                    IpVersion::V4 => {
-                        (*crate::lookup::IP4_MAIN
-                            .get()
-                            .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
-                                plugin: "ip",
-                            })?
-                            .lookup_main
-                            .get())
-                        .unicast_feature_arc_index
-                    }
-                    IpVersion::V6 => {
-                        (*crate::lookup::IP6_MAIN
-                            .get()
-                            .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
-                                plugin: "ip",
-                            })?
-                            .lookup_main
-                            .get())
-                        .unicast_feature_arc_index
-                    }
-                }
-            };
-            let features = FeatureMain::global()?;
-            let mut buffer = runtime.buffer_mut(index);
-            let interface_index =
-                hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-            features.start_feature_arc(arc_index, interface_index, &mut buffer, default_next)
-        }
-        IpInputTarget::LookupMulticast => match version {
+        IpInputTarget::Lookup => match version {
             IpVersion::V4 => Ip4InputNext::Lookup.slot() as u16,
+            IpVersion::V6 => Ip6InputNext::Lookup.slot() as u16,
+        },
+        IpInputTarget::LookupMulticast => match version {
+            // MFIB is not installed yet; multicast must not enter the unicast FIB.
+            IpVersion::V4 => Ip4InputNext::Punt.slot() as u16,
             IpVersion::V6 => Ip6InputNext::Lookup.slot() as u16,
         },
         IpInputTarget::IcmpError => {
@@ -367,6 +340,54 @@ fn process_input_packet(
             IpVersion::V6 => Ip6InputNext::Reassembly.slot() as u16,
         },
     };
+    let start_unicast_arc = matches!(input_target, IpInputTarget::Lookup)
+        || matches!(version, IpVersion::V4)
+            && matches!(
+                input_target,
+                IpInputTarget::LookupMulticast | IpInputTarget::Reassembly
+            );
+    let resolved = if start_unicast_arc {
+        let default_next = match version {
+            IpVersion::V4 => Ip4InputNext::Lookup.slot() as u16,
+            IpVersion::V6 => Ip6InputNext::Lookup.slot() as u16,
+        };
+        let arc_index = unsafe {
+            match version {
+                IpVersion::V4 => {
+                    (*crate::lookup::IP4_MAIN
+                        .get()
+                        .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
+                            plugin: "ip",
+                        })?
+                        .lookup_main
+                        .get())
+                    .unicast_feature_arc_index
+                }
+                IpVersion::V6 => {
+                    (*crate::lookup::IP6_MAIN
+                        .get()
+                        .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
+                            plugin: "ip",
+                        })?
+                        .lookup_main
+                        .get())
+                    .unicast_feature_arc_index
+                }
+            }
+        };
+        let features = FeatureMain::global()?;
+        let mut buffer = runtime.buffer_mut(index);
+        let interface_index = hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
+        let feature_next =
+            features.start_feature_arc(arc_index, interface_index, &mut buffer, default_next);
+        if feature_next == default_next {
+            fallback_next
+        } else {
+            feature_next
+        }
+    } else {
+        fallback_next
+    };
     if let Some(trace) = trace {
         let _ = add_packet_trace!(
             runtime,
@@ -383,11 +404,7 @@ fn process_input_packet(
 }
 
 #[inline(always)]
-fn finish_input_errors(
-    runtime: &mut DataPlaneMain,
-    indices: &[u32],
-    errors: &[IpInputError],
-) {
+fn finish_input_errors(runtime: &mut DataPlaneMain, indices: &[u32], errors: &[IpInputError]) {
     const INPUT_ERRORS: [IpInputError; 9] = [
         IpInputError::None,
         IpInputError::Version,
@@ -425,47 +442,55 @@ fn finish_input_errors(
 #[inline(always)]
 fn classify_ipv4_input(
     packet: &[u8],
+    chain_len: usize,
 ) -> Result<(IpProtocol, IpInputTarget, IpInputError, usize, usize, usize), IpInputError> {
     let (header, _) =
         Ipv4Header::ref_from_prefix(packet).map_err(|_| IpInputError::HeaderTooShort)?;
+    let header_len = header.header_len();
     if header.version() != 4 {
         return Err(IpInputError::Version);
     }
-    let header_len = header.header_len();
     if header_len < IPV4_HEADER_MIN_LEN || packet.len() < header_len {
         return Err(IpInputError::HeaderTooShort);
     }
     let packet_len = header.total_len();
-    if packet_len < header_len {
-        return Err(IpInputError::BadLength);
-    }
     let fragment = header.flags_fragment();
     let fragment_offset = fragment & IPV4_FRAGMENT_OFFSET_MASK;
     let checksum_bad = internet_checksum(&packet[..header_len]) != 0;
     let destination = header.destination();
-    let (target, error) =
-        if fragment_offset == 1 || checksum_bad || packet_len < IPV4_HEADER_MIN_LEN {
-            (
-                IpInputTarget::Drop,
-                if fragment_offset == 1 {
-                    IpInputError::FragmentOffsetOne
-                } else if checksum_bad {
-                    IpInputError::BadChecksum
-                } else {
-                    IpInputError::TooShort
-                },
-            )
-        } else if header.ttl() < 1 {
-            (IpInputTarget::IcmpError, IpInputError::TimeExpired)
-        } else if header_len != IPV4_HEADER_MIN_LEN {
-            (IpInputTarget::Options, IpInputError::Options)
-        } else if fragment & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
-            (IpInputTarget::Reassembly, IpInputError::None)
-        } else if destination.is_multicast() {
-            (IpInputTarget::LookupMulticast, IpInputError::None)
-        } else {
-            (IpInputTarget::Lookup, IpInputError::None)
-        };
+    // VPP ip4_input_check_x1/x2/x4 overwrites earlier classifications in this order.
+    let mut error = if header_len != IPV4_HEADER_MIN_LEN {
+        IpInputError::Options
+    } else {
+        IpInputError::None
+    };
+    if checksum_bad {
+        error = IpInputError::BadChecksum;
+    }
+    if header.ttl() < 1 {
+        error = IpInputError::TimeExpired;
+    }
+    if fragment_offset == 1 {
+        error = IpInputError::FragmentOffsetOne;
+    }
+    if packet_len < IPV4_HEADER_MIN_LEN {
+        error = IpInputError::TooShort;
+    }
+    if chain_len < packet_len || packet_len < header_len {
+        error = IpInputError::BadLength;
+    }
+    let target = match error {
+        IpInputError::TimeExpired => IpInputTarget::IcmpError,
+        IpInputError::Options => IpInputTarget::Options,
+        IpInputError::None
+            if fragment & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 =>
+        {
+            IpInputTarget::Reassembly
+        }
+        IpInputError::None if destination.is_multicast() => IpInputTarget::LookupMulticast,
+        IpInputError::None => IpInputTarget::Lookup,
+        _ => IpInputTarget::Drop,
+    };
     Ok((
         IpProtocol::from(header.protocol()),
         target,
@@ -562,5 +587,78 @@ fn ip_ecn_from_packet(packet: &[u8], version: IpVersion) -> Option<IpEcnCodepoin
         2 => Some(IpEcnCodepoint::Ect0),
         3 => Some(IpEcnCodepoint::Ce),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ipv4_packet(header_len: usize, ttl: u8, total_len: u16, fragment: u16) -> Vec<u8> {
+        let mut packet = vec![0u8; header_len];
+        packet[0] = 0x40 | (header_len / 4) as u8;
+        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+        packet[6..8].copy_from_slice(&fragment.to_be_bytes());
+        packet[8] = ttl;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[198, 18, 0, 2]);
+        packet[16..20].copy_from_slice(&[198, 18, 0, 1]);
+        let checksum = internet_checksum(&packet);
+        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn ipv4_input_checks_chain_length_and_header_errors() {
+        let packet = ipv4_packet(20, 64, 64, 0);
+        let (_, target, error, packet_len, _, _) = classify_ipv4_input(&packet, 64).unwrap();
+        assert_eq!(
+            (target, error, packet_len),
+            (IpInputTarget::Lookup, IpInputError::None, 64)
+        );
+        assert_eq!(
+            classify_ipv4_input(&packet, 20).unwrap().2,
+            IpInputError::BadLength
+        );
+        assert_eq!(
+            classify_ipv4_input(&packet[..19], 64),
+            Err(IpInputError::HeaderTooShort)
+        );
+        let mut wrong_version = packet;
+        wrong_version[0] = 0x65;
+        assert_eq!(
+            classify_ipv4_input(&wrong_version, 64),
+            Err(IpInputError::Version)
+        );
+    }
+
+    #[test]
+    fn ipv4_input_uses_vpp_error_precedence() {
+        let mut packet = ipv4_packet(24, 0, 19, 1);
+        packet[10] ^= 1;
+        assert_eq!(
+            classify_ipv4_input(&packet, 24).unwrap().2,
+            IpInputError::TooShort
+        );
+        assert_eq!(
+            classify_ipv4_input(&packet, 18).unwrap().2,
+            IpInputError::BadLength
+        );
+
+        let packet = ipv4_packet(24, 0, 24, 1);
+        assert_eq!(
+            classify_ipv4_input(&packet, 24).unwrap().2,
+            IpInputError::FragmentOffsetOne
+        );
+        let packet = ipv4_packet(24, 0, 24, 0);
+        assert_eq!(
+            classify_ipv4_input(&packet, 24).unwrap().2,
+            IpInputError::TimeExpired
+        );
+        let packet = ipv4_packet(24, 64, 24, 0);
+        assert_eq!(
+            classify_ipv4_input(&packet, 24).unwrap().2,
+            IpInputError::Options
+        );
     }
 }

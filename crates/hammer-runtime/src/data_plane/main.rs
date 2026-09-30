@@ -72,6 +72,7 @@ pub struct DataPlaneMain {
     /// Largest internal pending frame dispatched in this worker main-loop
     /// iteration. VPP: vlib/main.h:426-439, vlib/main.c:1064-1066.
     pub(crate) max_internal_frame_vectors: usize,
+    pub(crate) queue_signal_callback: Option<fn(&mut DataPlaneMain) -> RuntimeResult<()>>,
     pub(crate) worker_init_functions_called: Bitmap,
 }
 
@@ -82,6 +83,19 @@ const _: () = {
 };
 
 impl DataPlaneMain {
+    /// Installs the main-loop queue check before Process Nodes start.
+    /// VPP: `vlib_set_queue_signal_callback`, vlib/main.h:462-466.
+    pub fn set_queue_signal_callback(
+        &mut self,
+        callback: fn(&mut DataPlaneMain) -> RuntimeResult<()>,
+    ) {
+        assert_eq!(self.thread_index, 0, "queue signals belong to main thread");
+        assert!(
+            self.queue_signal_callback.replace(callback).is_none(),
+            "main loop has one queue signal callback"
+        );
+    }
+
     /// VPP: `vlib_last_vectors_per_main_loop`, vlib/main.h:435-439.
     #[inline(always)]
     pub fn max_internal_frame_vectors(&self) -> usize {

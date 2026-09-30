@@ -1,0 +1,34 @@
+plugins = ["tuntap", "iperf3"]
+
+[memory]
+main_heap_size = "100 MiB"
+main_heap_page_size = "default"
+
+[cpu]
+main-core = 0
+corelist-workers = [10]
+
+[worker.buffer]
+slots_per_numa = 8192
+frame_pool_size = 64
+page_size = "default-hugepage"
+
+[statseg]
+socket_name = "/tmp/hammer-adr45-stats-20260930.sock"
+
+[plugin.tuntap]
+enabled = true
+name = "hammer0"
+mtu = 1500
+admin_up = true
+ip4_address = "198.18.0.1/30"
+
+[plugin.tcp]
+congestion = "bbr"
+
+[plugin.iperf3]
+enable = true
+namespace = 0
+control_endpoint = "0.0.0.0:5201"
+data_endpoint = "0.0.0.0:5202"
+duration = "10s"

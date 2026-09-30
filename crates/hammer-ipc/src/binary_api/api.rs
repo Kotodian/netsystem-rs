@@ -96,6 +96,7 @@ pub struct ApiMain {
     pub(super) shmem_header: UnsafeCell<Option<NonNull<ShmemHeader>>>,
     pub(super) process_pid: AtomicI32,
     pub(super) ring_misses: AtomicU32,
+    queue_signal_pending: Cell<bool>,
     pub(super) input_queue_length: u32,
     api_uid: u32,
     api_gid: u32,
@@ -116,6 +117,23 @@ unsafe impl Send for ApiMain {}
 unsafe impl Sync for ApiMain {}
 
 impl ApiMain {
+    /// Returns true only for a newly pending main-thread queue signal.
+    /// VPP: `memclnt_queue_callback`, memory_api.c:60-70.
+    #[inline]
+    pub fn mark_queue_signal_pending(&self) -> bool {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API queue signals belong to runtime main thread");
+        !self.queue_signal_pending.replace(true)
+    }
+
+    /// VPP: `QUEUE_SIGNAL_EVENT`, memclnt_api.c:441-443.
+    #[inline]
+    pub fn clear_queue_signal_pending(&self) {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API queue signals belong to runtime main thread");
+        self.queue_signal_pending.set(false);
+    }
+
     pub fn new(first_available_msg_id: u16) -> Self {
         Self {
             msg_data: RefCell::new(Vec::new()),
@@ -134,6 +152,7 @@ impl ApiMain {
             shmem_header: UnsafeCell::new(None),
             process_pid: AtomicI32::new(0),
             ring_misses: AtomicU32::new(0),
+            queue_signal_pending: Cell::new(false),
             input_queue_length: 0,
             api_uid: unsafe { libc::getuid() },
             api_gid: unsafe { libc::getgid() },
