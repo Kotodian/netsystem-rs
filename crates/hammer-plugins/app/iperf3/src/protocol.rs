@@ -4,10 +4,12 @@ use hammer_infra::svm::fifo::Fifo;
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-const COOKIE_SIZE: usize = 37;
+pub(crate) const COOKIE_SIZE: usize = 37;
+pub(crate) const MAX_STREAMS: u32 = 128;
 const CONTROL_STATE_SIZE: usize = 1;
 const PARAMETER_LENGTH_SIZE: usize = 4;
 const MAX_PARAMETER_SIZE: usize = 8 * 1024;
+const MAX_RESULTS_SIZE: usize = 256 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, KnownLayout, Immutable, IntoBytes)]
@@ -39,6 +41,7 @@ pub enum ControlState {
     CreateStreams = 10,
     ExchangeResults = 13,
     DisplayResults = 14,
+    Done = 16,
 }
 
 impl TryFrom<u8> for ControlState {
@@ -54,6 +57,7 @@ impl TryFrom<u8> for ControlState {
             10 => Ok(Self::CreateStreams),
             13 => Ok(Self::ExchangeResults),
             14 => Ok(Self::DisplayResults),
+            16 => Ok(Self::Done),
             state => Err(Iperf3ProtocolError::StateUnsupported { state }),
         }
     }
@@ -64,13 +68,16 @@ pub enum ControlPhase {
     Cookie,
     Parameters,
     Running,
+    Results,
+    Done,
     Finished,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlAction {
     SendState(ControlState),
     Parameters(ControlParameters),
+    Results(Vec<u32>),
     Close,
 }
 
@@ -91,6 +98,25 @@ pub struct ControlParameters {
     pub bidirectional: bool,
 }
 
+#[derive(serde::Deserialize)]
+struct ClientResults {
+    cpu_util_total: f64,
+    cpu_util_user: f64,
+    cpu_util_system: f64,
+    sender_has_retransmits: i32,
+    streams: Vec<ClientStreamResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClientStreamResult {
+    id: u32,
+    bytes: u64,
+    retransmits: i64,
+    jitter: f64,
+    errors: u64,
+    packets: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum Iperf3ProtocolError {
     #[error("iperf3 cookie is not ASCII")]
@@ -103,6 +129,13 @@ pub enum Iperf3ProtocolError {
     TcpRequired,
     #[error("iperf3 parameters are invalid")]
     ParametersInvalid {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("iperf3 stream count {count} is outside 1..={MAX_STREAMS}")]
+    StreamCountInvalid { count: u32 },
+    #[error("iperf3 client results are invalid")]
+    ResultsInvalid {
         #[source]
         source: serde_json::Error,
     },
@@ -176,6 +209,10 @@ impl ControlParser {
                 if !parameters.tcp || parameters.udp || parameters.sctp {
                     return Err(Iperf3ProtocolError::TcpRequired);
                 }
+                let count = parameters.parallel.unwrap_or(1);
+                if !(1..=MAX_STREAMS).contains(&count) {
+                    return Err(Iperf3ProtocolError::StreamCountInvalid { count });
+                }
                 Ok(Some((
                     ControlAction::Parameters(parameters),
                     PARAMETER_LENGTH_SIZE + length,
@@ -204,13 +241,79 @@ impl ControlParser {
                     | ControlState::ParameterExchange
                     | ControlState::CreateStreams
                     | ControlState::ExchangeResults
-                    | ControlState::DisplayResults => {
+                    | ControlState::DisplayResults
+                    | ControlState::Done => {
                         return Err(Iperf3ProtocolError::StateUnsupported {
                             state: record.value,
                         });
                     }
                 };
                 Ok(Some((action, CONTROL_STATE_SIZE)))
+            }
+            ControlPhase::Results => {
+                if rx.max_dequeue() < PARAMETER_LENGTH_SIZE {
+                    return Ok(None);
+                }
+                let mut header = [0; PARAMETER_LENGTH_SIZE];
+                assert_eq!(rx.peek(0, PARAMETER_LENGTH_SIZE, &mut header), header.len());
+                let length = ParameterLength::ref_from_bytes(&header)
+                    .expect("fixed result length has its declared layout")
+                    .value();
+                if length == 0 || length > MAX_RESULTS_SIZE {
+                    return Ok(Some((ControlAction::Close, PARAMETER_LENGTH_SIZE)));
+                }
+                if rx.max_dequeue() < PARAMETER_LENGTH_SIZE + length {
+                    return Ok(None);
+                }
+                // ESnet iperf_api.c:2403-2420,2975-3100: the server reads
+                // client results before sending its own framed results.
+                let input = ParameterInput {
+                    fifo: rx,
+                    offset: PARAMETER_LENGTH_SIZE,
+                    remaining: length,
+                };
+                let results: ClientResults = serde_json::from_reader(input)
+                    .map_err(|source| Iperf3ProtocolError::ResultsInvalid { source })?;
+                if !results.cpu_util_total.is_finite()
+                    || !results.cpu_util_user.is_finite()
+                    || !results.cpu_util_system.is_finite()
+                    || !(-1..=1).contains(&results.sender_has_retransmits)
+                    || results.streams.is_empty()
+                    || results.streams.len() > MAX_STREAMS as usize
+                    || results.streams.iter().any(|stream| {
+                        stream.id == 0
+                            || stream.retransmits < -1
+                            || !stream.jitter.is_finite()
+                            || stream.jitter < 0.0
+                            || stream.bytes > i64::MAX as u64
+                            || stream.errors > i64::MAX as u64
+                            || stream.packets > i64::MAX as u64
+                    })
+                {
+                    return Ok(Some((ControlAction::Close, PARAMETER_LENGTH_SIZE + length)));
+                }
+                let stream_ids = results
+                    .streams
+                    .into_iter()
+                    .map(|stream| stream.id)
+                    .collect();
+                Ok(Some((
+                    ControlAction::Results(stream_ids),
+                    PARAMETER_LENGTH_SIZE + length,
+                )))
+            }
+            ControlPhase::Done => {
+                if rx.max_dequeue() < CONTROL_STATE_SIZE {
+                    return Ok(None);
+                }
+                let mut state = [0; CONTROL_STATE_SIZE];
+                assert_eq!(rx.peek(0, CONTROL_STATE_SIZE, &mut state), state.len());
+                match ControlState::try_from(state[0])? {
+                    ControlState::Done | ControlState::ClientTerminate => {
+                        Ok(Some((ControlAction::Close, CONTROL_STATE_SIZE)))
+                    }
+                    _ => Err(Iperf3ProtocolError::StateUnsupported { state: state[0] }),
+                }
             }
             ControlPhase::Finished => Ok(None),
         }
@@ -226,8 +329,11 @@ impl ControlParser {
                 ControlPhase::Parameters
             }
             (ControlPhase::Parameters, ControlAction::Parameters(_)) => ControlPhase::Running,
-            (ControlPhase::Running, ControlAction::SendState(ControlState::ExchangeResults))
-            | (ControlPhase::Running, ControlAction::Close) => ControlPhase::Finished,
+            (ControlPhase::Running, ControlAction::SendState(ControlState::ExchangeResults)) => {
+                ControlPhase::Results
+            }
+            (ControlPhase::Results, ControlAction::Results(_)) => ControlPhase::Done,
+            (_, ControlAction::Close) => ControlPhase::Finished,
             (phase, _) => phase,
         };
     }
