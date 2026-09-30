@@ -52,6 +52,20 @@ fn fifo_round_trip_non_power_of_two_capacity() {
 }
 
 #[test]
+fn fifo_accepts_data_after_full_drain() {
+    let (segment, index) = allocated_fifo(4096);
+    let fifo = segment.fifo(0, index).expect("fifo");
+    let payload = vec![0x5a; 4096];
+
+    for _ in 0..3 {
+        assert_eq!(fifo.enqueue_ooo(0, &payload).unwrap().accepted, 4096);
+        assert_eq!(fifo.max_enqueue(), 0);
+        assert_eq!(fifo.drop_dequeue(payload.len()), payload.len());
+        assert_eq!(fifo.max_enqueue(), payload.len());
+    }
+}
+
+#[test]
 fn fifo_copies_across_chunks_and_preserves_segmented_enqueue() {
     let (mut segment, index) = allocated_fifo(8192);
     let fifo = segment.fifo(0, index).expect("fifo");

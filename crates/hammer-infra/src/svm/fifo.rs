@@ -1225,7 +1225,6 @@ impl Fifo {
         let visible_len = tail.wrapping_sub(chunk.start_byte);
         if chunk.start_byte != tail && chunk.length.load(Ordering::Relaxed) <= visible_len {
             chunk.start_byte = tail;
-            chunk.length.store(0, Ordering::Relaxed);
         }
     }
 

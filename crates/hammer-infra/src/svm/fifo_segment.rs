@@ -420,7 +420,7 @@ impl SvmFifoSegment {
             return Ok(None);
         }
         let mut head = shared.free_chunks[class].load(Ordering::Acquire);
-        while head != 0 {
+        while fs_head_offset(head) != 0 {
             let offset = fs_head_offset(head);
             if !fs_offset_is_valid(offset, self.max_byte_index) {
                 panic!("FIFO chunk freelist contains invalid offset {offset:#x}");
@@ -1243,7 +1243,7 @@ impl SvmFifoSegment {
         let mut count = 0;
         for slice in unsafe { self.header().slices() } {
             let mut head = slice.free_chunks[class].load(Ordering::Acquire);
-            while head != 0 {
+            while fs_head_offset(head) != 0 {
                 let offset = fs_head_offset(head);
                 if !fs_offset_is_valid(offset, self.max_byte_index) {
                     panic!("FIFO chunk freelist contains invalid offset {offset:#x}");
