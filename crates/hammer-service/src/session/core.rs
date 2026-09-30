@@ -469,11 +469,7 @@ impl SessionWorker {
         let mut file = File::new(
             registered_fd,
             format!("session-wrk-tfd-{}", runtime.thread_index()),
-            u64::from(
-                self.queue_node
-                    .expect("session-queue NodeId installs before its timerfd")
-                    .slot(),
-            ),
+            u64::from(runtime.thread_index()),
             FileFunctions {
                 read: Some(super::node::session_queue_timer_ready),
                 write: None,
@@ -3091,6 +3087,17 @@ impl SessionMain {
     #[inline(always)]
     pub fn global() -> Result<&'static Self, SessionError> {
         SESSION_MAIN.get().ok_or(SessionError::Unknown)
+    }
+
+    #[inline(always)]
+    pub(crate) fn queue_node(&self) -> NodeId {
+        let slot = self.queue_node.load(Ordering::Acquire);
+        assert_ne!(
+            slot,
+            u32::MAX,
+            "Session queue NodeId installs before timer File dispatch"
+        );
+        NodeId::new(slot)
     }
 }
 

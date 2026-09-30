@@ -210,7 +210,7 @@ impl SessionWorker {
         let mut file = File::new(
             registered_fd,
             format!("session-wrk-tfd-{}", runtime.thread_index()),
-            u64::from(self.queue_node.expect("Session queue NodeId was installed").slot()),
+            u64::from(runtime.thread_index()),
             FileFunctions {
                 read: Some(session_queue_timer_ready),
                 write: None,
@@ -343,8 +343,8 @@ impl SessionWorker {
 
 `enable_adaptive_mode` 中的 timerfd 是 worker 的**设表端**，FileMain 注册的是复制的
 **读取端**；两者共享内核计数器，不是两套 timer。注册的 `private_data` 保存初始化时
-取得的 `session-queue` NodeId slot，`polling_thread_index` 选同一 Data Worker 并保留
-错误上下文所需的 worker 身份。任何一步创建/复制/注册失败
+取得的 runtime thread index，`polling_thread_index` 选同一 Data Worker 的 Sync File
+poller；SessionMain 已发布的 queue NodeId 由回调从全局 Session Main 取得。任何一步创建/复制/注册失败
 都返回带 OS 或 runtime source 的启动错误；worker 的两个 `Option` 与 adaptive flag
 保持原值。FileMain 注册成功后，fd 生命周期随该 worker 的 FileMain 注册结束；
 后续 timer 状态更新只借 worker 的 `timer_fd`，不再重复注册。
@@ -575,12 +575,15 @@ fn session_queue_timer_ready(
     graph: &mut NodeMain,
     file: &mut File,
 ) -> RuntimeResult<()> {
-    // VPP session_node.c:2180-2187 uses session_queue_node.index directly.
-    // File.private_data holds this worker graph's NodeId slot from worker init.
-    let queue = NodeId::new(u32::try_from(file.private_data())
-        .expect("Session queue NodeId fits File private data"));
+    // VPP session_node.c:2177-2188 stores the owner thread index in private_data.
+    let thread_index = u32::try_from(file.private_data())
+        .expect("Session worker thread index fits File private data");
+    assert_eq!(thread_index, file.polling_thread_index());
+    let queue = core::SessionMain::global()
+        .expect("Session Main initializes before timer File dispatch")
+        .queue_node();
     graph.mark_interrupt_pending(queue)?;
-    let worker = u32::try_from(DataWorkerId::try_from(file.polling_thread_index())?.slot())
+    let worker = u32::try_from(DataWorkerId::try_from(thread_index)?.slot())
         .expect("configured worker slot fits u32");
     let mut expirations = 0_u64;
     loop {
@@ -709,8 +712,9 @@ impl Node for SessionQueueNode {
 决定是否安装 timerfd，并设置 node 初态。它不是每轮执行的 callback，也不为
 thread zero 创建一个数据面 timerfd。
 
-timerfd 回调从 `File.private_data` 取初始化时保存的 NodeId，直接调用
-`mark_interrupt_pending`，然后从 `file.fd()` 读走到期计数；它**不**每次执行
+timerfd 回调从 `File.private_data` 取 owner thread index，并核对它与
+`polling_thread_index` 一致；随后从已发布的 `SessionMain` 取得 queue NodeId，调用
+`mark_interrupt_pending`，再从 `file.fd()` 读走到期计数；它**不**每次执行
 `node_by_name`。`WouldBlock` 不算失败。
 `Interrupted` 重试，完整的 8 字节读取只消费到期次数，不按次数重复运行 queue；
 其他读取失败携原始 `io::Error` 返回 worker main loop。FileMain 随后在同一轮 worker

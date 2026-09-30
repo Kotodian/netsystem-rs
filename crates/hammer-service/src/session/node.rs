@@ -120,14 +120,21 @@ pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
     Ok(node)
 }
 
-/// VPP: session_node.c:2180-2188. The File stores the queue NodeId resolved
-/// at worker init; its polling thread identifies the owning Session worker.
+/// VPP: session_node.c:2177-2188. The File stores the owner thread index in
+/// private_data; polling_thread_index selects the same Sync File poller.
 pub(crate) fn session_queue_timer_ready(graph: &mut NodeMain, file: &mut File) -> RuntimeResult<()> {
-    let queue = NodeId::new(
-        u32::try_from(file.private_data()).expect("session-queue NodeId fits File private data"),
+    let thread_index = u32::try_from(file.private_data())
+        .expect("Session worker thread index fits File private data");
+    assert_eq!(
+        thread_index,
+        file.polling_thread_index(),
+        "Session timer File private data and polling thread must agree"
     );
+    let queue = core::SessionMain::global()
+        .expect("Session Main initializes before timer File dispatch")
+        .queue_node();
     graph.mark_interrupt_pending(queue)?;
-    let worker = u32::try_from(DataWorkerId::try_from(file.polling_thread_index())?.slot())
+    let worker = u32::try_from(DataWorkerId::try_from(thread_index)?.slot())
         .expect("configured worker slot fits u32");
     let mut expirations = 0_u64;
     loop {
