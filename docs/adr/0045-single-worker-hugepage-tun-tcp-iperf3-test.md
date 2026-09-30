@@ -1,13 +1,13 @@
 # ADR-0045: 单 Worker 大页 TUN/TCP/iperf3 测试
 
 - 日期：2026-09-29
-- 状态：CPU section 与 bitmap 核分配、单 worker 大页测试配置已实现；全路径大页与标准 iperf3 验收仍有前置缺口；测试未执行
+- 状态：单 worker TUN/TCP 与标准 iperf3 单流协议交换已实测；高重传与多 worker 尚未验收，见测试记录
 - 前置：ADR-0039、ADR-0041、ADR-0043、ADR-0044
-- 范围：Linux 同机 TUN、一个 Data Worker、HugeTLB Main Heap/Buffer、TCP 与 builtin iperf3 server
+- 范围：Linux 同机 TUN、一个 Data Worker、普通 Main Heap、HugeTLB packet Buffer、TCP 与 builtin iperf3 server
 
 ## 目标与边界
 
-本测试先确认主机到 Hammer TUN 的 IPv4 双向路径、TCP 握手、Session/FIFO 数据接收以及 **Main Heap 和 packet Buffer** 的显式大页映射，再尝试标准 iperf3 客户端。它目前不能证明 Session MQ/FIFO 也使用大页。本配置显式将控制主线程固定到 CPU 0，并将唯一的 **Data Worker** 固定到 CPU 1；主线程和其他辅助线程不计入 Data Worker。主机的 iperf3/socat 进程不是 Hammer Worker。
+本测试先确认主机到 Hammer TUN 的 IPv4 双向路径、TCP 握手、Session/FIFO 数据接收以及 **packet Buffer** 的显式大页映射，再尝试标准 iperf3 客户端。Main Heap 不请求大页；本测试也不声称 Session MQ/FIFO 使用大页。本配置显式将控制主线程固定到 CPU 0，并将唯一的 **Data Worker** 固定到 CPU 10；主线程和其他辅助线程不计入 Data Worker。主机的 iperf3/nc 进程不是 Hammer Worker。
 
 测试不添加 CLI、协议适配层、额外 listener、错误类型或测试专用实现。VPP 的 TUN、Session queue、TCP 和 builtin app 是数据路径与所有权的参照，不代表 VPP vperf 与标准 iperf3 互通。
 
@@ -32,11 +32,11 @@ plugins = ["tuntap", "iperf3"]
 
 [memory]
 main_heap_size = "100 MiB"
-main_heap_page_size = "default-hugepage"
+main_heap_page_size = "default"
 
 [cpu]
 main-core = 0
-corelist-workers = [1]
+corelist-workers = [10]
 
 [worker.buffer]
 slots_per_numa = 8192
@@ -65,8 +65,8 @@ duration = "10s"
 ```
 
 `[cpu]` 是运行时的 CPU 拓扑入口，不是测试专用字段。本测试配置使用显式的
-`main-core` 与 `corelist-workers`，因此不使用数量式的 `workers`。CPU 0 是控制主线程，CPU 1
-是唯一 Data Worker；如果测试机的 CPU 0/1 不在进程允许的 affinity 集合中，应将这两个值
+`main-core` 与 `corelist-workers`，因此不使用数量式的 `workers`。CPU 0 是控制主线程，CPU 10
+是唯一 Data Worker；如果测试机的 CPU 0/10 不在进程允许的 affinity 集合中，应将这两个值
 替换为两个不同的可用 CPU，不能让它们重叠。`workers` 与
 `corelist-workers` 互斥：省略 `corelist-workers` 时，`workers` 指要创建的 Data Worker
 数量；提供 `corelist-workers` 时，置位 CPU 的数量就是 worker 数量。运行时保存的是
@@ -139,23 +139,23 @@ skip-cores = 2
 
 `plugins` 仅列根插件；`tuntap` 依赖 `ip`，`iperf3` 依赖 `session` 和 `tcp`，后者再加载自己的依赖。插件 DSO 默认从 daemon 可执行文件旁加载；自定义目录使用 `HAMMER_PLUGIN_DIR`。`namespace = 0` 是现有默认 namespace，不需要另建一个 namespace。
 
-显式的 `main_heap_page_size` 和 `worker.buffer.page_size` 分别要求 Main Heap 和 packet Buffer 使用 HugeTLB；缺页时应启动失败，不接受默认 Buffer 普通页回退。**这不是“所有 SVM 都用大页”配置**：当前 service Session worker MQ 创建时 `huge_page = false`；iperf3 attach 仅带 `ApplicationFlags::BUILTIN`，因此应用 RX MQ/FIFO segment 使用 private 后端及普通页。这个默认值对应上表的 VPP 路径，不是 `main_heap_page_size` 可以传递给 SVM 的隐式开关。`duration` 当前仅参与 iperf3 配置校验，实际传输时长以客户端命令为准。
+`main_heap_page_size = "default"` 不请求 Main Heap 大页；`worker.buffer.page_size = "default-hugepage"` 单独要求 packet Buffer 使用 HugeTLB，缺页时应启动失败，不接受 Buffer 普通页回退。**这不是“所有 SVM 都用大页”配置**：当前 service Session worker MQ 创建时 `huge_page = false`；iperf3 attach 仅带 `ApplicationFlags::BUILTIN`，因此应用 RX MQ/FIFO segment 使用 private 后端及普通页。这个默认值对应上表的 VPP 路径，不是 `main_heap_page_size` 可以传递给 SVM 的隐式开关。`duration` 当前仅参与 iperf3 配置校验，实际传输时长以客户端命令为准。
 
 如果测试目标是 **Session MQ、应用 RX MQ、FIFO 也全部强制 HugeTLB**，当前 TOML 和实现做不到，不能把本配置的结果称为“全路径大页”。后续需由 service Session owner 决定 worker MQ 的大页创建策略；iperf3 的 Application attach 则需同时选 builtin memfd 后端与 huge-page 选项，使应用 MQ/FIFO 使用可承载 HugeTLB 的 memfd。两处都应在创建失败时明确失败，不能回退到普通页。本 ADR 只记录这两个实施前置条件，不擅自新增配置字段、改变 VPP 默认值或修改代码。
 
 ## 执行顺序
 
-在隔离的 Linux 测试机执行；需要 `/dev/net/tun`、`CAP_NET_ADMIN` 和足够的 HugeTLB 页。以下示例假设系统默认大页为 2 MiB。先记录原有 `vm.nr_hugepages`、`HugePages_Free`、Hugepagesize 与 NUMA 分布；若大页大小不是 2 MiB，应按实际大小重新计算页数，不照搬 64。64 个 2 MiB 页是供 100 MiB Main Heap、约 16 MiB packet Buffer 及少量余量使用的测试预算，不是产品默认值。仅在专用测试机上按需预留；已有配额高于 64 时不要降低它，测试后由管理员恢复原有配置。
+在隔离的 Linux 测试机、非沙箱环境执行；需要 `/dev/net/tun`、`CAP_NET_ADMIN` 和足够的 HugeTLB 页。每次启动前用 `pgrep -a -x hammer` 确认没有另一实例；不得仅凭沙箱内的进程表判断。以下示例假设系统默认大页为 2 MiB。先记录原有 `vm.nr_hugepages`、`HugePages_Free`、Hugepagesize 与 NUMA 分布；packet Buffer 的大页预算按实际映射大小与 NUMA 节点计算，不为普通 Main Heap 预留大页。仅在专用测试机上按需预留；已有配额足够时不要改变它，测试后由管理员恢复原有配置。
 
 ```sh
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
 cat /proc/sys/vm/nr_hugepages
-# 仅当默认大页是 2 MiB 且当前预留不足时，由管理员执行：
-sudo sysctl -w vm.nr_hugepages=64
+# 仅在 packet Buffer 大页不足时，由管理员按实测映射大小调整预留：
+# sudo sysctl -w vm.nr_hugepages=<所需页数>
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
 ```
 
-1. `cargo build --workspace --locked --release` 构建 release daemon 和需要的 DSO。确认 `target/release/hammer` 旁存在 `libhammer_plugin_tuntap.so`、`libhammer_plugin_ip.so`、`libhammer_plugin_session.so`、`libhammer_plugin_tcp.so`、`libhammer_plugin_iperf3.so`。本文不执行构建。
+1. `cargo build --workspace --locked --release` 构建 release daemon 和需要的 DSO。确认 `target/release/hammer` 旁存在 `libhammer_plugin_tuntap.so`、`libhammer_plugin_ip.so`、`libhammer_plugin_session.so`、`libhammer_plugin_tcp.so`、`libhammer_plugin_iperf3.so`。
 2. 用上节 TOML 的实际文件路径启动 `sudo ./target/release/hammer /absolute/path/to/startup.toml`。记录 PID 和启动日志；如使用 `HAMMER_PLUGIN_DIR`，确保提权后的进程仍收到该环境变量。启动失败时不继续网络测试，先区分 DSO 缺失、TUN 权限、大页不足和 listener 创建错误。
 3. daemon 启动后，在**主机**执行以下命令。Hammer 接口是 `198.18.0.1/30`，主机端是 `198.18.0.2/30`；内核应把发往 `.1` 的流量路由到 `hammer0`。不要在 Hammer 配置里把两个地址都配到同一个接口。
 
@@ -166,7 +166,7 @@ ip -4 route get 198.18.0.1
 ip -s link show dev hammer0
 ```
 
-4. 验证大页与 worker 身份。以实际 PID 检查 `smaps`，其中应找到 Main Heap 和 packet Buffer 的 HugeTLB 映射（`VmFlags` 含 `ht`），并记录测试前后的系统空闲大页；仅检查配置或 `HugePages_Total` 不足以证明进程实际用了大页。`ps -T` 只用于辅助观察 CPU/线程，不以总线程数等于 1 作为验收条件。
+4. 验证大页与 worker 身份。以实际 PID 检查 `smaps`，其中应找到 packet Buffer 的 HugeTLB 映射（`VmFlags` 含 `ht`），而 Main Heap 不要求 `ht`；仅检查配置或 `HugePages_Total` 不足以证明 Buffer 实际用了大页。`ps -T` 只用于辅助观察 CPU/线程，不以总线程数等于 1 作为验收条件。
 
 ```sh
 hammer_pid=$(pgrep -n -x hammer)
@@ -175,10 +175,10 @@ sudo awk '/^[0-9a-f]+-[0-9a-f]+/ { region=$0 } /VmFlags:.* ht/ { print region; p
 ps -T -p "$hammer_pid" -o pid,tid,comm,psr
 ```
 
-5. 先做数据路径测试：`socat` 从主机向 5202 单连接发送 8 MiB，当前 iperf3 data callback 直接消耗 RX FIFO 字节。这验证 TUN RX、IPv4/TCP、Session RX FIFO、应用消费及 ACK/TUN TX；它**不是**标准 iperf3 吞吐成绩。传输前后各记录 `ip -s link show dev hammer0` 和 daemon 错误日志；需要时用 `tcpdump -ni hammer0 'tcp port 5202'` 区分握手、数据和重传。
+5. 先做数据路径测试：`nc` 从主机向 5202 单连接发送 8 MiB，当前 iperf3 data callback 直接消耗 RX FIFO 字节。这验证 TUN RX、IPv4/TCP、Session RX FIFO、应用消费及 ACK/TUN TX；它**不是**标准 iperf3 吞吐成绩。传输前后各记录 `ip -s link show dev hammer0` 和 daemon 错误日志；需要时用 `tcpdump -ni hammer0 'tcp port 5202'` 区分握手、数据和重传。
 
 ```sh
-dd if=/dev/zero bs=64K count=128 status=none | socat -u - TCP:198.18.0.1:5202,connect-timeout=3
+timeout 30s bash -o pipefail -c 'dd if=/dev/zero bs=64K count=128 status=none | nc -N -w 25 198.18.0.1 5202'
 ip -s link show dev hammer0
 ```
 
@@ -194,12 +194,16 @@ iperf3 -4 -c 198.18.0.1 -p 5201 -P 1 -t 10
 
 | 阶段 | 通过标准 | 失败时优先排查 |
 |---|---|---|
-| 启动 | 单 Data Worker 配置被接受；TUN、两个 listener 均初始化；Main Heap 与 Buffer 都可证实为 HugeTLB | 权限、同名 TUN、5201/5202 冲突、大页总量或 NUMA 节点不足；若这两类映射是普通页，**本阶段失败** |
+| 启动 | 单 Data Worker 配置被接受；TUN、两个 listener 均初始化；packet Buffer 可证实为 HugeTLB，Main Heap 不请求大页 | 权限、同名 TUN、5201/5202 冲突、Buffer 大页总量或 NUMA 节点不足；若 Buffer 映射是普通页，**本阶段失败** |
 | 全路径大页 | 仅在 Session MQ 与应用 MQ/FIFO 也有 HugeTLB 映射、且无普通页回退后通过 | 当前缺少可用配置与实现；**本 ADR 不将该项判为通过** |
 | 主机路由 | `route get` 显示 `dev hammer0`、源地址 `.2`；TUN 双向计数有变化 | 主机已有更优路由、地址配反、接口未 UP |
 | 5202 数据流 | 单 TCP 连接完成 8 MiB 发送并正常结束，TUN RX/TX 计数增加，无异常 reset/持续重传 | TCP accept、Session event、FIFO dequeue、ACK/output、IPv4 rewrite |
-| 标准 iperf3 | 完整 control/data/results 交换且客户端正常退出，才记为协议通过 | 当前实现预期不能满足此项，见下文；不能用 5202 的裸 TCP 成功替代 |
+| 标准 iperf3 | 完整 control/data/results 交换且客户端正常退出，才记为协议通过 | 不能用 5202 的裸 TCP 成功替代；吞吐与重传另行验收 |
 
-当前插件的 control 监听 5201、data 监听 5202，配置还禁止两个端口相同；标准 iperf3 客户端的 control 和 data stream 连接同一个 `-p` 服务器端口。因此标准客户端的 data 连接不会到达现有 data listener。此外，当前 `ControlParser`/`on_rx` 只覆盖部分状态和单字节响应，没有完整的 iperf3 JSON 结果交换；`duration` 也未驱动服务端测试时钟。**本 ADR 不宣称标准 iperf3 端到端已经可通过**。将第 6 步视为暴露兼容性缺口的探测；补齐协议后再把它升为性能验收，并分别测单流、反向、多流及丢包/重传条件。
+## 测试记录
 
-事实依据：`crates/hammer-plugins/app/iperf3/src/config.rs`、`src/main.rs`、`src/protocol.rs`；`crates/hammer-service/src/session/mod.rs`、`src/app.rs`；`crates/hammer-runtime/src/data_plane/buffer_pool.rs`；`crates/hammer-infra/src/mem/mod.rs`。标准客户端同端口行为对应 ESnet iperf3 的 `iperf_client_api.c::iperf_connect` 与 `iperf_tcp.c::iperf_tcp_connect` 均使用 `server_port`。其他运行表现仍待上述实测，不以编译成功代替。
+使用 release 构建、CPU 0 主线程和 CPU 10 单 Data Worker 测试。进程的 packet Buffer 映射在 `smaps` 中带 `VmFlags: ht`；Main Heap 使用普通页。此前 5202 裸 TCP 发送 8 MiB 已完成；这不能代替标准 iperf3 协议测试。
+
+标准客户端的 control 和 data 连接均到达 5201；插件在同一 listener 上按 cookie 区分连接，接收参数与客户端结果 JSON，并回复服务端结果。`iperf3 -4 -c 198.18.0.1 -p 5201 -P 1 -t 10` 完整退出，发送约 121 MiB、接收约 120 MiB，约 101 Mbit/s；客户端报告 4742 次重传。3 秒复测同样完整退出，约 101 Mbit/s、1320 次重传。抓包没有 capture drop，主机 TUN qdisc 计数没有 drop/overlimit；这些观察不足以确定重传原因，不能据此验收 TCP 性能。当前 release 构建尚未复测 5202 裸 TCP，也未执行双 worker、反向或多流测试。
+
+事实依据：`crates/hammer-plugins/app/iperf3/src/config.rs`、`src/main.rs`、`src/protocol.rs`；`crates/hammer-service/src/session/mod.rs`、`src/app.rs`；`crates/hammer-runtime/src/data_plane/buffer_pool.rs`；`crates/hammer-infra/src/mem/mod.rs`。标准客户端同端口行为对应 ESnet iperf3 的 `iperf_client_api.c::iperf_connect` 与 `iperf_tcp.c::iperf_tcp_connect` 均使用 `server_port`。
