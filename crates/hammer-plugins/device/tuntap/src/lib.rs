@@ -9,7 +9,7 @@ use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_plugin_ip::{Ip4InputNode, Ip6InputNode, IpInterfaceAddressError};
 use hammer_runtime::file::{FILE_MAIN, File, FileFunctions};
-use hammer_runtime::{DataPlaneMain, Node, NodeRuntime, RuntimeError, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::feature::FeatureMain;
 use hammer_service::interface::{HwClassFlags, HwInterfaceFlags, InterfaceMtu, SwInterfaceFlags};
@@ -251,7 +251,11 @@ impl TuntapMain {
             return Err(startup_error.into());
         }
 
-        let file = match register_tuntap_file(control) {
+        // VPP's file callback runs on the vlib main that owns the input node
+        // (`third_party/vpp/src/vnet/unix/tuntap.c:396-400`). Hammer's thread
+        // zero is control-only, so the TUN file must be owned by the first
+        // Data Worker that executes the cloned `tuntap-rx` graph.
+        let file = match register_tuntap_file(control, DataWorkerId::new(0).thread_index()) {
             Ok(file) => file,
             Err(startup_error) => {
                 interfaces.delete_hardware_interface(data_plane, hw_if_index);
@@ -337,7 +341,7 @@ impl TuntapMain {
             .borrow_mut()
     }
 }
-fn register_tuntap_file(control: OwnedFd) -> RuntimeResult<TuntapFile> {
+fn register_tuntap_file(control: OwnedFd, polling_thread_index: u32) -> RuntimeResult<TuntapFile> {
     let data =
         control
             .as_fd()
@@ -346,7 +350,7 @@ fn register_tuntap_file(control: OwnedFd) -> RuntimeResult<TuntapFile> {
                 operation: "duplicate tuntap descriptor",
                 source,
             })?;
-    let file = File::new(
+    let mut file = File::new(
         data,
         "vnet tuntap".to_owned(),
         0,
@@ -355,6 +359,7 @@ fn register_tuntap_file(control: OwnedFd) -> RuntimeResult<TuntapFile> {
             ..FileFunctions::default()
         },
     );
+    file.set_polling_thread_index(polling_thread_index);
     let file_index = match FILE_MAIN
         .get()
         .expect("FileMain exists before tuntap config")
@@ -699,6 +704,8 @@ fn tuntap_config(config: TuntapConfig, data_plane: &mut DataPlaneMain) -> Runtim
         return Ok(());
     }
     let main = TuntapMain::init(config, data_plane)?;
+    main.rx_next
+        .set(Some(TuntapRxNext::resolve(data_plane.nodes())));
     assert!(
         TUNTAP_MAIN.set(main).is_ok(),
         "tuntap config callback executes once"

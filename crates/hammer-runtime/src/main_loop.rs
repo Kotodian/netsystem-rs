@@ -140,7 +140,6 @@ where
 
     let run_result = (|| -> crate::RuntimeResult<T> {
         crate::init::run_init_functions(global, main)?;
-        crate::init::run_config_functions(global, Some(main), false, global.startup_config())?;
         // Service node initializers may publish registrations through their
         // owner Mains (for example NetMain's DPO roots). Materialize the
         // graph only after those owners have completed normal init/config.
@@ -149,6 +148,14 @@ where
             global.node_function_registrations.iter().copied(),
         )?;
         crate::init::run_main_loop_enter(global, main)?;
+
+        // VPP applies post-worker configuration while the worker barrier is
+        // held. Interface/FIB/DPO publication and builtin application setup
+        // must observe the same control-plane ownership window. The enter
+        // phase installs the barrier before this non-early configuration runs.
+        crate::worker_thread_barrier_sync!(main, {
+            crate::init::run_config_functions(global, Some(main), false, global.startup_config())
+        })?;
 
         crate::worker_thread_barrier_sync!(main, {});
         main.start_processes(global.node_registrations.iter().copied())?;
