@@ -8,7 +8,8 @@ mod api;
 mod config;
 mod endpoint;
 mod lookup;
-mod main;
+#[path = "main.rs"]
+mod session_main;
 mod namespace;
 mod table;
 mod transport;
@@ -22,7 +23,7 @@ pub use endpoint::{
     IpTransportConnectionId, IpTransportEndpoint, IpTransportEndpointConfig,
 };
 pub use lookup::{IpSessionFamily, IpSessionLookup, IpSessionLookupKey, SessionTableIterator};
-pub use main::IpSessionMain;
+pub use session_main::IpSessionMain;
 pub use namespace::{IpNamespaceBinding, IpNamespaceMain, namespaces};
 pub use transport::{
     AppSessionTransport, IpTransportConfig, IpTransportConnection, IpTransportMain,
@@ -30,10 +31,6 @@ pub use transport::{
 };
 
 static SESSION_TABLE_CONFIG: OnceLock<IpSessionConfig> = OnceLock::new();
-
-pub(crate) fn ip_session_config() -> Option<IpSessionConfig> {
-    SESSION_TABLE_CONFIG.get().copied()
-}
 
 #[hammer_component_macros::config_function(
     name = "session_table_config",

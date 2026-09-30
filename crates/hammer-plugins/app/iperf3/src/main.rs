@@ -533,9 +533,3 @@ fn init_iperf3(_: &mut DataPlaneMain) -> RuntimeResult<()> {
     );
     Ok(())
 }
-
-pub fn main() -> &'static Iperf3Main {
-    IPERF3_MAIN
-        .get()
-        .expect("iperf3 Main is initialized before use")
-}

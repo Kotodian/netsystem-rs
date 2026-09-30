@@ -1186,8 +1186,8 @@ impl InterfaceMain {
     }
 
     pub fn software_interface_indices(&self) -> Vec<u32> {
-        hammer_runtime::ensure_main_thread_with_barrier()
-            .expect("software interface enumeration requires the publication scope");
+        hammer_runtime::ensure_main_thread()
+            .expect("software interface enumeration requires the main thread");
         self.state()
             .software_interfaces
             .iter()

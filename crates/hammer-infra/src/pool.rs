@@ -1,6 +1,5 @@
 use std::fmt;
 use std::mem::MaybeUninit;
-use std::ops::Range;
 
 use crate::bitmap::Bitmap;
 
@@ -171,51 +170,10 @@ impl<T> Pool<T> {
         self.opaque = opaque;
     }
 
-    /// Returns the bytes used by the pool metadata vectors.
-    #[inline]
-    pub(crate) fn header_bytes(&self) -> usize {
-        self.free_bitmap
-            .word_len()
-            .saturating_mul(std::mem::size_of::<u64>())
-            .saturating_add(
-                self.free_indices
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            )
-    }
-
-    /// Returns the bytes represented by the logical pool and metadata vectors.
-    #[inline]
-    pub(crate) fn bytes(&self) -> usize {
-        self.vector
-            .len()
-            .saturating_mul(std::mem::size_of::<MaybeUninit<T>>())
-            .saturating_add(self.header_bytes())
-    }
-
-    /// Returns the number of values available without growing the vector.
-    #[inline]
-    pub(crate) fn free_capacity(&self) -> usize {
-        let spare = self.vector.capacity().saturating_sub(self.vector.len());
-        self.free_indices.len().saturating_add(spare)
-    }
-
     /// Reports whether inserting without a free index will grow the vector.
     #[inline]
     pub fn will_get_grow(&self) -> bool {
         self.free_indices.is_empty() && self.vector.len() == self.vector.capacity()
-    }
-
-    /// Reports whether releasing `index` will grow the free-index metadata.
-    #[inline]
-    pub(crate) fn will_put_grow(&self, index: u32) -> bool {
-        self.contains_key(index) && self.free_indices.len() == self.free_indices.capacity()
-    }
-
-    /// Returns whether `index` is free or outside the logical vector.
-    #[inline]
-    pub(crate) fn is_free_index(&self, index: u32) -> bool {
-        !self.contains_key(index)
     }
 
     /// Drops the initialized value at `index` and returns its position to the pool.
@@ -254,73 +212,6 @@ impl<T> Pool<T> {
     #[inline]
     pub(crate) fn indices(&self) -> impl Iterator<Item = u32> + '_ {
         std::iter::successors(self.first_index(), |&index| self.next_index(index))
-    }
-
-    /// Iterates over occupied numeric indexes in `[start, end)`.
-    pub(crate) fn indices_range(&self, start: u32, end: u32) -> impl Iterator<Item = u32> + '_ {
-        let first = if start >= end {
-            None
-        } else {
-            self.free_bitmap
-                .first_clear_from(start as usize, self.vector.len())
-                .map(|position| position as u32)
-        };
-        std::iter::successors(first, |&index| self.next_occupied_index(index))
-            .take_while(move |&index| index < end)
-    }
-
-    /// Iterates over contiguous occupied index regions.
-    pub(crate) fn regions(&self) -> impl Iterator<Item = Range<u32>> + '_ {
-        let mut indices = self.indices().peekable();
-        std::iter::from_fn(move || {
-            let start = indices.next()?;
-            let mut end = start.saturating_add(1);
-            while indices.peek().is_some_and(|&index| index == end) {
-                indices.next();
-                end = end.saturating_add(1);
-            }
-            Some(start..end)
-        })
-    }
-
-    /// Drops every initialized value after applying `operation` to it.
-    pub(crate) fn clear_with<F>(&mut self, mut operation: F)
-    where
-        F: FnMut(&mut T),
-    {
-        for position in 0..self.vector.len() {
-            if self.free_bitmap.is_set(position) {
-                continue;
-            }
-            let index = position as u32;
-            // SAFETY: a clear free bit marks an initialized value.
-            let value = unsafe { self.vector[position].assume_init_mut() };
-            operation(value);
-            // SAFETY: the callback only receives a valid initialized value and
-            // it remains initialized until this drop.
-            unsafe { self.vector[position].assume_init_drop() };
-            self.release_index(index, position);
-        }
-    }
-
-    /// Checks the Pool metadata and occupancy invariants.
-    pub(crate) fn validate(&self) -> bool {
-        if self.free_bitmap.count_set() != self.free_indices.len() {
-            return false;
-        }
-        if self.len().saturating_add(self.free_indices.len()) != self.vector.len() {
-            return false;
-        }
-        for (position, &index) in self.free_indices.iter().enumerate() {
-            let index_usize = index as usize;
-            if index_usize >= self.vector.len() || !self.free_bitmap.is_set(index_usize) {
-                return false;
-            }
-            if self.free_indices[..position].contains(&index) {
-                return false;
-            }
-        }
-        true
     }
 
     #[inline]

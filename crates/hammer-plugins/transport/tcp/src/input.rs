@@ -592,6 +592,10 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
         }
         _ => return Ok(Some(TcpInputNext::Drop.slot() as u16)),
     };
+    // VPP tcp_input.c prefetches the established and listener tuple tables
+    // before the first lookup; the lookup owner keeps both family tables
+    // concrete and performs the family-specific key prefetch here.
+    main.worker(runtime.thread_index())?.lookup.prefetch_tuple(local, remote);
     let exact_session = match ip_session.lookup_main().lookup_exact(&connection) {
         SessionLookupResult::Session(handle) => Some(handle),
         SessionLookupResult::HalfOpen(_)

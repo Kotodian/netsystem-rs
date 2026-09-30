@@ -28,7 +28,9 @@ edition = "2024"
 publish = false
 
 [profile.release]
-lto = "thin"
+# `.cargo/config.toml` uses `prefer-dynamic` for the DSO plugin layout;
+# rustc rejects dynamic linking together with LTO.
+lto = false
 codegen-units = 16
 opt-level = 3
 

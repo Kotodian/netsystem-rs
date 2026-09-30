@@ -885,7 +885,6 @@ impl TcpConnection {
     }
 
     #[inline]
-    #[inline]
     pub(crate) fn observe_peer_ecn_feedback(&mut self, packet: &TcpPacket) {
         if self.negotiated_options().accurate_ecn {
             self.observe_peer_accurate_ecn_feedback(packet);

@@ -51,27 +51,6 @@ impl<I> Bitmap<I> {
         }
     }
 
-    #[inline]
-    pub fn word_len(&self) -> usize {
-        self.words.len()
-    }
-
-    pub(crate) fn try_reserve_bits(
-        &mut self,
-        bits: usize,
-    ) -> Result<(), std::collections::TryReserveError> {
-        let required = words_for(bits);
-        if required <= self.words.len() {
-            return Ok(());
-        }
-        let additional = required - self.words.len();
-        self.words.try_reserve(additional)?;
-        for _ in 0..additional {
-            self.words.push(0);
-        }
-        Ok(())
-    }
-
     fn ensure_bit(&mut self, bit: usize) {
         let required = bit / u64::BITS as usize + 1;
         if required <= self.words.len() {

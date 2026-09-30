@@ -7,7 +7,7 @@
 
 ## 目标与边界
 
-本测试先确认主机到 Hammer TUN 的 IPv4 双向路径、TCP 握手、Session/FIFO 数据接收以及 **Main Heap 和 packet Buffer** 的显式大页映射，再尝试标准 iperf3 客户端。它目前不能证明 Session MQ/FIFO 也使用大页。`[cpu].workers = 1` 指一个 **Data Worker**；主线程和其他辅助线程不计入该数。主机的 iperf3/socat 进程不是 Hammer Worker。
+本测试先确认主机到 Hammer TUN 的 IPv4 双向路径、TCP 握手、Session/FIFO 数据接收以及 **Main Heap 和 packet Buffer** 的显式大页映射，再尝试标准 iperf3 客户端。它目前不能证明 Session MQ/FIFO 也使用大页。本配置显式将控制主线程固定到 CPU 0，并将唯一的 **Data Worker** 固定到 CPU 1；主线程和其他辅助线程不计入 Data Worker。主机的 iperf3/socat 进程不是 Hammer Worker。
 
 测试不添加 CLI、协议适配层、额外 listener、错误类型或测试专用实现。VPP 的 TUN、Session queue、TCP 和 builtin app 是数据路径与所有权的参照，不代表 VPP vperf 与标准 iperf3 互通。
 
@@ -31,11 +31,12 @@
 plugins = ["tuntap", "iperf3"]
 
 [memory]
-main_heap_size = "512 MiB"
+main_heap_size = "100 MiB"
 main_heap_page_size = "default-hugepage"
 
 [cpu]
-workers = 1
+main-core = 0
+corelist-workers = [1]
 
 [worker.buffer]
 slots_per_numa = 8192
@@ -63,7 +64,10 @@ data_endpoint = "0.0.0.0:5202"
 duration = "10s"
 ```
 
-`[cpu]` 是运行时的 CPU 拓扑入口，不是测试专用字段。`workers` 与
+`[cpu]` 是运行时的 CPU 拓扑入口，不是测试专用字段。本测试配置使用显式的
+`main-core` 与 `corelist-workers`，因此不使用数量式的 `workers`。CPU 0 是控制主线程，CPU 1
+是唯一 Data Worker；如果测试机的 CPU 0/1 不在进程允许的 affinity 集合中，应将这两个值
+替换为两个不同的可用 CPU，不能让它们重叠。`workers` 与
 `corelist-workers` 互斥：省略 `corelist-workers` 时，`workers` 指要创建的 Data Worker
 数量；提供 `corelist-workers` 时，置位 CPU 的数量就是 worker 数量。运行时保存的是
 `hammer_infra::bitmap::Bitmap`，不是一个保留重复项或输入顺序的 `Vec`；TOML 数组和 VPP
@@ -141,18 +145,18 @@ skip-cores = 2
 
 ## 执行顺序
 
-在隔离的 Linux 测试机执行；需要 `/dev/net/tun`、`CAP_NET_ADMIN` 和足够的 HugeTLB 页。以下示例假设系统默认大页为 2 MiB。先记录原有 `vm.nr_hugepages`、`HugePages_Free`、Hugepagesize 与 NUMA 分布；若大页大小不是 2 MiB，应按实际大小重新计算页数，不照搬 512。512 个 2 MiB 页是供 512 MiB Main Heap、约 16 MiB packet Buffer 及余量使用的测试预算，不是产品默认值。仅在专用测试机上按需预留；已有配额高于 512 时不要降低它，测试后由管理员恢复原有配置。
+在隔离的 Linux 测试机执行；需要 `/dev/net/tun`、`CAP_NET_ADMIN` 和足够的 HugeTLB 页。以下示例假设系统默认大页为 2 MiB。先记录原有 `vm.nr_hugepages`、`HugePages_Free`、Hugepagesize 与 NUMA 分布；若大页大小不是 2 MiB，应按实际大小重新计算页数，不照搬 64。64 个 2 MiB 页是供 100 MiB Main Heap、约 16 MiB packet Buffer 及少量余量使用的测试预算，不是产品默认值。仅在专用测试机上按需预留；已有配额高于 64 时不要降低它，测试后由管理员恢复原有配置。
 
 ```sh
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
 cat /proc/sys/vm/nr_hugepages
 # 仅当默认大页是 2 MiB 且当前预留不足时，由管理员执行：
-sudo sysctl -w vm.nr_hugepages=512
+sudo sysctl -w vm.nr_hugepages=64
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
 ```
 
-1. `cargo build --workspace --locked` 构建 daemon 和需要的 DSO。确认 `target/debug/hammer` 旁存在 `libhammer_plugin_tuntap.so`、`libhammer_plugin_ip.so`、`libhammer_plugin_session.so`、`libhammer_plugin_tcp.so`、`libhammer_plugin_iperf3.so`。本文不执行构建。
-2. 用上节 TOML 的实际文件路径启动 `sudo ./target/debug/hammer /absolute/path/to/startup.toml`。记录 PID 和启动日志；如使用 `HAMMER_PLUGIN_DIR`，确保提权后的进程仍收到该环境变量。启动失败时不继续网络测试，先区分 DSO 缺失、TUN 权限、大页不足和 listener 创建错误。
+1. `cargo build --workspace --locked --release` 构建 release daemon 和需要的 DSO。确认 `target/release/hammer` 旁存在 `libhammer_plugin_tuntap.so`、`libhammer_plugin_ip.so`、`libhammer_plugin_session.so`、`libhammer_plugin_tcp.so`、`libhammer_plugin_iperf3.so`。本文不执行构建。
+2. 用上节 TOML 的实际文件路径启动 `sudo ./target/release/hammer /absolute/path/to/startup.toml`。记录 PID 和启动日志；如使用 `HAMMER_PLUGIN_DIR`，确保提权后的进程仍收到该环境变量。启动失败时不继续网络测试，先区分 DSO 缺失、TUN 权限、大页不足和 listener 创建错误。
 3. daemon 启动后，在**主机**执行以下命令。Hammer 接口是 `198.18.0.1/30`，主机端是 `198.18.0.2/30`；内核应把发往 `.1` 的流量路由到 `hammer0`。不要在 Hammer 配置里把两个地址都配到同一个接口。
 
 ```sh

@@ -639,11 +639,6 @@ impl TcpWorker {
     }
 
     #[inline]
-    pub(crate) fn has_connection_capacity(&self) -> bool {
-        self.connections.len() < self.connections.capacity()
-    }
-
-    #[inline]
     pub(crate) fn insert_connection(&mut self, connection: TcpConnection) -> u32 {
         let index = self.connections.insert(connection);
         self.connections

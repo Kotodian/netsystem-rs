@@ -44,9 +44,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
 
 use hammer_core::data_plane::{BufferPacketCursor, NodeId};
-use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult,
-};
+use hammer_runtime::{DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult};
 use hammer_runtime::node::{NodeErrorDescriptor, NodeErrorSeverity};
 use thiserror::Error;
 
@@ -336,10 +334,9 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
 
     fn connect_stream(
         &self,
-        endpoint: &IpTransportEndpointConfig,
-        session: ServiceSessionHandle,
+        _: &IpTransportEndpointConfig,
+        _: ServiceSessionHandle,
     ) -> Result<u32, SessionError> {
-        drop((endpoint, session));
         Err(SessionError::NotSupported)
     }
 

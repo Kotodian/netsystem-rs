@@ -12,7 +12,7 @@ use hammer_service::transport::{Transport, TransportMain};
 
 use crate::config::IpSessionConfig;
 use crate::endpoint::{
-    ENDPOINT_INVALID_INDEX, IpSessionEndpoint, IpSessionEndpointConfig, IpTransportConnectionId,
+    ENDPOINT_INVALID_INDEX, IpSessionEndpoint, IpSessionEndpointConfig,
     IpTransportEndpoint, IpTransportEndpointConfig,
 };
 use crate::lookup::{IpSessionFamily, IpSessionLookup};

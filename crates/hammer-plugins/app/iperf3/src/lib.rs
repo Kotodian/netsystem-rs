@@ -1,11 +1,12 @@
 //! Builtin iperf3 TCP server.
 
 mod config;
-mod main;
+#[path = "main.rs"]
+mod iperf_main;
 mod protocol;
 
 pub use config::Iperf3Config;
-pub use main::{Iperf3Main, ListenerRole, SessionPhase};
+pub use iperf_main::{Iperf3Main, ListenerRole, SessionPhase};
 pub use protocol::{
     ControlAction, ControlParameters, ControlParser, ControlPhase, ControlState,
     Iperf3ProtocolError,
@@ -14,8 +15,8 @@ pub use protocol::{
 hammer_component_macros::declare_plugin!(
     name = "iperf3",
     load_after = ["session", "tcp"],
-    init_functions = [main::__INIT_FN_IPERF3_INIT],
-    config_functions = [main::__CONFIG_FN_IPERF3_CONFIG],
+    init_functions = [iperf_main::__INIT_FN_IPERF3_INIT],
+    config_functions = [iperf_main::__CONFIG_FN_IPERF3_CONFIG],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [],

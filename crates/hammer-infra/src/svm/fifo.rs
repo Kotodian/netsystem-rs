@@ -708,7 +708,7 @@ impl Fifo {
                 );
             }
         }
-        let mut fifo = Self {
+        let fifo = Self {
             shr: hdr,
             fs_hdr: base.cast::<FifoSegmentHeader>(),
             ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
@@ -809,7 +809,7 @@ impl Fifo {
                 },
             );
         }
-        let mut fifo = Self {
+        let fifo = Self {
             shr: hdr,
             fs_hdr: base.cast::<FifoSegmentHeader>(),
             ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
@@ -881,7 +881,7 @@ impl Fifo {
         {
             return Err(FifoError::SegmentExhausted);
         }
-        let mut fifo = Self {
+        let fifo = Self {
             shr: hdr,
             fs_hdr: base.cast::<FifoSegmentHeader>(),
             ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
