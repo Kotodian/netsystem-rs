@@ -4,19 +4,17 @@ use std::time::Duration;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::ring::LocalRing;
-use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
+use io_uring::{IoUring, Probe, opcode, squeue, types};
 
 use super::{FILE_POOL_CAPACITY, POLL_BATCH_SIZE, PollEvent, PollSpec, PollTarget, Readiness};
 
 const CONTROL_TOKEN: u64 = u64::MAX - 1;
-const PROBE_TOKEN: u64 = u64::MAX;
 const DEADLINE_TOKEN_BIT: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
 struct Completion {
     user_data: u64,
     result: i32,
-    flags: u32,
 }
 
 pub(super) struct Poller {
@@ -26,7 +24,6 @@ pub(super) struct Poller {
     deadline_tokens: [u64; FILE_POOL_CAPACITY],
     deadline_fds: [Option<OwnedFd>; FILE_POOL_CAPACITY],
     deadline_durations: [Option<Duration>; FILE_POOL_CAPACITY],
-    multishot: bool,
     wake: OwnedFd,
 }
 
@@ -53,8 +50,6 @@ impl Poller {
             }
         }
 
-        let multishot = probe_multishot(&mut ring)?;
-
         // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
@@ -77,7 +72,6 @@ impl Poller {
             deadline_tokens: [CONTROL_TOKEN; FILE_POOL_CAPACITY],
             deadline_fds: std::array::from_fn(|_| None),
             deadline_durations: [None; FILE_POOL_CAPACITY],
-            multishot,
             wake,
         })
     }
@@ -260,18 +254,14 @@ impl Poller {
             let Some(completion) = self.pending.pop() else {
                 break;
             };
-            if let Some(event) = completion_event(
-                completion,
-                &self.current_tokens,
-                &self.deadline_tokens,
-                self.multishot,
-            )? {
+            if let Some(event) =
+                completion_event(completion, &self.current_tokens, &self.deadline_tokens)?
+            {
                 ready[count] = event;
                 count += 1;
             }
         }
 
-        let multishot = self.multishot;
         let current_tokens = &self.current_tokens;
         let deadline_tokens = &self.deadline_tokens;
         let (ring, pending) = (&mut self.ring, &mut self.pending);
@@ -280,11 +270,9 @@ impl Poller {
             let completion = Completion {
                 user_data: completion.user_data(),
                 result: completion.result(),
-                flags: completion.flags(),
             };
             if count < ready.len() {
-                if let Some(event) =
-                    completion_event(completion, current_tokens, deadline_tokens, multishot)?
+                if let Some(event) = completion_event(completion, current_tokens, deadline_tokens)?
                 {
                     ready[count] = event;
                     count += 1;
@@ -332,7 +320,6 @@ impl Poller {
                 let completion = Completion {
                     user_data: completion.user_data(),
                     result: completion.result(),
-                    flags: completion.flags(),
                 };
                 if completion.user_data == CONTROL_TOKEN {
                     result = Some(completion.result);
@@ -372,8 +359,9 @@ impl Poller {
 
     fn add_poll(&mut self, index: u32, fd: i32, flags: u32, deadline: bool) -> RuntimeResult<()> {
         let token = Self::next_token(index, deadline);
+        // VPP vlib/file.c uses level-triggered epoll unless EDGE_TRIGGERED is set.
+        // A one-shot poll rearmed after dispatch observes unread data again.
         let entry = opcode::PollAdd::new(types::Fd(fd), flags)
-            .multi(!deadline && self.multishot)
             .build()
             .user_data(token);
         self.submit(entry)?;
@@ -406,67 +394,10 @@ impl Poller {
     }
 }
 
-fn probe_multishot(ring: &mut IoUring) -> RuntimeResult<bool> {
-    // SAFETY: eventfd returns a fresh descriptor or -1 with errno set.
-    let fd = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(io_error(
-            "create eventfd for io_uring multishot probe",
-            io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: ownership of the fresh eventfd descriptor is transferred once.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let entry = opcode::PollAdd::new(types::Fd(fd.as_raw_fd()), libc::POLLIN as u32)
-        .multi(true)
-        .build()
-        .user_data(PROBE_TOKEN);
-    push(ring, entry)?;
-    submit_and_wait(ring)?;
-
-    let completion = ring
-        .completion()
-        .find(|completion| completion.user_data() == PROBE_TOKEN)
-        .ok_or(RuntimeError::FilePollerProbeCompletionMissing)?;
-    if completion.result() == -libc::EINVAL {
-        return Ok(false);
-    }
-    if completion.result() < 0 {
-        return Err(completion_error(
-            "probe io_uring multishot poll",
-            completion.result(),
-        ));
-    }
-    if !cqueue::more(completion.flags()) {
-        return Ok(false);
-    }
-
-    let remove = opcode::PollRemove::new(PROBE_TOKEN)
-        .build()
-        .user_data(CONTROL_TOKEN);
-    push(ring, remove)?;
-    loop {
-        submit_and_wait(ring)?;
-        let mut result = None;
-        for completion in ring.completion() {
-            if completion.user_data() == CONTROL_TOKEN {
-                result = Some(completion.result());
-            }
-        }
-        if let Some(result) = result {
-            if result != 0 && result != -libc::ENOENT {
-                return Err(completion_error("remove io_uring multishot probe", result));
-            }
-            return Ok(true);
-        }
-    }
-}
-
 fn completion_event(
     completion: Completion,
     current_tokens: &[u64; FILE_POOL_CAPACITY],
     deadline_tokens: &[u64; FILE_POOL_CAPACITY],
-    multishot: bool,
 ) -> RuntimeResult<Option<PollEvent>> {
     if completion.user_data == CONTROL_TOKEN {
         return Ok(None);
@@ -512,7 +443,7 @@ fn completion_event(
     Ok(Some(PollEvent {
         target: Some(target),
         readiness,
-        rearm: is_deadline || !multishot || !cqueue::more(completion.flags),
+        rearm: true,
     }))
 }
 
@@ -567,12 +498,6 @@ fn set_timerfd(fd: i32, duration: Option<Duration>) -> RuntimeResult<()> {
     }
 }
 
-fn push(ring: &mut IoUring, entry: squeue::Entry) -> RuntimeResult<()> {
-    let mut submissions = ring.submission();
-    // SAFETY: probe entries contain no borrowed userspace buffer.
-    unsafe { submissions.push(&entry) }.map_err(|_| RuntimeError::FileSubmissionQueueFull.into())
-}
-
 fn submit(ring: &IoUring) -> RuntimeResult<usize> {
     loop {
         match ring.submit() {
@@ -601,4 +526,46 @@ fn completion_error(operation: &'static str, result: i32) -> RuntimeError {
 
 fn io_error(operation: &'static str, source: io::Error) -> RuntimeError {
     RuntimeError::FilePollerIo { operation, source }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn unread_file_remains_ready_after_rearm() {
+        let mut poller = Poller::new().expect("io_uring poller is available");
+        // SAFETY: eventfd returns a new descriptor, owned by this test.
+        let fd = unsafe { libc::eventfd(1, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0);
+        // SAFETY: the new descriptor has not been transferred elsewhere.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let spec = PollSpec {
+            index: 0,
+            fd: fd.as_raw_fd(),
+            read: true,
+            write: false,
+        };
+        poller.add(spec).expect("register readable descriptor");
+
+        for _ in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let mut ready = std::array::from_fn(|_| PollEvent::default());
+                if poller.poll(&mut ready).expect("poll readiness") != 0 {
+                    assert!(matches!(ready[0].target, Some(PollTarget::File(0))));
+                    assert!(ready[0].readiness.contains(Readiness::READ));
+                    assert!(ready[0].rearm);
+                    poller.add(spec).expect("rearm readable descriptor");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "unread descriptor lost readiness"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
 }

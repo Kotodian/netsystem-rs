@@ -721,16 +721,13 @@ impl FileMain {
                     // A callback already borrows its File exclusively. It
                     // changes that value's write flag directly; reconcile the
                     // poller only after the callback borrow has ended.
-                    if let Some(after) = self.poll_spec(index)
-                        && before.write != after.write
-                    {
+                    let Some(after) = self.poll_spec(index) else {
+                        continue;
+                    };
+                    if before.write != after.write {
                         self.poller_mut(thread_index)?.modify(before, after)?;
-                    }
-                    if event.rearm {
-                        let Some(spec) = self.poll_spec(index) else {
-                            continue;
-                        };
-                        self.poller_mut(thread_index)?.add(spec)?;
+                    } else if event.rearm {
+                        self.poller_mut(thread_index)?.add(after)?;
                     }
                 }
                 Some(PollTarget::Deadline(index)) => {

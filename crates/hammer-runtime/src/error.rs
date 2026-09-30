@@ -64,10 +64,6 @@ pub enum RuntimeError {
     FilePollerOperationUnsupported { operation: &'static str },
     #[error("File poller completion queue is full while {operation}")]
     FileCompletionQueueFull { operation: &'static str },
-    #[error("File poller multishot probe produced no completion")]
-    FilePollerProbeCompletionMissing,
-    #[error("File poller submission queue is full")]
-    FileSubmissionQueueFull,
     #[error("{operation}")]
     FilePollerIo {
         operation: &'static str,
