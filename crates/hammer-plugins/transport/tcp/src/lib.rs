@@ -622,6 +622,24 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
             .expect("sendable TCP connection retains its Session RX FIFO")
             .max_enqueue();
         connection.set_rcv_wnd(rx_available);
+        let sendable = matches!(
+            connection.state(),
+            TcpState::SynSent | TcpState::Established | TcpState::CloseWait
+        ) || (connection.state() == TcpState::FinWait1 && connection.fin_pending);
+        if !sendable {
+            // VPP tcp.c:1147-1154,1190-1212: Session TX deschedules
+            // after the connection leaves a packetizable send state.
+            *cached_segment = None;
+            params.send_space = 0;
+            params.tx_offset = connection.snd_nxt().wrapping_sub(connection.snd_una());
+            params.send_mss = u16::try_from(connection.send_mss)
+                .expect("TCP effective MSS fits transport parameter");
+            params.flags = TransportSendFlags {
+                deschedule: true,
+                postpone: false,
+            };
+            return;
+        }
         let segment = connection.tx_segment(0, TcpCapabilities::default())
             .expect("ready TCP connection prepares established burst options");
         let options_len = segment.cache_options(cached_opts);
@@ -1265,8 +1283,10 @@ fn tcp_session_update_time(
 fn listener_capabilities() -> TcpCapabilities {
     let policy = active_tcp_policy();
     let mut window_scale = 0u8;
+    // VPP tcp.c:1716-1717, tcp_output.c:73-80: negotiate against the
+    // maximum RX FIFO, not the unscaled SYN receive window.
     while window_scale < connection::TCP_MAX_WINDOW_SCALE
-        && (policy.receive_window >> window_scale) > u32::from(u16::MAX)
+        && ((32 << 20) >> window_scale) > u32::from(u16::MAX)
     {
         window_scale += 1;
     }

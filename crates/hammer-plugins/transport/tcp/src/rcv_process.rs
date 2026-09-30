@@ -334,5 +334,7 @@ fn tcp_rcv_process_index<const IS_IP4: bool>(
             tcp.tco_next_node[usize::from(!packet.local.is_ipv4())],
         );
     }
+    // VPP tcp_input.c:2370-2375 frees every consumed rcv-process input.
+    runtime.buffer_free_one(index);
     Ok(())
 }

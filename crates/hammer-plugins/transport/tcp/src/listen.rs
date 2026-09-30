@@ -394,7 +394,9 @@ impl<'a> TcpListener<'a> {
                 packet.remote,
                 sequence,
                 packet.sequence.advance(1).raw(),
-                packet.advertised_window,
+                // VPP tcp_output.c:518-535: the SYN-ACK advertises the
+                // local unscaled initial window, not the peer SYN window.
+                4 << 10,
                 flags,
                 capabilities,
                 None,

@@ -36,7 +36,6 @@ const IPV4_TCP_BASE_HEADER_BYTES: u16 = 40;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
-const TCP_DELAYED_ACK_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpKeepaliveConfig {
@@ -588,7 +587,13 @@ impl TcpConnection {
 
     #[inline]
     fn output_receive_window(&mut self, flags: TcpSegmentFlags) -> u16 {
-        let advertised = self.advertised_receive_window(self.rcv_wnd);
+        // VPP tcp_output.c:104-113,496-535: SYN windows are unscaled and
+        // use the minimum RX FIFO size until a Session FIFO is attached.
+        let advertised = if flags.contains(TcpSegmentFlags::SYN) {
+            4 << 10
+        } else {
+            self.advertised_receive_window(self.rcv_wnd)
+        };
         if flags.contains(TcpSegmentFlags::ACK) {
             self.zero_receive_window_sent = advertised == 0;
         }
@@ -1081,26 +1086,6 @@ impl TcpConnection {
             self.timestamps.recent_remote_at = Some(now);
         }
         true
-    }
-
-    #[inline]
-    pub(super) fn on_clean_in_order_payload(
-        &mut self,
-        index: u32,
-        timers: &mut TimerWheel1t2w2048sl<u32>,
-    ) -> RuntimeResult<bool> {
-        if self.timers.is_active(TcpTimerKind::DelayedAck) {
-            timers::reset(timers, index, &mut self.timers, TcpTimerKind::DelayedAck);
-            return Ok(true);
-        }
-        timers::set(
-            timers,
-            index,
-            &mut self.timers,
-            TcpTimerKind::DelayedAck,
-            TCP_DELAYED_ACK_INTERVAL,
-        )?;
-        Ok(false)
     }
 
     #[inline]
@@ -1956,6 +1941,10 @@ impl TcpConnection {
         now: Instant,
     ) -> RuntimeResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::Established)?;
+        // VPP tcp_input.c:211-325 validates RST before the ACK field.
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return self.receive_close_side(index, timers, packet, now);
+        }
         if !self.observe_inbound_timestamp(
             packet.flags,
             packet.timestamp,
@@ -2058,6 +2047,13 @@ impl TcpConnection {
 
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
+            // VPP tcp_input.c:168-191 resets connection timers before
+            // publishing the reset notification and deferred cleanup.
+            for id in 0..TCP_TIMER_KIND_COUNT as u32 {
+                let kind = TcpTimerKind::from_id(id)
+                    .expect("TCP timer count covers every registered kind");
+                timers::reset(timers, index, &mut self.timers, kind);
+            }
             self.state = TcpState::Closed;
             return Ok(None);
         }

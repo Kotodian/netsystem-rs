@@ -282,6 +282,19 @@ fn tcp_established_index<const IS_IP4: bool>(
         if acked_tx_len != 0 {
             tcp.program_dequeue(connection_index, acked_tx_len);
         }
+        if packet.flags.contains(crate::TcpSegmentFlags::RST)
+            && tcp
+                .connection(connection_index)
+                .is_some_and(|connection| connection.state() == crate::TcpState::Closed)
+        {
+            // VPP tcp_input.c:159-191, tcp46_established_inline: notify
+            // Session before delaying the transport connection release.
+            sessions.transport_reset(runtime, handle, connection_index)?;
+            sessions.transport_closed(runtime, handle, connection_index)?;
+            tcp.program_cleanup(connection_index);
+            runtime.buffer_free_one(index);
+            return Ok(());
+        }
         let retransmit_pending = tcp.connection(connection_index)
             .is_some_and(|connection| {
                 connection.recovery.in_recovery()
@@ -310,33 +323,14 @@ fn tcp_established_index<const IS_IP4: bool>(
                 | RxDelivery::InOrder { rx_available, .. }
                 | RxDelivery::OutOfOrder { rx_available, .. } => rx_available as usize,
             };
-            let clean_in_order = trim == 0
-                && offset == 0
-                && matches!(
-                    delivery,
-                    RxDelivery::InOrder {
-                        accepted,
-                        promoted,
-                        ..
-                    } if promoted == 0 && accepted.get() == accepted_len
-                );
-            immediate_ack = {
-                let crate::worker::TcpWorker {
-                    connections,
-                    timer_wheel: timers,
-                    ..
-                } = tcp;
-                let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                    *error = Some(TcpNodeError::EstablishedSessionMissing);
-                    TcpNodeError::EstablishedSessionMissing
-                })?;
-                connection.receive_payload(accepted_sequence, trim as u32, delivery)?;
-                if clean_in_order {
-                    connection.on_clean_in_order_payload(connection_index, timers)?
-                } else {
-                    true
-                }
-            };
+            let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
+                *error = Some(TcpNodeError::EstablishedSessionMissing);
+                TcpNodeError::EstablishedSessionMissing
+            })?;
+            connection.receive_payload(accepted_sequence, trim as u32, delivery)?;
+            // VPP tcp_input.c:1207-1208 programs an ACK for every in-order
+            // enqueue; session custom TX coalesces requests in a burst.
+            immediate_ack = true;
             match delivery {
                 RxDelivery::NotAccepted { .. } => {}
                 RxDelivery::InOrder {
@@ -410,5 +404,7 @@ fn tcp_established_index<const IS_IP4: bool>(
             tcp.tco_next_node[usize::from(!packet.local.is_ipv4())],
         );
     }
+    // VPP tcp_input.c:1408-1414 frees every consumed established input.
+    runtime.buffer_free_one(index);
     Ok(())
 }
