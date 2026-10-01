@@ -21,9 +21,19 @@ use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::NodeMain;
 use crate::error::{RuntimeError, RuntimeResult};
+pub use hammer_core::file::FileReadinessMode;
 use hammer_core::file::{
     File as CoreFile, FileFunction as CoreFileFunction, FileFunctions as CoreFileFunctions,
 };
+
+/// Data Worker File polling strategy; thread zero retains asynchronous File waiting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFilePollMode {
+    #[default]
+    Adaptive,
+    Busy,
+}
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -223,6 +233,14 @@ impl FileMain {
 
     #[allow(clippy::mut_from_ref)]
     fn poller_mut(&self, thread_index: u32) -> RuntimeResult<&mut Poller> {
+        if thread_index != 0 && crate::thread_main::THREAD_MAIN.get().is_some() {
+            let worker = crate::DataWorkerId::new(thread_index - 1);
+            if !crate::thread_main::is_current_worker(worker) {
+                crate::ensure_main_thread()
+                    .expect("only the main thread changes another worker's File poller");
+                crate::barrier::__assert_held();
+            }
+        }
         let poller =
             self.pollers
                 .get(thread_index as usize)
@@ -230,8 +248,8 @@ impl FileMain {
                     stage: "FileMain".to_owned(),
                     message: format!("polling thread {thread_index} is not configured"),
                 })?;
-        // SAFETY: the caller owns the poller selected by the File's
-        // polling_thread_index and the lifecycle barrier excludes teardown.
+        // SAFETY: a worker accesses only its own poller; main-thread changes
+        // require the barrier after worker publication.
         Ok(unsafe { &mut *poller.get() })
     }
 
@@ -698,6 +716,9 @@ impl FileMain {
         let count = self.poller_mut(thread_index)?.poll(&mut events)?;
         let mut dispatched = 0;
         for event in &events[..count] {
+            if !self.poller_mut(thread_index)?.is_current(event) {
+                continue;
+            }
             match event.target {
                 Some(PollTarget::File(index)) => {
                     let Some(file) = self.file_ptr(index) else {
@@ -724,10 +745,13 @@ impl FileMain {
                     let Some(after) = self.poll_spec(index) else {
                         continue;
                     };
-                    if before.write != after.write {
+                    if !self.poller_mut(thread_index)?.is_current(event) {
+                        continue;
+                    }
+                    if event.rearm {
+                        self.poller_mut(thread_index)?.rearm(after)?;
+                    } else if before.write != after.write {
                         self.poller_mut(thread_index)?.modify(before, after)?;
-                    } else if event.rearm {
-                        self.poller_mut(thread_index)?.add(after)?;
                     }
                 }
                 Some(PollTarget::Deadline(index)) => {
@@ -741,7 +765,9 @@ impl FileMain {
                     function(graph, deadline)?;
                     dispatched += 1;
                     if event.rearm {
-                        if self.deadline_ptr(index).is_some() {
+                        if self.deadline_ptr(index).is_some()
+                            && self.poller_mut(thread_index)?.is_current(event)
+                        {
                             self.poller_mut(thread_index)?.rearm_deadline(index)?;
                         }
                     }
@@ -749,6 +775,7 @@ impl FileMain {
                 None => {}
             }
         }
+        self.poller_mut(thread_index)?.flush()?;
         Ok(dispatched)
     }
 }
@@ -789,6 +816,12 @@ impl AsyncFileMain {
 
     /// Awaits main-shard readiness and performs one nonblocking poll.
     pub async fn next_ready(&mut self, graph: &mut NodeMain) -> RuntimeResult<usize> {
+        let file_main = FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before runtime services start");
+        if file_main.poller_mut(0)?.has_pending() {
+            return file_main.poll_for_worker(0, graph);
+        }
         let mut guard =
             self.wake
                 .readable()
@@ -797,9 +830,6 @@ impl AsyncFileMain {
                     operation: "await AsyncFileMain wake readiness",
                     source,
                 })?;
-        let file_main = FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before runtime services start");
         file_main.clear_io_wake_for_worker(0)?;
         guard.clear_ready();
         file_main.poll_for_worker(0, graph)
@@ -815,6 +845,7 @@ pub(super) struct PollSpec {
     pub(super) fd: RawFd,
     pub(super) read: bool,
     pub(super) write: bool,
+    pub(super) readiness_mode: FileReadinessMode,
 }
 
 impl PollSpec {
@@ -826,6 +857,7 @@ impl PollSpec {
             fd: file.fd(),
             read: functions.read.is_some() || functions.error.is_some(),
             write: file.write_enabled(),
+            readiness_mode: file.readiness_mode(),
         }
     }
 }
@@ -841,6 +873,7 @@ pub(super) struct PollEvent {
     pub(super) target: Option<PollTarget>,
     pub(super) readiness: Readiness,
     pub(super) rearm: bool,
+    pub(super) token: u64,
 }
 
 impl Default for PollEvent {
@@ -849,6 +882,7 @@ impl Default for PollEvent {
             target: None,
             readiness: Readiness::default(),
             rearm: false,
+            token: 0,
         }
     }
 }

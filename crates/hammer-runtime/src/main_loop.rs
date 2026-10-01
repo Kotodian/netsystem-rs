@@ -199,6 +199,7 @@ where
 /// 7. Advance timers, increment the thread's main-loop counter and check exit
 pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i32 {
     main.attach_worker_interrupt_thread();
+    let file_poll = crate::config::worker::file_poll();
 
     loop {
         let mut progress = false;
@@ -247,7 +248,7 @@ pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i
         // Step 3: Drain handoff queues and run ready nodes.
         let _ = main.run_ready_nodes();
 
-        if !progress {
+        if !progress && matches!(file_poll, crate::file::WorkerFilePollMode::Adaptive) {
             std::thread::park_timeout(idle_slice);
         }
 

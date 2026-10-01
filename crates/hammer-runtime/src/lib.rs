@@ -57,7 +57,7 @@ pub mod config;
 pub mod file;
 pub use file::{
     AsyncFileMain, Deadline, DeadlineFunction, FILE_MAIN, File, FileFunction, FileFunctions,
-    FileMain,
+    FileMain, FileReadinessMode, WorkerFilePollMode,
 };
 
 pub mod barrier;

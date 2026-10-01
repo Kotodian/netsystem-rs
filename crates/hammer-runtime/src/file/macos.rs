@@ -46,6 +46,22 @@ impl Poller {
         self.update(None, Some(spec))
     }
 
+    pub(super) fn rearm(&self, spec: PollSpec) -> RuntimeResult<()> {
+        self.add(spec)
+    }
+
+    pub(super) fn flush(&self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    pub(super) fn is_current(&self, _: &PollEvent) -> bool {
+        true
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        false
+    }
+
     pub(super) fn modify(&self, before: PollSpec, after: PollSpec) -> RuntimeResult<()> {
         self.update(Some(before), Some(after))
     }
@@ -165,6 +181,7 @@ impl Poller {
                 target,
                 readiness,
                 rearm: event.filter == libc::EVFILT_TIMER,
+                token,
             };
         }
         Ok(count)

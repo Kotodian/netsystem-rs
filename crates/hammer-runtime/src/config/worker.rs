@@ -22,6 +22,7 @@ use serde::ser::{SerializeSeq, Serializer};
 use std::fmt;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::file::WorkerFilePollMode;
 
 // hammer-service/src/service.rs
 pub(crate) const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -42,6 +43,7 @@ const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
 static STACK_SIZE: OnceLock<usize> = OnceLock::new();
 static MAX_BLOCKING: OnceLock<usize> = OnceLock::new();
 static IDLE_SLICE: OnceLock<Duration> = OnceLock::new();
+static FILE_POLL: OnceLock<WorkerFilePollMode> = OnceLock::new();
 static BUFFER: OnceLock<WorkerBuffer> = OnceLock::new();
 static HANDOFF: OnceLock<WorkerHandoff> = OnceLock::new();
 static APP_SESSION: OnceLock<WorkerAppSession> = OnceLock::new();
@@ -87,6 +89,7 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     )?
     .map(humantime_serde::Serde::into_inner)
     .unwrap_or(WORKER_IDLE_SLICE);
+    let file_poll = take_value(&mut section, "file_poll", &[])?.unwrap_or_default();
     let buffer: WorkerBuffer = take_value(&mut section, "buffer", &[])?.unwrap_or_default();
     let handoff: WorkerHandoff = take_value(&mut section, "handoff", &[])?.unwrap_or_default();
     let app_session: WorkerAppSession =
@@ -114,6 +117,7 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     assert!(STACK_SIZE.set(stack_size).is_ok());
     assert!(MAX_BLOCKING.set(max_blocking_threads).is_ok());
     assert!(IDLE_SLICE.set(idle_slice).is_ok());
+    assert!(FILE_POLL.set(file_poll).is_ok());
     assert!(BUFFER.set(buffer).is_ok());
     assert!(HANDOFF.set(handoff).is_ok());
     assert!(APP_SESSION.set(app_session).is_ok());
@@ -149,6 +153,12 @@ pub(crate) fn idle_slice() -> Duration {
     *IDLE_SLICE
         .get()
         .expect("worker configuration is installed before thread setup")
+}
+
+pub(crate) fn file_poll() -> WorkerFilePollMode {
+    *FILE_POLL
+        .get()
+        .expect("worker configuration is installed before File polling")
 }
 
 pub(crate) fn buffer() -> &'static WorkerBuffer {
