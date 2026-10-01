@@ -261,6 +261,9 @@ impl WorkerThread {
                 if refork_required {
                     barrier.refork(&mut main.nodes);
                 }
+                main.select_architecture_functions(
+                    cfg!(target_os = "linux") && cpu_index.is_some(),
+                )?;
                 crate::init::run_worker_init_functions(&mut main, &init_functions)?;
                 let exit_status = crate::main_loop::data_plane_main_loop(&mut main, idle_slice);
                 if exit_status == 0 {

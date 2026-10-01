@@ -27,6 +27,15 @@ impl DataPlaneMain {
         entries: impl Clone + Iterator<Item = &'entry NodeEntry>,
         node_functions: impl Clone + Iterator<Item = &'function NodeFunctionRegistration>,
     ) -> RuntimeResult<()> {
+        for entry in entries.clone() {
+            if let Some(registration) = entry.registration {
+                let _ = crate::node::preferred_node_function(
+                    registration.name(),
+                    false,
+                    node_functions.clone(),
+                )?;
+            }
+        }
         let mut nodes = Vec::with_capacity(entries.clone().count());
         let mut processes = Vec::with_capacity(nodes.capacity());
         for register_siblings in [false, true] {
@@ -52,12 +61,8 @@ impl DataPlaneMain {
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.register_node_errors(node, error_counters)?;
-            self.nodes.install_node_function(
-                node,
-                self.simd_bytes,
-                node_functions.clone(),
-                process,
-            )?;
+            self.nodes
+                .install_node_function(node, node_functions.clone(), process)?;
         }
         self.nodes.resolve_named_next_nodes()
     }
@@ -67,6 +72,15 @@ impl DataPlaneMain {
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
+        for entry in entries {
+            let name = entry
+                .registration
+                .map(NodeRegistration::name)
+                .ok_or(DataPlaneError::UnnamedGraphRegistration)?;
+            if self.nodes.node_by_name(name).is_none() {
+                let _ = crate::node::preferred_node_function(name, false, node_functions.iter())?;
+            }
+        }
         let mut nodes = Vec::with_capacity(entries.len());
         let mut processes = Vec::with_capacity(entries.len());
         for register_siblings in [false, true] {
@@ -91,12 +105,8 @@ impl DataPlaneMain {
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.register_node_errors(node, error_counters)?;
-            self.nodes.install_node_function(
-                node,
-                self.simd_bytes,
-                node_functions.iter(),
-                process,
-            )?;
+            self.nodes
+                .install_node_function(node, node_functions.iter(), process)?;
         }
         self.nodes.resolve_named_next_nodes()?;
         Ok(())

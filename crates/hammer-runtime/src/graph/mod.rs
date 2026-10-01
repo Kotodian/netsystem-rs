@@ -8,6 +8,6 @@
 //! Graph contents come from declarations installed by the thread-zero runtime
 //! before normal initialization begins.
 
-mod fanout;
+pub(crate) mod fanout;
 
 pub use crate::NodeEntry;

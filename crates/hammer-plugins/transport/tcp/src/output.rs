@@ -6,7 +6,7 @@ use hammer_core::data_plane::{
 use hammer_infra::checksum::InternetChecksum;
 use hammer_plugin_session::{IpSessionFamily, IpSessionMain};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
+use hammer_runtime::{DataPlaneMain, Node, NodeRuntime};
 use hammer_service::session::SessionMain;
 use hammer_service::session::node::SessionQueueNode;
 
@@ -95,8 +95,7 @@ impl Node for Tcp4OutputNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_output_node_process::<true>;
-        process(runtime, node_runtime, frame)
+        tcp4_output_node_process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -112,44 +111,34 @@ impl Node for Tcp6OutputNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_output_node_process::<false>;
-        process(runtime, node_runtime, frame)
+        tcp6_output_node_process(runtime, node_runtime, frame)
     }
 }
 
-fn tcp_output_node_process<const IS_IP4: bool>(
-    runtime: &mut DataPlaneMain,
-    node_runtime: &mut NodeRuntime,
-    frame: &mut Frame,
-) -> usize {
-    let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<1, IS_IP4>(runtime, node_runtime, frame);
-    processed_vectors
-}
-
 #[hammer_component_macros::node_function(node = Tcp4OutputNode)]
-fn tcp4_output_node_process_simd<const SIMD_BYTES: usize>(
+fn tcp4_output_node_process(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<SIMD_BYTES, true>(runtime, node_runtime, frame);
+    tcp_output_node_process_frame::<true>(runtime, node_runtime, frame);
     processed_vectors
 }
 
 #[hammer_component_macros::node_function(node = Tcp6OutputNode)]
-fn tcp6_output_node_process_simd<const SIMD_BYTES: usize>(
+fn tcp6_output_node_process(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<SIMD_BYTES, false>(runtime, node_runtime, frame);
+    tcp_output_node_process_frame::<false>(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_output_node_process_frame<const SIMD_BYTES: usize, const IS_IP4: bool>(
+#[inline(always)]
+fn tcp_output_node_process_frame<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
@@ -180,9 +169,8 @@ fn tcp_output_node_process_frame<const SIMD_BYTES: usize, const IS_IP4: bool>(
         prefetch_tcp_output(runtime, indices[position + 3]);
 
         let mut error0 = None;
-        let next0 = tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(
-            runtime, indices[position], &mut error0,
-        ).unwrap_or(TcpOutputNext::Drop);
+        let next0 = tcp_output_next_for_index::<IS_IP4>(runtime, indices[position], &mut error0)
+            .unwrap_or(TcpOutputNext::Drop);
         nexts[position] = NodeNext::slot(next0);
         if let Some(error) = error0 {
             let code = error as usize;
@@ -192,9 +180,9 @@ fn tcp_output_node_process_frame<const SIMD_BYTES: usize, const IS_IP4: bool>(
         }
 
         let mut error1 = None;
-        let next1 = tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(
-            runtime, indices[position + 1], &mut error1,
-        ).unwrap_or(TcpOutputNext::Drop);
+        let next1 =
+            tcp_output_next_for_index::<IS_IP4>(runtime, indices[position + 1], &mut error1)
+                .unwrap_or(TcpOutputNext::Drop);
         nexts[position + 1] = NodeNext::slot(next1);
         if let Some(error) = error1 {
             let code = error as usize;
@@ -210,9 +198,8 @@ fn tcp_output_node_process_frame<const SIMD_BYTES: usize, const IS_IP4: bool>(
             prefetch_tcp_output(runtime, next);
         }
         let mut error = None;
-        let next = tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(
-            runtime, indices[position], &mut error,
-        ).unwrap_or(TcpOutputNext::Drop);
+        let next = tcp_output_next_for_index::<IS_IP4>(runtime, indices[position], &mut error)
+            .unwrap_or(TcpOutputNext::Drop);
         nexts[position] = NodeNext::slot(next);
         if let Some(error) = error {
             let code = error as usize;
@@ -248,7 +235,8 @@ fn prefetch_tcp_output(runtime: &DataPlaneMain, index: u32) {
     hammer_infra::prefetch::prefetch_write_l1_bytes(data, 2 * hammer_infra::align::CACHE_LINE);
 }
 
-fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
+#[inline(always)]
+fn tcp_output_next_for_index<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
     error: &mut Option<TcpError>,
@@ -321,7 +309,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
                 *error = Some(TcpError::Length);
                 return Ok(TcpOutputNext::Drop);
             };
-            tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len, fib_index)?;
+            tcp_output_push_ipv4(runtime, index, src, dst, total_len, fib_index)?;
             Ok(TcpOutputNext::Lookup)
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) if !IS_IP4 => {
@@ -329,7 +317,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
                 *error = Some(TcpError::Length);
                 return Ok(TcpOutputNext::Drop);
             };
-            tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len, fib_index)?;
+            tcp_output_push_ipv6(runtime, index, src, dst, payload_len, fib_index)?;
             Ok(TcpOutputNext::Lookup)
         }
         _ => {
@@ -340,7 +328,8 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
 }
 
 /// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
-pub(crate) fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
+#[inline(always)]
+pub(crate) fn tcp_output_push_ipv4(
     runtime: &mut DataPlaneMain,
     index: u32,
     src: Ipv4Addr,
@@ -350,7 +339,7 @@ pub(crate) fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
 ) -> RuntimeResult<()> {
     const IPV4_HEADER_LEN: usize = 20;
     let tcp_len = total_len - IPV4_HEADER_LEN as u16;
-    let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
+    let mut checksum = InternetChecksum::default();
     checksum.write(&src.octets());
     checksum.write(&dst.octets());
     checksum.write(&[0, TCP_PROTOCOL]);
@@ -382,7 +371,8 @@ pub(crate) fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
 }
 
 /// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
-pub(crate) fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
+#[inline(always)]
+pub(crate) fn tcp_output_push_ipv6(
     runtime: &mut DataPlaneMain,
     index: u32,
     src: Ipv6Addr,
@@ -391,7 +381,7 @@ pub(crate) fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     fib_index: u32,
 ) -> RuntimeResult<()> {
     const IPV6_HEADER_LEN: usize = 40;
-    let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
+    let mut checksum = InternetChecksum::default();
     checksum.write(&src.octets());
     checksum.write(&dst.octets());
     checksum.write(&u32::from(payload_len).to_be_bytes());
@@ -422,10 +412,11 @@ pub(crate) fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     Ok(())
 }
 
-fn set_tcp_checksum<const SIMD_BYTES: usize>(
+#[inline(always)]
+fn set_tcp_checksum(
     runtime: &mut DataPlaneMain,
     index: u32,
-    mut checksum: InternetChecksum<SIMD_BYTES>,
+    mut checksum: InternetChecksum,
 ) -> RuntimeResult<()> {
     {
         let buffer = runtime.buffer_mut(index);

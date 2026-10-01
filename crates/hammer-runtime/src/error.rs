@@ -176,6 +176,11 @@ pub enum RuntimeError {
     MainProcessRuntimeUnavailable,
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
+    #[error("duplicate Node Function for `{node}` variant {variant:?}")]
+    DuplicateNodeFunction {
+        node: &'static str,
+        variant: crate::node::NodeVariant,
+    },
     #[error("Process Node declaration has no registered name")]
     ProcessNodeNameMissing,
     #[error("Process Node declaration `{name}` has graph kind {kind:?}")]

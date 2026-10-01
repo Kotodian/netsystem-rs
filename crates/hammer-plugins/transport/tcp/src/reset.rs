@@ -129,7 +129,7 @@ fn tcp_reset_next_for_index<const IS_IP4: bool>(
     }
     match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) if IS_IP4 => {
-            tcp_output_push_ipv4::<1>(runtime, index, source, destination, 40, fib_index)?;
+            tcp_output_push_ipv4(runtime, index, source, destination, 40, fib_index)?;
             let buffer = runtime.buffer_mut(index);
             let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
             network.sw_if_index[0] = input_interface;
@@ -137,7 +137,7 @@ fn tcp_reset_next_for_index<const IS_IP4: bool>(
             Ok(TcpResetNext::Lookup)
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) if !IS_IP4 => {
-            tcp_output_push_ipv6::<1>(runtime, index, source, destination, 20, fib_index)?;
+            tcp_output_push_ipv6(runtime, index, source, destination, 20, fib_index)?;
             let buffer = runtime.buffer_mut(index);
             let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
             network.sw_if_index[0] = input_interface;

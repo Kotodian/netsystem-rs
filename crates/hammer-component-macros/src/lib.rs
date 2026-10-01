@@ -878,12 +878,8 @@ impl Parse for NodeFunctionArgs {
     }
 }
 
-/// Registers multiarch Node Function candidates for an existing Graph Node.
-///
-/// The function is compiled once per supported SIMD width. A function may
-/// declare one `const SIMD_BYTES: usize` generic to receive that width.
-/// Conditional compilation attributes on the function gate every generated
-/// variant.
+/// Registers architecture candidates for an existing Graph Node.
+/// Conditional compilation attributes on the function gate every candidate.
 #[proc_macro_attribute]
 pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as NodeFunctionArgs);
@@ -893,87 +889,77 @@ pub fn node_function(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn expand_node_function(args: NodeFunctionArgs, function: ItemFn) -> TokenStream2 {
     let node = &args.node;
-    let function_name = function.sig.ident.clone();
-    let has_simd_generic = match function.sig.generics.params.len() {
-        0 => false,
-        1 => match function.sig.generics.params.first() {
-            Some(GenericParam::Const(_)) => true,
-            _ => {
-                return Error::new_spanned(
-                    &function.sig.generics,
-                    "`node_function` only accepts a const SIMD-width generic",
-                )
-                .to_compile_error();
-            }
-        },
-        _ => {
-            return Error::new_spanned(
-                &function.sig.generics,
-                "`node_function` accepts at most one const SIMD-width generic",
-            )
-            .to_compile_error();
-        }
-    };
-    if has_simd_generic
-        && !matches!(
-            function.sig.generics.params.first(),
-            Some(GenericParam::Const(parameter))
-                if matches!(&parameter.ty, Type::Path(path) if path.path.is_ident("usize"))
-        )
-    {
+    if !function.sig.generics.params.is_empty() {
         return Error::new_spanned(
             &function.sig.generics,
-            "the `node_function` SIMD-width generic must be `const ...: usize`",
+            "`node_function` body must not have architecture-width generics",
         )
         .to_compile_error();
     }
-    // VPP recompiles one VLIB_NODE_FN body for each enabled march variant.
-    // Generate the equivalent private symbols from one Rust declaration.
-    let scalar = expand_node_function_variant(
+    let baseline = expand_node_function_variant(
         node,
         &function,
-        function_name,
-        "scalar",
-        1,
-        has_simd_generic,
+        function.sig.ident.clone(),
+        "base",
+        quote!(::hammer_runtime::node::NodeVariant::Base),
+        quote!(),
         quote!(),
     );
-    let simd128 = expand_node_function_variant(
+    let v3 = expand_node_function_variant(
         node,
         &function,
-        format_ident!("__{}_simd128", function.sig.ident),
-        "simd128",
-        16,
-        has_simd_generic,
-        quote!(
-            #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse2"))]
-            #[cfg_attr(any(target_arch = "arm", target_arch = "aarch64"), target_feature(enable = "neon"))]
-        ),
+        format_ident!("__{}_x86_64_v3", function.sig.ident),
+        "x86_64_v3",
+        quote!(::hammer_runtime::node::NodeVariant::X86_64V3),
+        quote!(#[cfg(target_arch = "x86_64")]),
+        quote!(#[target_feature(enable = "avx2,bmi1,bmi2,fma,f16c,lzcnt,movbe")]),
     );
-    let simd256 = expand_node_function_variant(
+    let v4 = expand_node_function_variant(
         node,
         &function,
-        format_ident!("__{}_simd256", function.sig.ident),
-        "simd256",
-        32,
-        has_simd_generic,
-        quote!(#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]),
+        format_ident!("__{}_x86_64_v4", function.sig.ident),
+        "x86_64_v4",
+        quote!(::hammer_runtime::node::NodeVariant::X86_64V4),
+        quote!(#[cfg(target_arch = "x86_64")]),
+        quote!(#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512cd")]),
     );
-    let simd512 = expand_node_function_variant(
-        node,
-        &function,
-        format_ident!("__{}_simd512", function.sig.ident),
-        "simd512",
-        64,
-        has_simd_generic,
-        quote!(#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx512f,avx512bw"))]),
+    let base_name = format_ident!(
+        "__NODE_FUNCTION_{}_BASE",
+        function.sig.ident.to_string().to_ascii_uppercase()
     );
+    let v3_name = format_ident!(
+        "__NODE_FUNCTION_{}_X86_64_V3",
+        function.sig.ident.to_string().to_ascii_uppercase()
+    );
+    let v4_name = format_ident!(
+        "__NODE_FUNCTION_{}_X86_64_V4",
+        function.sig.ident.to_string().to_ascii_uppercase()
+    );
+    let variants_name = format_ident!(
+        "__NODE_FUNCTION_{}_VARIANTS",
+        function.sig.ident.to_string().to_ascii_uppercase()
+    );
+    let input_cfg: Vec<_> = function
+        .attrs
+        .iter()
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        .collect();
 
     quote! {
-        #scalar
-        #simd128
-        #simd256
-        #simd512
+        #baseline
+        #v3
+        #v4
+
+        #(#input_cfg)*
+        #[cfg(target_arch = "x86_64")]
+        pub(crate) static #variants_name: &[&::hammer_runtime::node::NodeFunctionRegistration] =
+            &[&#base_name, &#v3_name, &#v4_name];
+        #(#input_cfg)*
+        #[cfg(not(target_arch = "x86_64"))]
+        pub(crate) static #variants_name: &[&::hammer_runtime::node::NodeFunctionRegistration] =
+            &[&#base_name];
     }
 }
 
@@ -982,8 +968,8 @@ fn expand_node_function_variant(
     function: &ItemFn,
     function_name: Ident,
     suffix: &str,
-    simd_bytes: usize,
-    has_simd_generic: bool,
+    variant: TokenStream2,
+    platform_cfg: TokenStream2,
     target_feature: TokenStream2,
 ) -> TokenStream2 {
     let mut variant_function = function.clone();
@@ -999,11 +985,6 @@ fn expand_node_function_variant(
         function.sig.ident.to_string().to_ascii_uppercase(),
         suffix.to_ascii_uppercase(),
     );
-    let registered_function = if has_simd_generic {
-        quote!(#function_name::<#simd_bytes>)
-    } else {
-        quote!(#function_name)
-    };
     let frame_type = match function.sig.inputs.last() {
         Some(FnArg::Typed(argument)) => match argument.ty.as_ref() {
             Type::Reference(reference) if reference.mutability.is_some() => reference.elem.as_ref(),
@@ -1054,18 +1035,20 @@ fn expand_node_function_variant(
     let trampoline = format_ident!("__{}_{}_invoke", function.sig.ident, suffix);
     let invocation = if variant_function.sig.unsafety.is_some() {
         quote! {
-            // SAFETY: runtime selects this registration only after checking
-            // the matching SIMD width against this Worker's CPU features.
-            unsafe { #registered_function(runtime, node_runtime, frame) }
+            // SAFETY: runtime installs this candidate only after the current
+            // worker CPU and OS vector state support its target features.
+            unsafe { #function_name(runtime, node_runtime, frame) }
         }
     } else {
-        quote! { #registered_function(runtime, node_runtime, frame) }
+        quote! { #function_name(runtime, node_runtime, frame) }
     };
     let input_cfg: Vec<_> = input_cfg.collect();
     quote! {
+        #platform_cfg
         #target_feature
         #variant_function
 
+        #platform_cfg
         #(#input_cfg)*
         fn #trampoline(
             runtime: &mut ::hammer_runtime::DataPlaneMain,
@@ -1085,11 +1068,12 @@ fn expand_node_function_variant(
             }
         }
 
+        #platform_cfg
         #(#input_cfg)*
         pub(crate) static #static_name: ::hammer_runtime::node::NodeFunctionRegistration =
             ::hammer_runtime::node::NodeFunctionRegistration::new(
                 #node::NODE_NAME,
-                ::hammer_runtime::Simd::<u8, #simd_bytes>::splat(0),
+                #variant,
                 #trampoline,
                 {
                     assert!(<#frame_type>::ALLOCATION_SIZE <= u16::MAX as usize);

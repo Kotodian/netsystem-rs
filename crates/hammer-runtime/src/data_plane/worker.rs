@@ -5,6 +5,25 @@ use super::*;
 use crate::ThreadMain;
 
 impl DataPlaneMain {
+    pub(crate) fn select_architecture_functions(&mut self, cpu_pinned: bool) -> RuntimeResult<()> {
+        let global = crate::GlobalMain::global();
+        self.nodes.select_node_functions(
+            global.node_function_registrations.iter().copied(),
+            cpu_pinned,
+        )?;
+        self.cpu_pinned = cpu_pinned;
+        self.enqueue_next = crate::graph::fanout::select_enqueue_next(cpu_pinned);
+        Ok(())
+    }
+
+    pub(crate) fn select_node_functions(&self) -> RuntimeResult<()> {
+        let global = crate::GlobalMain::global();
+        self.nodes.select_node_functions(
+            global.node_function_registrations.iter().copied(),
+            self.cpu_pinned,
+        )
+    }
+
     #[inline]
     pub fn main_loop_exit_requested(&self) -> bool {
         self.main_loop_exit_now
