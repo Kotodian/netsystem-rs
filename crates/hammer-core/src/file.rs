@@ -3,6 +3,14 @@
 use std::fmt;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
+/// Readiness contract used by a File's polling owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileReadinessMode {
+    #[default]
+    Level,
+    Drain,
+}
+
 /// Callback invoked for one ready file descriptor.
 pub type FileFunction<Context, Error> =
     fn(&mut Context, &mut File<Context, Error>) -> Result<(), Error>;
@@ -50,6 +58,7 @@ pub struct File<Context, Error> {
     private_data: u64,
     functions: FileFunctions<Context, Error>,
     write_enabled: bool,
+    readiness_mode: FileReadinessMode,
     polling_thread_index: u32,
     read_events: u64,
     write_events: u64,
@@ -71,6 +80,7 @@ impl<Context, Error> File<Context, Error> {
             private_data,
             functions,
             write_enabled: false,
+            readiness_mode: FileReadinessMode::Level,
             polling_thread_index: 0,
             read_events: 0,
             write_events: 0,
@@ -137,6 +147,18 @@ impl<Context, Error> File<Context, Error> {
     #[inline]
     pub fn set_write_enabled(&mut self, enabled: bool) {
         self.write_enabled = enabled;
+    }
+
+    /// Selects multishot readiness only when the owner drains or reschedules
+    /// until the descriptor would block.
+    #[inline]
+    pub fn set_readiness_mode(&mut self, mode: FileReadinessMode) {
+        self.readiness_mode = mode;
+    }
+
+    #[inline]
+    pub fn readiness_mode(&self) -> FileReadinessMode {
+        self.readiness_mode
     }
 
     /// Returns the worker that owns readiness polling for this file.
