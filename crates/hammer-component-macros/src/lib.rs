@@ -3918,6 +3918,7 @@ struct ClassArgs {
     name: Option<LitStr>,
     format_device_name: Option<Expr>,
     tx_function: Option<Expr>,
+    tx_hash: Option<Expr>,
     flags: Option<Expr>,
 }
 
@@ -3951,6 +3952,12 @@ impl Parse for ClassArgs {
                         ));
                     }
                     args.tx_function = Some(input.parse()?);
+                }
+                "tx_hash" => {
+                    if args.tx_hash.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `tx_hash` class argument"));
+                    }
+                    args.tx_hash = Some(input.parse()?);
                 }
                 "flags" => {
                     if args.flags.is_some() {
@@ -3999,6 +4006,12 @@ fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {
                 "`flags` is only valid for `HwClass`",
             ));
         }
+        if args.tx_hash.is_some() {
+            return Err(Error::new(
+                ident.span(),
+                "`tx_hash` is only valid for `HwClass`",
+            ));
+        }
         let format = args
             .format_device_name
             .map(|format| quote!(.with_format_device_name(#format)))
@@ -4029,10 +4042,14 @@ fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {
             .flags
             .map(|flags| quote!(.with_flags(#flags)))
             .unwrap_or_default();
+        let tx_hash = args
+            .tx_hash
+            .map(|hash| quote!(.with_tx_hash(#hash)))
+            .unwrap_or_default();
         (
             quote!(::hammer_service::device::HwClass),
             quote!(crate::__HAMMER_HW_CLASS_REGISTRATIONS),
-            quote!(::hammer_service::device::HwClass::new(#name) #flags),
+            quote!(::hammer_service::device::HwClass::new(#name) #flags #tx_hash),
         )
     };
     Ok(quote! {

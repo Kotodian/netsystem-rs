@@ -214,6 +214,56 @@ where
 }
 
 impl Frame {
+    /// Borrow a scalar from a registered u32-vector Frame after checking its
+    /// complete layout. Used by dynamically registered Node functions.
+    #[inline]
+    pub fn scalar_as<S>(&self) -> &S
+    where
+        S: KnownLayout + FromBytes + Immutable + IntoBytes,
+    {
+        self.validate_layout::<S, u32, ()>();
+        assert_ne!(self.scalar_offset, 0, "Frame has scalar arguments");
+        // SAFETY: validation proves the scalar's initialized size and alignment.
+        unsafe {
+            &*(ptr::from_ref(self) as *const u8)
+                .add(self.scalar_offset as usize)
+                .cast::<S>()
+        }
+    }
+
+    #[inline]
+    pub fn scalar_as_mut<S>(&mut self) -> &mut S
+    where
+        S: KnownLayout + FromBytes + Immutable + IntoBytes,
+    {
+        self.validate_layout::<S, u32, ()>();
+        assert_ne!(self.scalar_offset, 0, "Frame has scalar arguments");
+        // SAFETY: validation proves the scalar's initialized size and alignment;
+        // the exclusive Frame borrow excludes simultaneous argument access.
+        unsafe {
+            &mut *(ptr::from_mut(self) as *mut u8)
+                .add(self.scalar_offset as usize)
+                .cast::<S>()
+        }
+    }
+
+    #[inline]
+    pub fn vectors_as<S>(&self) -> &[u32]
+    where
+        S: KnownLayout + FromBytes + Immutable + IntoBytes,
+    {
+        self.validate_layout::<S, u32, ()>();
+        // SAFETY: the validated vector region contains len initialized u32 values.
+        unsafe {
+            slice::from_raw_parts(
+                (ptr::from_ref(self) as *const u8)
+                    .add(self.vector_offset as usize)
+                    .cast::<u32>(),
+                self.len(),
+            )
+        }
+    }
+
     /// Initialized Next Frame suffix. Runtime validates the destination's
     /// vector/auxiliary sizes; core verifies the complete stored layout before
     /// constructing the two disjoint borrows.

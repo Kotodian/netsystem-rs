@@ -35,10 +35,12 @@ bitflags::bitflags! {
         const LOCALLY_ORIGINATED = 1 << 0;
         const L4_CHECKSUM_COMPUTED = 1 << 1;
         const L4_CHECKSUM_CORRECT = 1 << 2;
+        const GSO = 1 << 3;
     }
     impl NetworkOffloadFlags: u8 {
         const TCP_CHECKSUM = 1 << 0;
         const UDP_CHECKSUM = 1 << 1;
+        const IP4_CHECKSUM = 1 << 2;
     }
 }
 
@@ -82,7 +84,7 @@ pub struct NetworkIpOpaque {
     ip_protocol: u8,
     ip_ecn: u8,
     ip_ecn_valid: u8,
-    padding: [u8; 2],
+    gso_size: [u8; 2],
     fib_index: u32,
     pub rx_sw_if_index: u32,
     reserved: [u8; 4],
@@ -99,7 +101,7 @@ impl Default for NetworkIpOpaque {
             ip_protocol: 0,
             ip_ecn: 0,
             ip_ecn_valid: 0,
-            padding: [0; 2],
+            gso_size: [0; 2],
             fib_index: u32::MAX,
             rx_sw_if_index: u32::MAX,
             reserved: [0; 4],
@@ -138,6 +140,16 @@ impl NetworkIpOpaque {
     #[inline]
     pub fn set_transport_header_len(&mut self, len: u16) {
         self.transport_header_len = len;
+    }
+
+    #[inline]
+    pub fn gso_size(&self) -> u16 {
+        u16::from_ne_bytes(self.gso_size)
+    }
+
+    #[inline]
+    pub fn set_gso_size(&mut self, size: u16) {
+        self.gso_size = size.to_ne_bytes();
     }
 
     #[inline]

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use hammer_core::buffer::Buffer;
 use hammer_core::data_plane::{NodeId, NodeKind, NodeRegistration};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
@@ -11,7 +12,7 @@ use hammer_runtime::{
 };
 
 use crate::ethernet::{EthernetInterface, EthernetInterfaceRegistration, EthernetMain};
-use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
+use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult, TxFrame};
 use crate::net::NetMain;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +144,7 @@ pub struct HwClass {
     pub name: &'static str,
     pub index: u32,
     pub flags: HwClassFlags,
-    pub tx_hash_fn_type: u8,
+    pub tx_hash: Option<fn(&Buffer) -> u32>,
     pub interface_add_del_function: Option<InterfaceCallback>,
     pub admin_up_down_function: Option<InterfaceCallback>,
     pub link_up_down_function: Option<InterfaceCallback>,
@@ -168,7 +169,7 @@ impl HwClass {
             name,
             index: 0,
             flags: HwClassFlags::empty(),
-            tx_hash_fn_type: 0,
+            tx_hash: None,
             interface_add_del_function: None,
             admin_up_down_function: None,
             link_up_down_function: None,
@@ -190,6 +191,11 @@ impl HwClass {
 
     pub const fn with_flags(mut self, flags: HwClassFlags) -> Self {
         self.flags = flags;
+        self
+    }
+
+    pub const fn with_tx_hash(mut self, hash: fn(&Buffer) -> u32) -> Self {
+        self.tx_hash = Some(hash);
         self
     }
 
@@ -371,9 +377,23 @@ pub struct RxQueue {
     pub hw_if_index: u32,
     pub device_instance: u32,
     pub worker: DataWorkerId,
-    pub file_index: u32,
+    pub file_index: Option<u32>,
     pub queue_id: u32,
     pub mode: DriverScheduleMode,
+}
+
+/// A worker's active RX queue, as consumed by a device input node.
+/// VPP: vnet/interface/rx_queue.h and rx_queue_funcs.h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxQueuePoll {
+    pub device_instance: u32,
+    pub queue_id: u32,
+}
+
+#[derive(Default)]
+struct RxPoll {
+    interrupts: Bitmap<usize>,
+    vector: Vec<RxQueuePoll>,
 }
 
 impl RxQueue {
@@ -436,6 +456,8 @@ impl Default for InterfaceLookupTable {
 
 pub struct InterfaceMain {
     state: UnsafeCell<InterfaceState>,
+    rx_polls: Vec<UnsafeCell<RxPoll>>,
+    tx_lookups: Vec<UnsafeCell<Vec<Vec<TxFrame>>>>,
 }
 
 unsafe impl Send for InterfaceMain {}
@@ -453,6 +475,12 @@ impl InterfaceMain {
         state.output_feature_arc_index = u8::MAX;
         let interfaces = Self {
             state: UnsafeCell::new(state),
+            rx_polls: (0..hammer_runtime::config::worker::worker_count())
+                .map(|_| UnsafeCell::new(RxPoll::default()))
+                .collect(),
+            tx_lookups: (0..hammer_runtime::config::worker::worker_count())
+                .map(|_| UnsafeCell::new(Vec::new()))
+                .collect(),
         };
         interfaces
             .consume_class_registrations(
@@ -686,7 +714,8 @@ impl InterfaceMain {
                             Some(NodeRegistration::next(tx_name, 1)),
                             &[],
                             None,
-                        ),
+                        )
+                        .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                     )
                     .expect("interface TX node recycle must succeed");
                 main.nodes()
@@ -713,7 +742,8 @@ impl InterfaceMain {
                             Some(NodeRegistration::next(tx_name, 1)),
                             &[],
                             None,
-                        ),
+                        )
+                        .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                     )
                     .expect("interface TX node registration must succeed");
                 let output_node = main
@@ -925,10 +955,20 @@ impl InterfaceMain {
             )
         };
         for index in rx_queue_indices {
+            for poll in &self.rx_polls {
+                // Queue removal runs on the main thread with workers stopped.
+                unsafe { &mut *poll.get() }.interrupts.clear(index as usize);
+            }
             state.rx_queues.remove(index);
         }
         for index in tx_queue_indices {
             state.tx_queues.remove(index);
+        }
+        for lookup in &self.tx_lookups {
+            let worker = unsafe { &mut *lookup.get() };
+            if let Some(table) = worker.get_mut(hw_if_index as usize) {
+                table.clear();
+            }
         }
     }
 
@@ -974,7 +1014,8 @@ impl InterfaceMain {
                         Some(NodeRegistration::next(tx_name, 1)),
                         &[],
                         None,
-                    ),
+                    )
+                    .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                 )
                 .expect("deleted interface TX runtime must publish");
         }
@@ -1238,7 +1279,6 @@ impl InterfaceMain {
         hw_if_index: u32,
         queue_id: u32,
         worker: DataWorkerId,
-        file_index: u32,
         mode: DriverScheduleMode,
     ) -> InterfaceResult<u32> {
         let state = self.state_mut();
@@ -1253,7 +1293,7 @@ impl InterfaceMain {
             hw_if_index,
             device_instance,
             worker,
-            file_index,
+            file_index: None,
             queue_id,
             mode,
         });
@@ -1263,7 +1303,98 @@ impl InterfaceMain {
             .expect("hardware interface exists")
             .rx_queue_indices
             .push(queue_index);
+        // Registration runs before worker launch or while workers are stopped.
+        let poll = unsafe { &mut *self.rx_polls[worker.slot()].get() };
+        poll.interrupts.set(queue_index as usize);
+        poll.interrupts.clear(queue_index as usize);
+        // The vector can hold every queue assigned to this worker without
+        // allocating in the device input node.
+        poll.vector.reserve(poll.vector.capacity() + 1);
         Ok(queue_index)
+    }
+
+    /// VPP vnet_hw_if_set_rx_queue_file_index; File private_data holds queue_index.
+    pub fn set_rx_queue_file_index(&self, queue_index: u32, file_index: u32) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX File publication requires the main thread barrier");
+        self.state_mut()
+            .rx_queues
+            .get_mut(queue_index)
+            .expect("RX File belongs to a registered queue")
+            .file_index = Some(file_index);
+    }
+
+    /// VPP vnet_hw_if_set_input_node; the queue interrupt identifies this node.
+    pub fn set_input_node(&self, hw_if_index: u32, node: NodeId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("input node publication requires the main thread barrier");
+        self.state_mut()
+            .hardware_interfaces
+            .get_mut(hw_if_index)
+            .expect("input node belongs to a live hardware interface")
+            .input_node_index = node;
+    }
+
+    /// VPP vnet_hw_if_rx_queue_set_int_pending; called on the queue's worker.
+    #[inline]
+    pub fn set_rx_queue_interrupt_pending(
+        &self,
+        graph: &hammer_runtime::NodeMain,
+        queue_index: u32,
+    ) -> RuntimeResult<()> {
+        let state = self.state();
+        let queue = state
+            .rx_queues
+            .get(queue_index)
+            .expect("RX interrupt names a live queue");
+        if !queue.is_interrupt() {
+            return Ok(());
+        }
+        let node = state
+            .hardware_interfaces
+            .get(queue.hw_if_index)
+            .expect("RX queue retains its hardware interface")
+            .input_node_index;
+        // File callbacks and the input node execute on this queue's worker.
+        graph.mark_interrupt_pending(node)?;
+        unsafe { &mut *self.rx_polls[queue.worker.slot()].get() }
+            .interrupts
+            .set(queue_index as usize);
+        Ok(())
+    }
+
+    /// VPP vnet_hw_if_get_rxq_poll_vector for an interrupt-mode Data Worker.
+    /// The returned slice is valid until this worker next checks its File poller.
+    #[inline]
+    pub fn rx_queue_poll_vector(&self, worker: DataWorkerId, node: NodeId) -> &[RxQueuePoll] {
+        // Each Data Worker exclusively borrows its own slot. Main-thread queue
+        // publication is protected by the WorkerBarrier.
+        let poll = unsafe { &mut *self.rx_polls[worker.slot()].get() };
+        poll.vector.clear();
+        let mut index = poll.interrupts.first_set();
+        while let Some(queue_index) = index {
+            index = poll.interrupts.next_set(queue_index);
+            let queue = self
+                .state()
+                .rx_queues
+                .get(queue_index as u32)
+                .expect("pending RX queue remains registered until worker barrier");
+            let input = self
+                .state()
+                .hardware_interfaces
+                .get(queue.hw_if_index)
+                .expect("pending RX queue retains its hardware interface")
+                .input_node_index;
+            if input != node {
+                continue;
+            }
+            poll.interrupts.clear(queue_index);
+            poll.vector.push(RxQueuePoll {
+                device_instance: queue.device_instance,
+                queue_id: queue.queue_id,
+            });
+        }
+        &poll.vector
     }
 
     pub fn register_tx_queue(
@@ -1303,14 +1434,48 @@ impl InterfaceMain {
         tx_queue_index: u32,
         worker: DataWorkerId,
     ) -> InterfaceResult<()> {
-        self.state_mut()
-            .tx_queues
-            .get_mut(tx_queue_index)
-            .ok_or(InterfaceError::NotRegistered {
-                interface_index: tx_queue_index,
-            })?
-            .assigned_workers
-            .set(worker);
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        assert!(
+            worker.slot() < self.tx_lookups.len(),
+            "TX queue worker is configured"
+        );
+        let hw_if_index = {
+            let queue = self.state_mut().tx_queues.get_mut(tx_queue_index).ok_or(
+                InterfaceError::NotRegistered {
+                    interface_index: tx_queue_index,
+                },
+            )?;
+            queue.assigned_workers.set(worker);
+            queue.hw_if_index
+        };
+        // VPP interface/runtime.c rebuilds each worker's power-of-two queue
+        // lookup under the worker barrier, not on the packet path.
+        let state = self.state();
+        let hardware = state.hardware_interfaces.get(hw_if_index)
+            .expect("TX queue belongs to a live interface");
+        let frames = hardware.tx_queue_indices.iter()
+            .filter_map(|&index| state.tx_queues.get(index))
+            .filter(|queue| queue.is_assigned_to(worker))
+            .map(TxFrame::from)
+            .collect::<Vec<_>>();
+        if frames.len() > 1 {
+            assert!(
+                state.hw_classes[hardware.hw_class_index as usize]
+                    .tx_hash
+                    .is_some(),
+                "multi-queue hardware class has a packet hash"
+            );
+        }
+        let lookup = unsafe { &mut *self.tx_lookups[worker.slot()].get() };
+        if lookup.len() <= hw_if_index as usize {
+            lookup.resize_with(hw_if_index as usize + 1, Vec::new);
+        }
+        let table = &mut lookup[hw_if_index as usize];
+        table.clear();
+        table.reserve(frames.len().next_power_of_two());
+        for position in 0..frames.len().next_power_of_two() {
+            table.push(frames[position % frames.len()]);
+        }
         Ok(())
     }
 
@@ -1338,6 +1503,33 @@ impl InterfaceMain {
             .collect()
     }
 
+    /// VPP interface_output.c: choose the Frame scalar from this worker's
+    /// published queue lookup. One queue avoids the packet hash entirely.
+    #[inline]
+    pub fn tx_frame_for_packet(
+        &self,
+        worker: DataWorkerId,
+        hw_if_index: u32,
+        buffer: &Buffer,
+    ) -> Option<TxFrame> {
+        let table = unsafe { &*self.tx_lookups[worker.slot()].get() }.get(hw_if_index as usize)?;
+        match table.as_slice() {
+            [] => None,
+            [frame] => Some(*frame),
+            frames => {
+                let hardware = self
+                    .state()
+                    .hardware_interfaces
+                    .get(hw_if_index)
+                    .expect("TX lookup names a live hardware interface");
+                let hash = self.state().hw_classes[hardware.hw_class_index as usize]
+                    .tx_hash
+                    .expect("multi-queue hardware class has a packet hash");
+                Some(frames[hash(buffer) as usize & (frames.len() - 1)])
+            }
+        }
+    }
+
     pub fn tx_slot_for_worker(&self, worker: DataWorkerId, sw_if_index: u32) -> Option<u16> {
         let hw_if_index = self.software_interface(sw_if_index)?.hw_if_index?;
         self.state()
@@ -1348,10 +1540,9 @@ impl InterfaceMain {
     }
 
     pub(crate) fn has_tx_queue_for_worker(&self, worker: DataWorkerId, hw_if_index: u32) -> bool {
-        self.state()
-            .tx_queues
-            .iter()
-            .any(|(_, queue)| queue.hw_if_index == hw_if_index && queue.is_assigned_to(worker))
+        unsafe { &*self.tx_lookups[worker.slot()].get() }
+            .get(hw_if_index as usize)
+            .is_some_and(|table| !table.is_empty())
     }
 
     pub fn register_mtu_callback(&self, callback: fn(&mut DataPlaneMain, &InterfaceMain, u32)) {

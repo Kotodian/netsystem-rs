@@ -198,6 +198,34 @@ impl NodeMain {
 }
 
 impl DataPlaneMain {
+    /// VPP interface_output.c: enqueue_one_to_tx_node keeps one queue id per
+    /// frame and starts a fresh frame when the selected queue changes.
+    pub(crate) fn get_next_frame_with_scalar<S>(&mut self, next_index: u32, scalar: S) -> &mut [u32]
+    where
+        S: Copy + Eq + KnownLayout + FromBytes + Immutable + IntoBytes,
+    {
+        let source = self
+            .current_node()
+            .expect("Next Frame requires an executing node");
+        let target = self
+            .nodes
+            .node_next_slot(source, next_index as usize)
+            .expect("registered next slot");
+        let (scalar_size, vector, aux) = self.nodes.frame_args_size(target).unwrap();
+        assert_eq!(usize::from(scalar_size), core::mem::size_of::<S>());
+        assert_eq!((vector, aux), (4, 0));
+        let mut index = self.nodes.prepare_next_frame(source, next_index);
+        if self.nodes.next_frame_mut(index).len() != 0
+            && *self.nodes.next_frame_mut(index).scalar_as::<S>() != scalar
+        {
+            self.nodes.next_frame_mut(index).frame_flags |= NO_APPEND;
+            index = self.nodes.prepare_next_frame(source, next_index);
+        }
+        let frame = self.nodes.next_frame_mut(index);
+        *frame.scalar_as_mut::<S>() = scalar;
+        frame.next_args_mut::<u32, ()>(scalar_size).0
+    }
+
     pub fn get_next_frame<V, A>(
         &mut self,
         _: &mut NodeRuntime,
