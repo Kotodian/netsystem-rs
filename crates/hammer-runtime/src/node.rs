@@ -1229,7 +1229,7 @@ impl From<NodeRuntimeInner> for NodeMain {
     }
 }
 
-fn preferred_node_function<'registration>(
+pub(crate) fn preferred_node_function<'registration>(
     node_name: &str,
     allow_specialized: bool,
     registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,

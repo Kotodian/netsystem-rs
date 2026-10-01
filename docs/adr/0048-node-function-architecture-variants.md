@@ -156,6 +156,10 @@ Frame scalar/vector/aux layout；layout 不一致属于插件声明错误，
 进入 packet dispatch 前断言并终止本次
 加载，不能让某个变体用错误布局解释 Frame。不能给 `process` 加一次
 运行时 CPU 分支；dispatch 仍只是调用固定的函数指针。
+整批 Graph Node 注册前先用同一选择函数校验将要安装的候选，
+使重复 `(node, variant)` 或 Frame layout 冲突在任何 Node 初始化前暴露；
+插件扩图只预检尚未存在的 Node。预检不安装函数，也不按主线程的
+CPU 能力代替 worker 的最终选择。
 
 ## 3. 宏、编译和现有 TCP 调用
 
