@@ -6,6 +6,7 @@
 //! involved. Session App and transport protocol capabilities are intentionally
 //! absent: those are registered by their owning service/plugin authorities.
 
+use crate::cli::CliCommandRegistration;
 use crate::error::RuntimeResult;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
@@ -39,6 +40,7 @@ pub struct RegistrationImage {
     graph_nodes: &'static [&'static NodeEntry],
     node_functions: &'static [&'static [&'static NodeFunctionRegistration]],
     process_nodes: &'static [&'static NodeEntry],
+    cli_commands: &'static [&'static CliCommandRegistration],
     stats_registrations: &'static [&'static StatsRegistration],
 }
 
@@ -69,6 +71,7 @@ impl RegistrationImage {
             node_functions,
             process_nodes,
             &[],
+            &[],
         )
     }
 
@@ -86,6 +89,7 @@ impl RegistrationImage {
         node_functions: &'static [&'static [&'static NodeFunctionRegistration]],
         process_nodes: &'static [&'static NodeEntry],
         stats_registrations: &'static [&'static StatsRegistration],
+        cli_commands: &'static [&'static CliCommandRegistration],
     ) -> Self {
         Self {
             init_functions,
@@ -98,6 +102,7 @@ impl RegistrationImage {
             graph_nodes,
             node_functions,
             process_nodes,
+            cli_commands,
             stats_registrations,
         }
     }
@@ -171,6 +176,13 @@ impl RegistrationImage {
     }
 
     #[inline]
+    pub(crate) fn cli_commands(
+        &self,
+    ) -> impl Clone + Iterator<Item = &'static CliCommandRegistration> + '_ {
+        self.cli_commands.iter().copied()
+    }
+
+    #[inline]
     pub(crate) fn stats_registrations(
         &self,
     ) -> impl Clone + Iterator<Item = &'static StatsRegistration> + '_ {
@@ -194,6 +206,7 @@ macro_rules! __declare_registration_image {
             node_functions = [];
             process_nodes = [];
             stats_registrations = [];
+            cli_commands = [];
         );
     };
     (
@@ -208,6 +221,7 @@ macro_rules! __declare_registration_image {
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
         stats_registrations = [$($stats_registration:path),* $(,)?];
+        cli_commands = [$($cli_command:path),* $(,)?];
     ) => {
         static __HAMMER_REGISTRATION_IMAGE: $crate::__private::RegistrationImage =
             $crate::__private::RegistrationImage::new_with_stats(
@@ -222,6 +236,7 @@ macro_rules! __declare_registration_image {
                 &[$($node_function),*],
                 &[$(&$process_node),*],
                 &[$(&$stats_registration),*],
+                &[$(&$cli_command),*],
             );
     };
     (
@@ -248,6 +263,7 @@ macro_rules! __declare_registration_image {
             node_functions = [$($node_function),*];
             process_nodes = [$($process_node),*];
             stats_registrations = [];
+            cli_commands = [];
         );
     };
 }

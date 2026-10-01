@@ -88,17 +88,26 @@ impl DataPlaneMain {
                 .get()
                 .expect("FileMain is initialized before data-plane use")
                 .poll_for_worker(thread_index, &mut self.nodes),
+            #[cfg(target_os = "linux")]
             FileMode::Async(_) => panic!("thread zero awaits AsyncFileMain readiness"),
         }
     }
 
     pub async fn next_file_readiness(&mut self) -> RuntimeResult<usize> {
-        let Self {
-            file_main, nodes, ..
-        } = self;
-        match file_main {
-            FileMode::Async(file_main) => file_main.next_ready(nodes).await,
+        match &self.file_main {
+            #[cfg(target_os = "linux")]
+            FileMode::Async(file_main) => {
+                crate::file::AsyncFileMain::next_ready(file_main.clone()).await
+            }
             FileMode::Sync => panic!("Data Workers poll synchronous File readiness"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn async_file_main(&self) -> std::rc::Rc<std::cell::RefCell<crate::file::AsyncFileMain>> {
+        match &self.file_main {
+            FileMode::Async(file_main) => file_main.clone(),
+            FileMode::Sync => panic!("only thread zero owns AsyncFileMain"),
         }
     }
 

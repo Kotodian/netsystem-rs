@@ -92,6 +92,7 @@ hammer_runtime::__declare_registration_image!(
         hammer_ipc::binary_api::memory_shared::__STATS_COLLECT_REGISTRATION_REGISTER_API_REGION_PVT_HEAP,
         hammer_ipc::binary_api::memory_shared::__STATS_COLLECT_REGISTRATION_REGISTER_API_REGION_DATA_HEAP,
     ];
+    cli_commands = [];
 );
 
 #[doc(hidden)]

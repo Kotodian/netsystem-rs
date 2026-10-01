@@ -344,7 +344,7 @@ fn exit_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
 mod stats_segment_listener {
     fn read<Context, Error>(
         _: &mut Context,
-        file: &mut hammer_core::file::File<Context, Error>,
+        file: &mut crate::__private::File<Context, Error>,
     ) -> Result<(), Error>
     where
         Error: From<crate::RuntimeError>,
@@ -354,7 +354,7 @@ mod stats_segment_listener {
 
     fn error<Context, Error>(
         _: &mut Context,
-        _: &mut hammer_core::file::File<Context, Error>,
+        _: &mut crate::__private::File<Context, Error>,
     ) -> Result<(), Error>
     where
         Error: From<crate::RuntimeError>,

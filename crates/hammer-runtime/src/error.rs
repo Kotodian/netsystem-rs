@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum RuntimeError {
     #[error(transparent)]
     DataPlane(#[from] DataPlaneError),
+    #[error(transparent)]
+    Cli(#[from] crate::cli::CliError),
     #[error("parse TOML: {message}")]
     ConfigParse { message: String },
     #[error("config callback `{function}` failed to parse section `{section}`")]

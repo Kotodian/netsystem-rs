@@ -4,15 +4,19 @@ pub mod registration;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::file::record::{File, FileFunctions};
     pub use crate::registration::{RegistrationImage, StatsRegistration};
     pub use abi_stable::RRef;
     pub use abi_stable::export_root_module;
     pub use abi_stable::prefix_type::PrefixTypeTrait;
     pub use abi_stable::std_types::{ROption, RSlice, RStr};
+    pub use tokio::task::{JoinHandle, spawn_local};
 }
 
 crate::__declare_registration_image!(
     init_functions = [
+        cli::__INIT_FN_CLI_MAIN_INIT,
+        unix_cli::__INIT_FN_UNIX_CLI_INIT,
         config::stats::__INIT_FN_STATS_MAIN_INIT,
     ];
     config_functions = [
@@ -26,7 +30,10 @@ crate::__declare_registration_image!(
         start_workers::__INIT_FN_START_WORKERS,
         node_stats::__INIT_FN_INSTALL_NODE_STATS,
     ];
-    main_loop_exit_functions = [config::stats::__INIT_FN_EXIT_STATS_MAIN];
+    main_loop_exit_functions = [
+        unix_cli::__INIT_FN_UNIX_CLI_EXIT,
+        config::stats::__INIT_FN_EXIT_STATS_MAIN,
+    ];
     worker_init_functions = [];
     num_workers_change_functions = [];
     api_init_functions = [];
@@ -44,6 +51,7 @@ crate::__declare_registration_image!(
         data_plane::buffer_stats::__STATS_COLLECT_REGISTRATION_REGISTER_BUFFER_POOLS,
         node_stats::__STATS_COLLECT_REGISTRATION_REGISTER_NODE_STATS,
     ];
+    cli_commands = [cli::__CLI_COMMAND_SHOW_VERSION, cli::__CLI_COMMAND_WAIT];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {
@@ -53,11 +61,28 @@ pub(crate) fn builtin_registration_image() -> &'static registration::Registratio
 pub mod error;
 pub mod global_main;
 pub use global_main::GlobalMain;
+pub mod cli;
 pub mod config;
 pub mod file;
+#[cfg(target_os = "linux")]
+pub mod unix_cli;
+#[cfg(not(target_os = "linux"))]
+mod unix_cli {
+    #[hammer_component_macros::init_function(name = "unix_cli_init")]
+    fn init_unix_cli(_: &mut crate::DataPlaneMain) -> crate::RuntimeResult<()> {
+        Ok(())
+    }
+
+    #[hammer_component_macros::main_loop_exit_function(name = "unix_cli_exit")]
+    fn exit_unix_cli(_: &mut crate::DataPlaneMain) -> crate::RuntimeResult<()> {
+        Ok(())
+    }
+}
+#[cfg(target_os = "linux")]
+pub use file::AsyncFileMain;
 pub use file::{
-    AsyncFileMain, Deadline, DeadlineFunction, FILE_MAIN, File, FileFunction, FileFunctions,
-    FileMain, FileReadinessMode, WorkerFilePollMode,
+    Deadline, DeadlineFunction, FILE_MAIN, File, FileFunction, FileFunctions, FileMain,
+    FileReadinessMode, WorkerFilePollMode,
 };
 
 pub mod barrier;
@@ -84,6 +109,7 @@ pub mod unix_main;
 pub use data_plane::{DataPlaneBufferConfig, DataPlaneMain};
 pub use hammer_core::data_plane::FrameBatchWidth;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
+pub use main_loop::enqueue_main_thread_future;
 pub use node::{
     DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
     NodeErrorSeverity, NodeMain, NodeProcessFn, NodeRuntime, NodeRuntimeReady,
@@ -94,11 +120,10 @@ pub use plugin::{
     host_meets_plugin_requirement,
 };
 pub use process::Process;
-pub use main_loop::enqueue_main_thread_future;
 pub use thread_main::ThreadMain;
-pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
 pub use thread_main::interrupt_worker_node;
 pub use thread_main::is_current_worker;
+pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
     TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,

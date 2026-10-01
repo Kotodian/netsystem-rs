@@ -1,6 +1,8 @@
 use crate::DataPlaneMain;
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -33,9 +35,7 @@ pub fn enqueue_main_thread_future<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    PENDING_MAIN_THREAD_FUTURES
-        .lock()
-        .push(Box::pin(future));
+    PENDING_MAIN_THREAD_FUTURES.lock().push(Box::pin(future));
     MAIN_THREAD_FUTURES_READY.notify_one();
 }
 
@@ -50,13 +50,11 @@ fn poll_main_thread_futures(processing: &mut Vec<MainThreadFuture>) {
     if processing.is_empty() {
         return;
     }
-    let waker = MAIN_THREAD_FUTURE_WAKER
-        .get_or_init(|| Waker::from(Arc::new(MainThreadFutureWake)));
+    let waker =
+        MAIN_THREAD_FUTURE_WAKER.get_or_init(|| Waker::from(Arc::new(MainThreadFutureWake)));
     let mut context = Context::from_waker(waker);
     crate::worker_thread_barrier_sync!({
-        processing.retain_mut(|future| {
-            matches!(future.as_mut().poll(&mut context), Poll::Pending)
-        });
+        processing.retain_mut(|future| matches!(future.as_mut().poll(&mut context), Poll::Pending));
     });
     if !processing.is_empty() {
         PENDING_MAIN_THREAD_FUTURES.lock().append(processing);
@@ -64,20 +62,27 @@ fn poll_main_thread_futures(processing: &mut Vec<MainThreadFuture>) {
 }
 
 impl DataPlaneMain {
-    pub fn run_main_until<F>(&mut self, future: F) -> crate::RuntimeResult<F::Output>
+    #[cfg(target_os = "linux")]
+    pub fn run_main_until<F>(main: &Rc<RefCell<Self>>, future: F) -> crate::RuntimeResult<F::Output>
     where
         F: Future,
     {
         crate::ensure_main_thread()?;
-        if self.thread_index() != 0 || self.nodes.process_runtime.is_none() {
-            return Err(crate::RuntimeError::MainProcessRuntimeUnavailable);
-        }
-        let runtime = self
-            .nodes
-            .process_runtime
-            .take()
-            .expect("validated thread-zero runtime remains installed");
-        let output = runtime.block_on(async {
+        let (runtime, files) = {
+            let mut owner = main.borrow_mut();
+            if owner.thread_index() != 0 || owner.nodes.process_runtime.is_none() {
+                return Err(crate::RuntimeError::MainProcessRuntimeUnavailable);
+            }
+            let runtime = owner
+                .nodes
+                .process_runtime
+                .take()
+                .expect("validated thread-zero runtime remains installed");
+            let files = owner.async_file_main();
+            (runtime, files)
+        };
+        let local = tokio::task::LocalSet::new();
+        let output = runtime.block_on(local.run_until(async {
             tokio::pin!(future);
             let mut processing = Vec::new();
             let mut queue_signal_interval = tokio::time::interval(Duration::from_micros(400));
@@ -88,26 +93,43 @@ impl DataPlaneMain {
                 poll_main_thread_futures(&mut processing);
                 // VPP main.c:1585-1586 checks the API queues from the main
                 // loop, then signals the API Process if work is pending.
-                if let Some(callback) = self.queue_signal_callback {
-                    callback(self)?;
+                {
+                    let mut owner = main.borrow_mut();
+                    if let Some(callback) = owner.queue_signal_callback {
+                        callback(&mut owner)?;
+                    }
+                    owner.nodes.restore_processes(Instant::now())?;
                 }
-                self.nodes.restore_processes(Instant::now())?;
-                let queue_signal_enabled = self.queue_signal_callback.is_some();
+                let queue_signal_enabled = main.borrow().queue_signal_callback.is_some();
                 tokio::select! {
                     _ = MAIN_THREAD_FUTURES_READY.notified() => {}
                     _ = queue_signal_interval.tick(), if queue_signal_enabled => {}
                     output = &mut future => break Ok(output),
-                    readiness = self.next_file_readiness() => {
+                    readiness = crate::file::AsyncFileMain::next_ready(files.clone()) => {
                         readiness?;
                     }
                 }
             }
-        });
+        }));
         assert!(
-            self.nodes.process_runtime.replace(runtime).is_none(),
+            main.borrow_mut()
+                .nodes
+                .process_runtime
+                .replace(runtime)
+                .is_none(),
             "thread-zero runtime has one NodeMain owner"
         );
         output
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn run_main_until<F>(_: &Rc<RefCell<Self>>, _: F) -> crate::RuntimeResult<F::Output>
+    where
+        F: Future,
+    {
+        Err(crate::RuntimeError::FilePollerOperationUnsupported {
+            operation: "thread-zero async File backend",
+        })
     }
 }
 
@@ -121,7 +143,7 @@ pub fn run<F, T>(
     global: crate::GlobalMain,
     threads: crate::ThreadMain,
     plugins: crate::PluginMain,
-    main: &mut DataPlaneMain,
+    main: &Rc<RefCell<DataPlaneMain>>,
     future: F,
 ) -> crate::RuntimeResult<T>
 where
@@ -129,7 +151,7 @@ where
 {
     crate::ensure_main_thread()?;
     assert_eq!(
-        main.thread_index(),
+        main.borrow().thread_index(),
         0,
         "thread-zero lifecycle requires main index 0"
     );
@@ -149,37 +171,60 @@ where
     let global = crate::GlobalMain::global();
 
     let run_result = (|| -> crate::RuntimeResult<T> {
-        crate::init::run_init_functions(global, main)?;
+        crate::init::run_init_functions(global, &mut main.borrow_mut())?;
         // Service node initializers may publish registrations through their
         // owner Mains (for example NetMain's DPO roots). Materialize the
         // graph only after those owners have completed normal init/config.
-        main.init_graph_from_declarations(
+        main.borrow_mut().init_graph_from_declarations(
             global.node_registrations.iter().copied(),
             global.node_function_registrations.iter().copied(),
         )?;
-        crate::init::run_main_loop_enter(global, main)?;
+        crate::init::run_main_loop_enter(global, &mut main.borrow_mut())?;
 
         // VPP applies post-worker configuration while the worker barrier is
         // held. Interface/FIB/DPO publication and builtin application setup
         // must observe the same control-plane ownership window. The enter
         // phase installs the barrier before this non-early configuration runs.
-        crate::worker_thread_barrier_sync!(main, {
-            crate::init::run_config_functions(global, Some(main), false, global.startup_config())
+        crate::worker_thread_barrier_sync!({
+            crate::init::run_config_functions(
+                global,
+                Some(&mut main.borrow_mut()),
+                false,
+                global.startup_config(),
+            )
         })?;
 
-        crate::worker_thread_barrier_sync!(main, {});
-        main.start_processes(global.node_registrations.iter().copied())?;
-        main.run_main_until(future)?
+        crate::worker_thread_barrier_sync!({});
+        main.borrow_mut()
+            .start_processes(global.node_registrations.iter().copied())?;
+        DataPlaneMain::run_main_until(main, future)?
     })();
 
     let finish = || {
-        let process_result = main.stop_processes();
-        let exit_result = crate::init::run_main_loop_exit(global, main);
+        let process_result = main.borrow_mut().stop_processes();
+        let exit_result = crate::init::run_main_loop_exit(global, &mut main.borrow_mut());
 
-        let output = run_result?;
-        process_result?;
-        exit_result?;
-        Ok(output)
+        let output = match run_result {
+            Ok(output) => output,
+            Err(primary) => {
+                if let Err(cleanup) = process_result {
+                    tracing::error!(%cleanup, "Process cleanup failed after main-loop error");
+                }
+                if let Err(cleanup) = exit_result {
+                    tracing::error!(%cleanup, "main-loop exit failed after main-loop error");
+                }
+                return Err(primary);
+            }
+        };
+        match (process_result, exit_result) {
+            (Err(primary), Err(cleanup)) => {
+                tracing::error!(%cleanup, "main-loop exit failed after Process cleanup error");
+                Err(primary)
+            }
+            (Err(primary), _) => Err(primary),
+            (_, Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Ok(output),
+        }
     };
     match crate::barrier::global() {
         Some(barrier) if !barrier.startup_cancelled() => barrier.final_sync(finish),
