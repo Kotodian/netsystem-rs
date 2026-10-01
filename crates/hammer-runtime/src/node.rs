@@ -6,9 +6,9 @@ use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
+use crate::DataPlaneMain;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneMain, Simd};
 use hammer_core::data_plane::{
     Frame, NodeErrorIndex, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
 };
@@ -160,12 +160,74 @@ pub type NodeProcessFn = fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame) ->
 
 type NodeFunction = fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame) -> usize;
 
+/// Architecture identity of a compiled Node Function candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NodeVariant {
+    Base,
+    X86_64V3,
+    X86_64V4,
+}
+
+impl NodeVariant {
+    #[inline]
+    pub(crate) fn priority_on_current_cpu(self) -> Option<u8> {
+        match self {
+            Self::Base => Some(0),
+            Self::X86_64V3 if x86_64_variant_supported(false) => Some(45),
+            Self::X86_64V4 if x86_64_variant_supported(true) => Some(95),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_64_variant_supported(v4: bool) -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv};
+
+    // CPUID is read on the executing worker after affinity, not from the
+    // process-wide cached feature detector. XGETBV verifies OS vector state.
+    let max_leaf = unsafe { __cpuid(0) }.eax;
+    let leaf1 = unsafe { __cpuid(1) };
+    if max_leaf < 7
+        || leaf1.ecx & ((1 << 12) | (1 << 22) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29))
+            != ((1 << 12) | (1 << 22) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29))
+    {
+        return false;
+    }
+    let leaf7 = unsafe { __cpuid_count(7, 0) };
+    let v3_bits = (1 << 3) | (1 << 5) | (1 << 8);
+    if leaf7.ebx & v3_bits != v3_bits {
+        return false;
+    }
+    let extended_max = unsafe { __cpuid(0x8000_0000) }.eax;
+    if extended_max < 0x8000_0001 || unsafe { __cpuid(0x8000_0001) }.ecx & (1 << 5) == 0 {
+        return false;
+    }
+    let xcr0 = unsafe { _xgetbv(0) };
+    if xcr0 & 0b110 != 0b110 {
+        return false;
+    }
+    if !v4 {
+        return true;
+    }
+    let v4_bits = (1 << 16) | (1 << 17) | (1 << 28) | (1 << 30) | (1 << 31);
+    leaf7.ebx & v4_bits == v4_bits && xcr0 & 0b1110_0000 == 0b1110_0000
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn x86_64_variant_supported(_: bool) -> bool {
+    false
+}
+
 /// One platform-compiled process-function candidate for an existing Graph Node.
 #[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct NodeFunctionRegistration {
     node_name: &'static str,
-    simd_bytes: usize,
+    variant: NodeVariant,
     function: NodeFunction,
     frame_args_size: (u16, u16, u16),
 }
@@ -176,16 +238,15 @@ impl NodeFunctionRegistration {
     /// The generated private trampoline contains CPU specialization and
     /// terminates Node panics inside the owning plugin artifact.
     #[doc(hidden)]
-    pub const fn new<const LANES: usize>(
+    pub const fn new(
         node_name: &'static str,
-        _: Simd<u8, LANES>,
+        variant: NodeVariant,
         function: fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame) -> usize,
         frame_args_size: (u16, u16, u16),
     ) -> Self {
-        assert!(matches!(LANES, 1 | 16 | 32 | 64));
         Self {
             node_name,
-            simd_bytes: core::mem::size_of::<Simd<u8, LANES>>(),
+            variant,
             function,
             frame_args_size,
         }
@@ -524,6 +585,7 @@ impl Clone for NodeRuntimeInner {
 struct NodeRuntimeSlot {
     kind: NodeKind,
     process: NodeFunction,
+    declared_process: NodeFunction,
     frame_args_size: (u16, u16, u16),
     runtime_data: Option<NodeRuntime>,
 }
@@ -700,6 +762,7 @@ impl NodeRuntimeInner {
         self.push_node_slot(NodeRuntimeSlot {
             kind,
             process,
+            declared_process: process,
             frame_args_size: (0, 4, 0),
             runtime_data: Some(runtime_data),
         })
@@ -1168,35 +1231,48 @@ impl From<NodeRuntimeInner> for NodeMain {
 
 fn preferred_node_function<'registration>(
     node_name: &str,
-    max_simd_bytes: usize,
+    allow_specialized: bool,
     registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,
 ) -> RuntimeResult<Option<&'registration NodeFunctionRegistration>> {
     let mut selected = None;
-    let mut seen_simd_widths = [false; 4];
+    let mut seen_variants = [false; 3];
+    let mut layout = None;
 
     for registration in registrations {
         if registration.node_name != node_name {
             continue;
         }
-        let width_index = match registration.simd_bytes {
-            1 => 0,
-            16 => 1,
-            32 => 2,
-            64 => 3,
-            _ => unreachable!("Node Function SIMD width is validated at construction"),
+        let variant_index = match registration.variant {
+            NodeVariant::Base => 0,
+            NodeVariant::X86_64V3 => 1,
+            NodeVariant::X86_64V4 => 2,
         };
-        if std::mem::replace(&mut seen_simd_widths[width_index], true) {
-            return Err(DataPlaneError::DuplicateNodeFunction {
+        if std::mem::replace(&mut seen_variants[variant_index], true) {
+            return Err(RuntimeError::DuplicateNodeFunction {
                 node: registration.node_name,
-                simd_bytes: registration.simd_bytes,
-            }
-            .into());
+                variant: registration.variant,
+            });
         }
-        if registration.simd_bytes > max_simd_bytes {
+        if let Some(existing) = layout {
+            assert_eq!(
+                existing, registration.frame_args_size,
+                "Node Function variants for {node_name} disagree on Frame layout"
+            );
+        } else {
+            layout = Some(registration.frame_args_size);
+        }
+        if !allow_specialized && registration.variant != NodeVariant::Base {
             continue;
         }
+        let Some(priority) = registration.variant.priority_on_current_cpu() else {
+            continue;
+        };
         if selected.is_none_or(|current: &NodeFunctionRegistration| {
-            registration.simd_bytes > current.simd_bytes
+            priority
+                > current
+                    .variant
+                    .priority_on_current_cpu()
+                    .expect("selected candidate is supported")
         }) {
             selected = Some(registration);
         }
@@ -1303,27 +1379,47 @@ impl NodeMain {
     pub(crate) fn install_node_function<'registration>(
         &self,
         node: NodeId,
-        simd_bytes: usize,
         registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,
         process: NodeProcessFn,
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.validate_node(node)?;
-            inner.nodes[node.slot() as usize].process = process;
-        }
-        let Some(node_name) = self.node_name(node)? else {
-            return Ok(());
-        };
-        let Some(registration) = preferred_node_function(node_name, simd_bytes, registrations)?
-        else {
-            return Ok(());
+        let registration = match self.node_name(node)? {
+            Some(node_name) => preferred_node_function(node_name, false, registrations)?,
+            None => None,
         };
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
-        inner.nodes[node.slot() as usize].process = registration.function;
-        inner.nodes[node.slot() as usize].frame_args_size = registration.frame_args_size;
+        let slot = &mut inner.nodes[node.slot() as usize];
+        slot.declared_process = process;
+        slot.process = registration.map_or(process, |candidate| candidate.function);
+        if let Some(candidate) = registration {
+            slot.frame_args_size = candidate.frame_args_size;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn select_node_functions<'registration>(
+        &self,
+        registrations: impl Clone + Iterator<Item = &'registration NodeFunctionRegistration>,
+        cpu_pinned: bool,
+    ) -> RuntimeResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        let selected = inner
+            .node_names
+            .iter()
+            .map(|name| {
+                name.map(|name| preferred_node_function(name, cpu_pinned, registrations.clone()))
+                    .transpose()
+                    .map(Option::flatten)
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        for (slot, registration) in inner.nodes.iter_mut().zip(selected) {
+            slot.process =
+                registration.map_or(slot.declared_process, |candidate| candidate.function);
+            if let Some(candidate) = registration {
+                slot.frame_args_size = candidate.frame_args_size;
+            }
+        }
         Ok(())
     }
 
@@ -2032,6 +2128,7 @@ impl NodeMain {
         Ok(NodeRuntimeSlot {
             kind: slot.kind,
             process: slot.process,
+            declared_process: slot.declared_process,
             frame_args_size: slot.frame_args_size,
             runtime_data: Some(
                 slot.runtime_data
@@ -2063,6 +2160,30 @@ impl Future for NodeRuntimeReady<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_architecture_candidate_is_a_runtime_error() {
+        let candidate = NodeFunctionRegistration::new(
+            "packet-input",
+            NodeVariant::Base,
+            process,
+            (0, 4, 0),
+        );
+        let error = preferred_node_function(
+            "packet-input",
+            false,
+            [&candidate, &candidate].into_iter(),
+        )
+        .err()
+        .expect("duplicate variant is rejected");
+        assert!(matches!(
+            error,
+            RuntimeError::DuplicateNodeFunction {
+                node: "packet-input",
+                variant: NodeVariant::Base,
+            }
+        ));
+    }
 
     struct PacketInputNode;
 
@@ -2132,8 +2253,7 @@ mod tests {
             .nodes()
             .install_node_function(
                 node,
-                1,
-                [&__NODE_FUNCTION_PACKET_INPUT_SCALAR].into_iter(),
+                __NODE_FUNCTION_PACKET_INPUT_VARIANTS.iter().copied(),
                 process,
             )
             .unwrap();

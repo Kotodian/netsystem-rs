@@ -37,7 +37,7 @@ pub struct RegistrationImage {
     num_workers_change_functions: &'static [&'static InitFunction],
     api_init_functions: &'static [&'static InitFunction],
     graph_nodes: &'static [&'static NodeEntry],
-    node_functions: &'static [&'static NodeFunctionRegistration],
+    node_functions: &'static [&'static [&'static NodeFunctionRegistration]],
     process_nodes: &'static [&'static NodeEntry],
     stats_registrations: &'static [&'static StatsRegistration],
 }
@@ -54,7 +54,7 @@ impl RegistrationImage {
         num_workers_change_functions: &'static [&'static InitFunction],
         api_init_functions: &'static [&'static InitFunction],
         graph_nodes: &'static [&'static NodeEntry],
-        node_functions: &'static [&'static NodeFunctionRegistration],
+        node_functions: &'static [&'static [&'static NodeFunctionRegistration]],
         process_nodes: &'static [&'static NodeEntry],
     ) -> Self {
         Self::new_with_stats(
@@ -83,7 +83,7 @@ impl RegistrationImage {
         num_workers_change_functions: &'static [&'static InitFunction],
         api_init_functions: &'static [&'static InitFunction],
         graph_nodes: &'static [&'static NodeEntry],
-        node_functions: &'static [&'static NodeFunctionRegistration],
+        node_functions: &'static [&'static [&'static NodeFunctionRegistration]],
         process_nodes: &'static [&'static NodeEntry],
         stats_registrations: &'static [&'static StatsRegistration],
     ) -> Self {
@@ -160,7 +160,9 @@ impl RegistrationImage {
     pub(crate) fn node_functions(
         &self,
     ) -> impl Clone + Iterator<Item = &'static NodeFunctionRegistration> + '_ {
-        self.node_functions.iter().copied()
+        self.node_functions
+            .iter()
+            .flat_map(|group| group.iter().copied())
     }
 
     #[inline]
@@ -217,7 +219,7 @@ macro_rules! __declare_registration_image {
                 &[$(&$num_workers_change),*],
                 &[$(&$api_init),*],
                 &[$(&$graph_node),*],
-                &[$(&$node_function),*],
+                &[$($node_function),*],
                 &[$(&$process_node),*],
                 &[$(&$stats_registration),*],
             );

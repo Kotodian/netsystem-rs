@@ -50,6 +50,8 @@ pub struct DataPlaneMain {
     active_numa_node: u32,
     trace: DataPlaneTrace,
     simd_bytes: usize,
+    cpu_pinned: bool,
+    pub(crate) enqueue_next: crate::graph::fanout::EnqueueNextFn,
     file_main: FileMode,
     /// Main loops completed in the current reporting interval
     /// (`loops_this_reporting_interval` in VPP's `vlib_main_t`).

@@ -2,10 +2,73 @@
 
 use crate::{DataPlaneMain, NodeRuntime};
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
-use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
+use hammer_infra::mask_compare::{compress_u32, mask_compare_u16, mask_compare_u16_words};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const MASK_WORDS: usize = mask_compare_u16_words(DEFAULT_BUFFER_FRAME_CAPACITY);
+
+pub(crate) type EnqueueNextFn = fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame, &[u16]);
+
+#[inline]
+pub(crate) fn select_enqueue_next(cpu_pinned: bool) -> EnqueueNextFn {
+    if cpu_pinned {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::node::NodeVariant;
+            if NodeVariant::X86_64V4.priority_on_current_cpu().is_some() {
+                return enqueue_next_x86_64_v4;
+            }
+            if NodeVariant::X86_64V3.priority_on_current_cpu().is_some() {
+                return enqueue_next_x86_64_v3;
+            }
+        }
+    }
+    enqueue_next_base
+}
+
+#[cfg(target_arch = "x86_64")]
+fn enqueue_next_x86_64_v3(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+    nexts: &[u16],
+) {
+    // SAFETY: selected on the executing, CPU-pinned worker.
+    unsafe { enqueue_next_x86_64_v3_body(runtime, node_runtime, frame, nexts) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,fma,f16c,lzcnt,movbe")]
+unsafe fn enqueue_next_x86_64_v3_body(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+    nexts: &[u16],
+) {
+    enqueue_next_base(runtime, node_runtime, frame, nexts);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn enqueue_next_x86_64_v4(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+    nexts: &[u16],
+) {
+    // SAFETY: selected on the executing, CPU-pinned worker.
+    unsafe { enqueue_next_x86_64_v4_body(runtime, node_runtime, frame, nexts) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512cd")]
+unsafe fn enqueue_next_x86_64_v4_body(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+    nexts: &[u16],
+) {
+    enqueue_next_base(runtime, node_runtime, frame, nexts);
+}
 
 #[cold]
 #[inline(never)]
@@ -101,6 +164,7 @@ impl DataPlaneMain {
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled
     /// next groups via a used bitmap, and for each group run `enqueue_one`.
+    #[inline(always)]
     pub fn enqueue_to_next<N: NodeNext>(
         &mut self,
         node_runtime: &mut NodeRuntime,
@@ -113,9 +177,6 @@ impl DataPlaneMain {
         if frame.is_empty() {
             return;
         }
-        let Some(current) = self.current_node() else {
-            abort_fanout("current graph node is required");
-        };
         let count = frame.len();
         if count > DEFAULT_BUFFER_FRAME_CAPACITY {
             abort_fanout("frame length exceeds production frame capacity");
@@ -126,24 +187,13 @@ impl DataPlaneMain {
             next_slots[offset] = next.slot();
         }
 
-        let mut used = [0u64; MASK_WORDS];
-        let mut n_left = count;
-        while n_left > 0 {
-            let next_index = first_unhandled(&next_slots[..count], &used);
-            n_left = self.enqueue_one(
-                node_runtime,
-                current,
-                next_index,
-                frame.vector_args(),
-                &next_slots[..count],
-                &mut used,
-                n_left,
-            );
-        }
+        let enqueue = self.enqueue_next;
+        enqueue(self, node_runtime, frame, &next_slots[..count]);
     }
 
     /// VPP `enqueue_one`: mask-compare, copy matches into the appendable next
     /// frame, put when full, rotate once if the group still spills.
+    #[inline(always)]
     fn enqueue_one(
         &mut self,
         node_runtime: &mut NodeRuntime,
@@ -153,6 +203,7 @@ impl DataPlaneMain {
         nexts: &[u16],
         used: &mut [u64; MASK_WORDS],
         n_left: usize,
+        extracted: &mut [u32; DEFAULT_BUFFER_FRAME_CAPACITY],
     ) -> usize {
         let target = match self
             .nodes()
@@ -173,7 +224,24 @@ impl DataPlaneMain {
             .frame_args_size(target)
             .expect("registered next layout")
             .0;
-        let mut source_offset = 0;
+        let frame_index = self
+            .nodes
+            .prepare_next_frame(current, u32::from(next_index));
+        if let Some(vectors_left) = {
+            let (vectors, _) = self
+                .nodes
+                .next_frame_mut(frame_index)
+                .next_args_mut::<u32, ()>(scalar_size);
+            (vectors.len() >= n_left).then(|| {
+                assert_eq!(compress_u32(vectors, buffers, &match_bmp), n_extracted);
+                vectors.len() - n_extracted
+            })
+        } {
+            self.put_next_frame(node_runtime, u32::from(next_index), vectors_left);
+            return n_left - n_extracted;
+        }
+
+        assert_eq!(compress_u32(extracted, buffers, &match_bmp), n_extracted);
         let mut copied = 0;
         while copied < n_extracted {
             let frame_index = self
@@ -184,19 +252,42 @@ impl DataPlaneMain {
                     .nodes
                     .next_frame_mut(frame_index)
                     .next_args_mut::<u32, ()>(scalar_size);
-                let mut written = 0;
-                while source_offset < nexts.len() && written < vectors.len() {
-                    if mask_bit(&match_bmp, source_offset) {
-                        vectors[written] = buffers[source_offset];
-                        written += 1;
-                    }
-                    source_offset += 1;
-                }
+                let written = vectors.len().min(n_extracted - copied);
+                vectors[..written].copy_from_slice(&extracted[copied..copied + written]);
                 copied += written;
                 vectors.len() - written
             };
             self.put_next_frame(node_runtime, u32::from(next_index), vectors_left);
         }
         n_left - n_extracted
+    }
+}
+
+/// VPP buffer_funcs.c:94-173: one selected ordinary architecture function.
+#[inline(always)]
+pub(crate) fn enqueue_next_base(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+    nexts: &[u16],
+) {
+    let Some(current) = runtime.current_node() else {
+        abort_fanout("current graph node is required");
+    };
+    let mut used = [0u64; MASK_WORDS];
+    let mut extracted = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut n_left = nexts.len();
+    while n_left > 0 {
+        let next_index = first_unhandled(nexts, &used);
+        n_left = runtime.enqueue_one(
+            node_runtime,
+            current,
+            next_index,
+            frame.vector_args(),
+            nexts,
+            &mut used,
+            n_left,
+            &mut extracted,
+        );
     }
 }

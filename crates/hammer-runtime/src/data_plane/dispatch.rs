@@ -52,12 +52,8 @@ impl DataPlaneMain {
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.register_node_errors(node, error_counters)?;
-            self.nodes.install_node_function(
-                node,
-                self.simd_bytes,
-                node_functions.clone(),
-                process,
-            )?;
+            self.nodes
+                .install_node_function(node, node_functions.clone(), process)?;
         }
         self.nodes.resolve_named_next_nodes()
     }
@@ -91,12 +87,8 @@ impl DataPlaneMain {
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.register_node_errors(node, error_counters)?;
-            self.nodes.install_node_function(
-                node,
-                self.simd_bytes,
-                node_functions.iter(),
-                process,
-            )?;
+            self.nodes
+                .install_node_function(node, node_functions.iter(), process)?;
         }
         self.nodes.resolve_named_next_nodes()?;
         Ok(())

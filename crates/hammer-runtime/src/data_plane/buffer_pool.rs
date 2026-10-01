@@ -124,6 +124,8 @@ impl DataPlaneMain {
             handoff: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,
+            cpu_pinned: false,
+            enqueue_next: crate::graph::fanout::enqueue_next_base,
             file_main,
             loops_this_reporting_interval: 0,
             loop_interval_start: None,

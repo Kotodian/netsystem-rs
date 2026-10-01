@@ -212,6 +212,10 @@ pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i
             && barrier.check_for_refork()
         {
             barrier.refork(&mut main.nodes);
+            if let Err(error) = main.select_node_functions() {
+                tracing::error!(worker = main.thread_index(), %error, "Node Function selection failed");
+                return 1;
+            }
         }
 
         // VPP `main.c:1519`: one timestamp per iteration; every dispatch in
