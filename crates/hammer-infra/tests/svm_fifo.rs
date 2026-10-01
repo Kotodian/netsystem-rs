@@ -66,6 +66,79 @@ fn fifo_accepts_data_after_full_drain() {
 }
 
 #[test]
+fn fifo_extends_chunks_before_consumed_bytes_reach_tail() {
+    let (segment, index) = allocated_fifo(4096);
+    let fifo = segment.fifo(0, index).expect("fifo");
+    let first = vec![0x11; 3072];
+    let second = vec![0x22; 2048];
+
+    assert_eq!(fifo.enqueue(&first), first.len());
+    assert_eq!(fifo.drop_dequeue(2048), 2048);
+    assert_eq!(fifo.enqueue(&second), second.len());
+    assert_eq!(fifo.max_dequeue(), 3072);
+
+    let mut received = vec![0; 3072];
+    assert_eq!(fifo.dequeue(received.len(), &mut received), received.len());
+    assert_eq!(&received[..1024], &first[2048..]);
+    assert_eq!(&received[1024..], second.as_slice());
+}
+
+#[test]
+fn fifo_extends_chunks_for_out_of_order_data() {
+    let (segment, index) = allocated_fifo(4096);
+    let fifo = segment.fifo(0, index).expect("fifo");
+
+    assert_eq!(fifo.enqueue(&vec![0x11; 3072]), 3072);
+    assert_eq!(fifo.drop_dequeue(2048), 2048);
+    assert_eq!(fifo.enqueue_ooo(512, &[0x33; 1024]).unwrap().accepted, 1024);
+    let contiguous = fifo.enqueue_ooo(0, &[0x22; 512]).unwrap();
+    assert_eq!(contiguous.accepted, 512);
+    assert_eq!(contiguous.delivered, 1024);
+
+    let mut received = vec![0; 2560];
+    assert_eq!(fifo.dequeue(received.len(), &mut received), received.len());
+    assert!(received[..1024].iter().all(|&byte| byte == 0x11));
+    assert!(received[1024..1536].iter().all(|&byte| byte == 0x22));
+    assert!(received[1536..].iter().all(|&byte| byte == 0x33));
+}
+
+#[test]
+fn fifo_extends_chunks_for_segmented_enqueue() {
+    let (segment, index) = allocated_fifo(4096);
+    let fifo = segment.fifo(0, index).expect("fifo");
+
+    assert_eq!(fifo.enqueue(&vec![0x11; 3072]), 3072);
+    assert_eq!(fifo.drop_dequeue(2048), 2048);
+    assert_eq!(
+        fifo.enqueue_segments(2048, [&[0x22; 512][..], &[0x33; 1536][..]]),
+        Ok(2048)
+    );
+
+    let mut received = vec![0; 3072];
+    assert_eq!(fifo.dequeue(received.len(), &mut received), received.len());
+    assert!(received[..1024].iter().all(|&byte| byte == 0x11));
+    assert!(received[1024..1536].iter().all(|&byte| byte == 0x22));
+    assert!(received[1536..].iter().all(|&byte| byte == 0x33));
+}
+
+#[test]
+fn fifo_extends_with_chunk_larger_than_initial_allocation() {
+    let (segment, index) = allocated_fifo(8192);
+    let fifo = segment.fifo(0, index).expect("fifo");
+    let first = vec![0x11; 7168];
+    let second = vec![0x22; 6144];
+
+    assert_eq!(fifo.enqueue(&first), first.len());
+    assert_eq!(fifo.drop_dequeue(6144), 6144);
+    assert_eq!(fifo.enqueue(&second), second.len());
+
+    let mut received = vec![0; 7168];
+    assert_eq!(fifo.dequeue(received.len(), &mut received), received.len());
+    assert_eq!(&received[..1024], &first[6144..]);
+    assert_eq!(&received[1024..], second.as_slice());
+}
+
+#[test]
 fn fifo_copies_across_chunks_and_preserves_segmented_enqueue() {
     let (mut segment, index) = allocated_fifo(8192);
     let fifo = segment.fifo(0, index).expect("fifo");

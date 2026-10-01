@@ -1,7 +1,7 @@
 # ADR-0045: 单 Worker 大页 TUN/TCP/iperf3 测试
 
 - 日期：2026-09-29
-- 状态：单 worker TUN/TCP 与标准 iperf3 单流协议交换已实测；高重传与多 worker 尚未验收，见测试记录
+- 状态：单 worker TUN/TCP、HugeTLB packet Buffer 与标准 iperf3 单流已实测；主机 TUN 队列长度影响剩余重传，见测试记录
 - 前置：ADR-0039、ADR-0041、ADR-0043、ADR-0044
 - 范围：Linux 同机 TUN、一个 Data Worker、普通 Main Heap、HugeTLB packet Buffer、TCP 与 builtin iperf3 server
 
@@ -204,6 +204,12 @@ iperf3 -4 -c 198.18.0.1 -p 5201 -P 1 -t 10
 
 使用 release 构建、CPU 0 主线程和 CPU 10 单 Data Worker 测试。进程的 packet Buffer 映射在 `smaps` 中带 `VmFlags: ht`；Main Heap 使用普通页。此前 5202 裸 TCP 发送 8 MiB 已完成；这不能代替标准 iperf3 协议测试。
 
-标准客户端的 control 和 data 连接均到达 5201；插件在同一 listener 上按 cookie 区分连接，接收参数与客户端结果 JSON，并回复服务端结果。`iperf3 -4 -c 198.18.0.1 -p 5201 -P 1 -t 10` 完整退出，发送约 121 MiB、接收约 120 MiB，约 101 Mbit/s；客户端报告 4742 次重传。3 秒复测同样完整退出，约 101 Mbit/s、1320 次重传。抓包没有 capture drop，主机 TUN qdisc 计数没有 drop/overlimit；这些观察不足以确定重传原因，不能据此验收 TCP 性能。当前 release 构建尚未复测 5202 裸 TCP，也未执行双 worker、反向或多流测试。
+标准客户端的 control 和 data 连接均到达 5201；插件在同一 listener 上按 cookie 区分连接，接收参数与客户端结果 JSON，并回复服务端结果。`iperf3 -4 -c 198.18.0.1 -p 5201 -P 1 -t 10` 完整退出，发送约 121 MiB、接收约 120 MiB，约 101 Mbit/s；客户端报告 4742 次重传。3 秒复测同样完整退出，约 101 Mbit/s、1320 次重传。抓包没有 capture drop，主机 TUN qdisc 计数没有 drop/overlimit；这些观察不足以确定重传原因，不能据此验收 TCP 性能。当时的 release 构建尚未复测 5202 裸 TCP，也未执行双 worker、反向或多流测试。
+
+对 3 秒抓包进一步核对：服务端 ACK 在累计 4,194,305、8,388,609、12,582,913 等位置分别停约 212 毫秒，随后才确认下一个数据段；间隔恰好是 iperf3 RX FIFO 的 4 MiB 容量。停顿期间重复 ACK 的通告窗口仍为 4096（协商缩放 10，即 4 MiB），不是零窗口。首个跨界段在客户端第一次发送后约 234 毫秒重传，服务端恢复时才确认它。VPP `svm_fifo.c:795-866,892-930` 在入队目标超过末尾前通过 `f_try_chunk_alloc` 追加 chunk；此前 Hammer 的 FIFO 只使用创建时分配的 chunk，非空状态下越过末尾会拒收首段。这是代码与抓包相互吻合的根因判断。`hammer-infra` 已补 chunk 追加、不同物理 chunk 尺寸的复制和跨界回归用例；修复后的实测结果见下文，不能用这份修复前抓包验收。
+
+2026-10-01 使用包含 FIFO chunk 追加修复的 release 构建复测。启动前宿主机 `pgrep -a -x hammer` 无结果，启动后只有一个 Hammer；主线程位于 CPU 0、Data Worker 位于 CPU 10。`/proc/<pid>/smaps` 显示 `/memfd:buffers` 映射的 `VmFlags` 含 `ht`，Main Heap 配置仍为 `default`；未把 packet Buffer 改为普通页。5202 裸 TCP 再发送 8 MiB，命令正常退出。默认主机 TUN 队列长度 500 下，3 秒 iperf3 为约 314 Mbit/s、29 次重传，10 秒为约 307 Mbit/s、33 次重传；另一轮带抓包的 3 秒传输为约 299 Mbit/s、24 次重传，抓包 157491 包且内核 capture drop 为 0。该轮前后 `hammer0` TX dropped 从 62 增至 86，恰好增加 24，`fq_codel` dropped 为 0；修复前每 4 MiB 停 ACK 的高重传已消失，剩余重传对应主机向 TUN 送包时的队列丢弃。
+
+仅将本次测试接口的主机 TUN 队列长度从 500 临时调至 4096 后，同样的 3 秒单流约 317 Mbit/s、0 次重传，10 秒单流约 316 Mbit/s、0 次重传；TUN TX dropped 保持 86 不变。测试结束前恢复队列长度 500，停止唯一的 Hammer 进程后 `hammer0` 被清理。VPP `tuntap.c:229-399` 与 Hammer `tuntap_rx` 均逐包 `readv`，两者都不替主机设置 TUN 队列长度；本结果是宿主机排队条件的对照，不代表修改了 TCP 拥塞控制、Session 接口或 Buffer 大页策略。多 Worker、反向及多流仍未验收。
 
 事实依据：`crates/hammer-plugins/app/iperf3/src/config.rs`、`src/main.rs`、`src/protocol.rs`；`crates/hammer-service/src/session/mod.rs`、`src/app.rs`；`crates/hammer-runtime/src/data_plane/buffer_pool.rs`；`crates/hammer-infra/src/mem/mod.rs`。标准客户端同端口行为对应 ESnet iperf3 的 `iperf_client_api.c::iperf_connect` 与 `iperf_tcp.c::iperf_tcp_connect` 均使用 `server_port`。

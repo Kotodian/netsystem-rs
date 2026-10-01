@@ -1049,9 +1049,18 @@ impl Fifo {
             }
             let used = tail.wrapping_sub(head);
             let free = ((*hdr).size - used) as usize;
-            let to_write = src.len().min(free);
+            let mut to_write = src.len().min(free);
             if to_write == 0 {
                 return (0, 0);
+            }
+            if self.ensure_chunk_capacity(head, tail, to_write).is_err() {
+                // VPP svm_fifo_enqueue keeps the physical prefix when a new
+                // chunk cannot be allocated; the caller observes a short write.
+                let end = f_chunk_end(&*f_end_cptr(self));
+                to_write = to_write.min(end.wrapping_sub(tail) as usize);
+                if to_write == 0 {
+                    return (0, 0);
+                }
             }
             let old_tail_chunk = (*hdr).tail_chunk.load(Ordering::Relaxed);
             let written = self.append_at_tail_without_tail_store(tail, &src[..to_write]);
@@ -1193,7 +1202,13 @@ impl Fifo {
             let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                if f_pos_geq(new_head, f_chunk_end(chunk)) {
+                let chunk_end = f_chunk_end(chunk);
+                if f_pos_geq(new_head, chunk_end) {
+                    // The producer may already have advanced tail_chunk while
+                    // still clearing this chunk before publishing the new tail.
+                    if !f_pos_gt(tail, chunk_end) {
+                        break;
+                    }
                     if chunk_off == (*hdr).tail_chunk.load(Ordering::Acquire) {
                         break;
                     }
@@ -1222,10 +1237,70 @@ impl Fifo {
             return;
         }
         let chunk = unsafe { &mut *self.base.add(chunk_off as usize).cast::<Chunk>() };
+        if chunk.next.load(Ordering::Acquire) != 0 {
+            return;
+        }
         let visible_len = tail.wrapping_sub(chunk.start_byte);
         if chunk.start_byte != tail && chunk.length.load(Ordering::Relaxed) <= visible_len {
             chunk.start_byte = tail;
         }
+    }
+
+    // VPP svm_fifo.c:f_try_chunk_alloc. Only the FIFO producer extends the
+    // chain; the consumer releases old chunks to the segment's shared slice.
+    fn ensure_chunk_capacity(&self, head: u32, tail: u32, len: usize) -> Result<(), FifoError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let header = unsafe { &*self.hdr };
+        let old_end_offset = header.end_chunk.load(Ordering::Relaxed);
+        let old_end = unsafe { &*self.base.add(old_end_offset as usize).cast::<Chunk>() };
+        let mut end_byte = f_chunk_end(old_end);
+        let target = tail.wrapping_add(len as u32);
+        if !f_pos_gt(target, end_byte) {
+            return Ok(());
+        }
+
+        let free = header.size - tail.wrapping_sub(head);
+        let mut first = 0;
+        let mut last = 0;
+        while f_pos_gt(target, end_byte) {
+            let missing = target.wrapping_sub(end_byte) as usize;
+            let requested = (header.min_alloc.min(free) as usize)
+                .max(missing)
+                .min(1usize << FS_MAX_LOG2_CHUNK_SIZE);
+            let chunk_offset = match crate::svm::fifo_segment::allocate_chunk(
+                unsafe { &*self.fs_hdr },
+                u32::from(header.slice_index),
+                requested,
+                end_byte,
+            ) {
+                Ok(offset) => offset,
+                Err(source) => {
+                    while first != 0 {
+                        let chunk = unsafe { &*self.base.add(first as usize).cast::<Chunk>() };
+                        let next = chunk.next.load(Ordering::Relaxed);
+                        unsafe { self.release_chunk(first) };
+                        first = next;
+                    }
+                    return Err(source);
+                }
+            };
+            if last == 0 {
+                first = chunk_offset;
+            } else {
+                unsafe { &*self.base.add(last as usize).cast::<Chunk>() }
+                    .next
+                    .store(chunk_offset, Ordering::Relaxed);
+            }
+            last = chunk_offset;
+            let chunk = unsafe { &*self.base.add(chunk_offset as usize).cast::<Chunk>() };
+            end_byte = f_chunk_end(chunk);
+        }
+
+        old_end.next.store(first, Ordering::Release);
+        header.end_chunk.store(last, Ordering::Release);
+        Ok(())
     }
 
     fn append_at_tail_without_tail_store(&self, offset: u32, src: &[u8]) -> usize {
@@ -1234,7 +1309,6 @@ impl Fifo {
         }
         let hdr = self.hdr;
         unsafe {
-            let chunk_data_size = (*hdr).min_alloc as usize;
             let mut written = 0usize;
             let mut remaining_offset = offset;
             let mut remaining_src = src;
@@ -1246,7 +1320,7 @@ impl Fifo {
                 }
 
                 let chunk = &mut *(self.base.add(chunk_off as usize) as *mut Chunk);
-                let chunk_end = chunk.start_byte.wrapping_add(chunk_data_size as u32);
+                let chunk_end = f_chunk_end(chunk);
                 if f_pos_geq(remaining_offset, chunk_end) {
                     let next_off = chunk.next.load(Ordering::Acquire);
                     if next_off != 0 {
@@ -1269,7 +1343,7 @@ impl Fifo {
                 }
 
                 let data_off = remaining_offset.wrapping_sub(chunk.start_byte) as usize;
-                let chunk_avail = chunk_data_size - data_off;
+                let chunk_avail = chunk.length.load(Ordering::Relaxed) as usize - data_off;
                 let to_write = remaining_src.len().min(chunk_avail);
                 let mut last = 0;
                 svm_fifo_copy_to_chunk(
@@ -1320,7 +1394,6 @@ impl Fifo {
         }
         let hdr = self.hdr;
         unsafe {
-            let chunk_data_size = (*hdr).min_alloc as usize;
             let mut written = 0usize;
             let mut remaining_offset = offset;
             let mut remaining_src = src;
@@ -1342,7 +1415,7 @@ impl Fifo {
             // Seek to the chunk covering remaining_offset
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
-                let chunk_end = chunk.start_byte.wrapping_add(chunk_data_size as u32);
+                let chunk_end = f_chunk_end(chunk);
                 if f_chunk_includes_pos(chunk, remaining_offset) {
                     break;
                 }
@@ -1362,7 +1435,7 @@ impl Fifo {
                 let chunk = &mut *(self.base.add(chunk_off as usize) as *mut Chunk);
                 if f_chunk_includes_pos(chunk, remaining_offset) {
                     let data_off = remaining_offset.wrapping_sub(chunk.start_byte) as usize;
-                    let chunk_avail = chunk_data_size - data_off;
+                    let chunk_avail = chunk.length.load(Ordering::Relaxed) as usize - data_off;
                     let to_write = remaining_src.len().min(chunk_avail);
                     let mut last = 0;
                     svm_fifo_copy_to_chunk(
@@ -1417,6 +1490,12 @@ impl Fifo {
                 available: self.max_enqueue(),
             });
         }
+        let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };
+        let tail = unsafe { (*self.hdr).tail.load(Ordering::Relaxed) };
+        if head == tail {
+            unsafe { self.prepare_empty_tail_chunk(tail) };
+        }
+        self.ensure_chunk_capacity(head, tail, total)?;
         let mut copied = 0usize;
         for segment in segments {
             let source = segment.as_ref();
@@ -1542,9 +1621,15 @@ impl Fifo {
             let first_chunk = (*hdr).start_chunk.load(Ordering::Relaxed);
             assert_ne!(first_chunk, 0, "a valid FIFO always retains one chunk");
             let first = &mut *self.base.add(first_chunk as usize).cast::<Chunk>();
+            let mut chunk_off = first.next.load(Ordering::Relaxed);
             first.next.store(0, Ordering::Relaxed);
+            while chunk_off != 0 {
+                let chunk = &*self.base.add(chunk_off as usize).cast::<Chunk>();
+                let next = chunk.next.load(Ordering::Relaxed);
+                self.release_chunk(chunk_off);
+                chunk_off = next;
+            }
             first.start_byte = 0;
-            first.length.store((*hdr).min_alloc, Ordering::Relaxed);
             (*hdr).head.store(0, Ordering::Relaxed);
             (*hdr).tail.store(0, Ordering::Relaxed);
             (*hdr).head_chunk.store(first_chunk, Ordering::Relaxed);
@@ -1585,10 +1670,7 @@ impl Fifo {
             while chunk_off != 0 {
                 let current = &mut *self.base.add(chunk_off as usize).cast::<Chunk>();
                 current.start_byte = start;
-                current
-                    .length
-                    .store((*self.hdr).min_alloc, Ordering::Relaxed);
-                start = start.wrapping_add((*self.hdr).min_alloc);
+                start = start.wrapping_add(current.length.load(Ordering::Relaxed));
                 chunk_off = current.next.load(Ordering::Acquire);
             }
         }
@@ -1711,6 +1793,8 @@ impl Fifo {
             });
         }
         let tail = unsafe { (*self.hdr).tail.load(Ordering::Relaxed) };
+        let head = unsafe { (*self.hdr).head.load(Ordering::Acquire) };
+        self.ensure_chunk_capacity(head, tail, offset as usize + src.len())?;
         let abs_start = tail.wrapping_add(offset);
         let written = self.write_at_without_tail_store(abs_start, src);
         if written != src.len() {

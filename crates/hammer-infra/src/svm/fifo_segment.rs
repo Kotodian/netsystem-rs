@@ -179,6 +179,92 @@ const fn chunk_size(size: usize) -> usize {
     1usize << (FS_MIN_LOG2_CHUNK_SIZE + fs_chunk_class(size) as u32)
 }
 
+/// The segment owner and a FIFO producer allocate from the same shared slice.
+/// VPP: fifo_segment.c:fsh_alloc_chunk, svm_fifo.c:f_try_chunk_alloc.
+pub(crate) fn allocate_chunk(
+    header: &FifoSegmentHeader,
+    slice: u32,
+    size: usize,
+    start_byte: u32,
+) -> Result<u64, FifoError> {
+    let shared = unsafe { header.slices() }
+        .get(slice as usize)
+        .expect("allocated FIFO retains its segment slice");
+    let class = fs_chunk_class(size);
+    let physical = chunk_size(size);
+    let mut head = shared.free_chunks[class].load(Ordering::Acquire);
+    while fs_head_offset(head) != 0 {
+        let offset = fs_head_offset(head);
+        assert!(
+            fs_offset_is_valid(offset, header.max_byte_index),
+            "FIFO chunk freelist contains invalid offset {offset:#x}"
+        );
+        let chunk = (header as *const _ as *mut u8)
+            .wrapping_add(offset as usize)
+            .cast::<SvmFifoChunk>();
+        let next = unsafe { (*chunk).next.load(Ordering::Relaxed) } & FS_CHUNK_OFFSET_MASK;
+        let new_head = fs_head_with_next(head, next);
+        match shared.free_chunks[class].compare_exchange_weak(
+            head,
+            new_head,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let bytes = unsafe { (*chunk).length.load(Ordering::Relaxed) } as u64;
+                shared.n_fl_chunk_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                header.n_cached_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                unsafe {
+                    (*chunk).start_byte = start_byte;
+                    (*chunk).length.store(physical as u32, Ordering::Relaxed);
+                    (*chunk).next.store(0, Ordering::Relaxed);
+                }
+                return Ok(offset);
+            }
+            Err(observed) => head = observed,
+        }
+    }
+
+    let mut current = header.byte_index.load(Ordering::Relaxed);
+    let offset = loop {
+        let aligned = current
+            .checked_add(7)
+            .map(|value| value & !7)
+            .ok_or(FifoError::SegmentExhausted)?;
+        let end = aligned
+            .checked_add((CHUNK_HEADER_SIZE + physical) as u64)
+            .ok_or(FifoError::SegmentExhausted)?;
+        if end >= header.max_byte_index || end > FS_CHUNK_OFFSET_MASK {
+            return Err(FifoError::SegmentExhausted);
+        }
+        match header.byte_index.compare_exchange_weak(
+            current,
+            end,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break aligned,
+            Err(observed) => current = observed,
+        }
+    };
+    let chunk = (header as *const _ as *mut u8)
+        .wrapping_add(offset as usize)
+        .cast::<SvmFifoChunk>();
+    unsafe {
+        std::ptr::write(
+            chunk,
+            SvmFifoChunk {
+                start_byte,
+                length: std::sync::atomic::AtomicU32::new(physical as u32),
+                next: std::sync::atomic::AtomicU64::new(0),
+                enq_rb_index: u32::MAX,
+                deq_rb_index: u32::MAX,
+            },
+        );
+    }
+    Ok(offset)
+}
+
 fn max_log2(size: usize) -> u32 {
     usize::BITS - size.max(1).leading_zeros() - 1
 }
@@ -413,42 +499,6 @@ impl SvmFifoSegment {
         }
     }
 
-    #[inline(always)]
-    fn pop_chunk(&self, slice: u32, class: usize) -> Result<Option<u64>, FifoSegmentError> {
-        let shared = self.shared_slice(slice)?;
-        if class >= FS_CHUNK_VEC_LEN {
-            return Ok(None);
-        }
-        let mut head = shared.free_chunks[class].load(Ordering::Acquire);
-        while fs_head_offset(head) != 0 {
-            let offset = fs_head_offset(head);
-            if !fs_offset_is_valid(offset, self.max_byte_index) {
-                panic!("FIFO chunk freelist contains invalid offset {offset:#x}");
-            }
-            let chunk = self.chunk_ptr(offset);
-            let next = unsafe { (*chunk).next.load(Ordering::Relaxed) } & FS_CHUNK_OFFSET_MASK;
-            let new_head = fs_head_with_next(head, next);
-            match shared.free_chunks[class].compare_exchange_weak(
-                head,
-                new_head,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let bytes = unsafe { (*chunk).length.load(Ordering::Relaxed) } as u64;
-                    shared.n_fl_chunk_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                    self.header()
-                        .n_cached_bytes
-                        .fetch_sub(bytes, Ordering::Relaxed);
-                    unsafe { (*chunk).next.store(0, Ordering::Relaxed) };
-                    return Ok(Some(offset));
-                }
-                Err(observed) => head = observed,
-            }
-        }
-        Ok(None)
-    }
-
     fn push_chunk_list(
         &self,
         slice: u32,
@@ -548,41 +598,6 @@ impl SvmFifoSegment {
         }
     }
 
-    fn allocate_chunk(
-        &self,
-        slice: u32,
-        size: usize,
-        start_byte: u32,
-    ) -> Result<u64, FifoSegmentError> {
-        let class = fs_chunk_class(size);
-        if let Some(offset) = self.pop_chunk(slice, class)? {
-            let chunk = self.chunk_ptr(offset);
-            unsafe {
-                (*chunk).start_byte = start_byte;
-                (*chunk)
-                    .length
-                    .store(chunk_size(size) as u32, Ordering::Relaxed);
-                (*chunk).next.store(0, Ordering::Relaxed);
-            }
-            return Ok(offset);
-        }
-        let physical = chunk_size(size);
-        let offset = self.allocate_block(CHUNK_HEADER_SIZE + physical, 8)?;
-        unsafe {
-            std::ptr::write(
-                self.chunk_ptr(offset),
-                SvmFifoChunk {
-                    start_byte,
-                    length: std::sync::atomic::AtomicU32::new(physical as u32),
-                    next: std::sync::atomic::AtomicU64::new(0),
-                    enq_rb_index: u32::MAX,
-                    deq_rb_index: u32::MAX,
-                },
-            );
-        }
-        Ok(offset)
-    }
-
     fn allocate_fifo_header(&self, slice: u32) -> Result<u64, FifoSegmentError> {
         if let Some(offset) = self.pop_fifo_header(slice)? {
             return Ok(offset);
@@ -611,12 +626,13 @@ impl SvmFifoSegment {
         let chunk_count = capacity.div_ceil(physical);
         let mut chunks = Vec::with_capacity(chunk_count);
         for index in 0..chunk_count {
-            match self.allocate_chunk(slice, physical, (index * physical) as u32) {
+            match allocate_chunk(self.header(), slice, physical, (index * physical) as u32) {
                 Ok(offset) => chunks.push(offset),
                 Err(error) => {
+                    self.memory_limit.store(true, Ordering::Relaxed);
                     self.release_chunks(slice, &chunks)?;
                     self.push_fifo_header(slice, header_offset)?;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -927,7 +943,12 @@ impl SvmFifoSegment {
 
     pub fn allocate_chunk_at(&mut self, slice: u32, size: usize) -> Result<u64, FifoSegmentError> {
         self.validate_chunk_size(size)?;
-        self.allocate_chunk(slice, size, 0)
+        self.shared_slice(slice)?;
+        let result = allocate_chunk(self.header(), slice, size, 0);
+        if matches!(result, Err(FifoError::SegmentExhausted)) {
+            self.memory_limit.store(true, Ordering::Relaxed);
+        }
+        result.map_err(Into::into)
     }
 
     pub fn collect_chunk(&mut self, slice: u32, first: u64) -> Result<(), FifoSegmentError> {
