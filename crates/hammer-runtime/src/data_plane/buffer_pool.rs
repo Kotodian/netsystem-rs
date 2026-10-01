@@ -74,16 +74,25 @@ impl DataPlaneMain {
             .enable_all()
             .build()
             .map_err(|source| RuntimeError::MainRuntime { source })?;
+        #[cfg(target_os = "linux")]
         let file_main = {
             let runtime_guard = process_runtime.enter();
-            let file_main = crate::file::AsyncFileMain::new()?;
+            let file_main = crate::file::AsyncFileMain::init()?;
             drop(runtime_guard);
             file_main
         };
+        #[cfg(not(target_os = "linux"))]
+        return Err(RuntimeError::FilePollerOperationUnsupported {
+            operation: "thread-zero async File backend",
+        });
         let active_numa_node = threads
             .thread_by_index(0)
             .and_then(crate::WorkerThread::numa_node)
             .unwrap_or(0);
+        #[cfg(target_os = "linux")]
+        let main_file_mode = FileMode::Async(file_main);
+        #[cfg(not(target_os = "linux"))]
+        let main_file_mode = FileMode::Sync;
         let mut main = Self::from_config_with_file(
             DataPlaneBufferConfig {
                 buffer_slot_capacity: buffer.slot_bytes,
@@ -95,7 +104,7 @@ impl DataPlaneMain {
                 page_size,
             },
             native_simd_bytes(),
-            FileMode::Async(file_main),
+            main_file_mode,
         )?;
         main.nodes.process_runtime = Some(process_runtime);
         Ok(main)

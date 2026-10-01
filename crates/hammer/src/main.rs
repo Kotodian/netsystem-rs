@@ -1,10 +1,14 @@
 //! hammer — VPP-clone daemon
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
+#[cfg(target_os = "linux")]
+use hammer_runtime::unix_cli::UnixCliMain;
 use hammer_runtime::{
     DataPlaneMain, PluginMain, RuntimeError, RuntimeResult, ThreadMain, UnixMain,
 };
@@ -42,6 +46,21 @@ impl DaemonEarlyConfig {
 #[serde(default)]
 struct DaemonStartupConfig {
     plugins: Vec<String>,
+    cli: DaemonCliConfig,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(default)]
+struct DaemonCliConfig {
+    socket: PathBuf,
+}
+
+impl Default for DaemonCliConfig {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from("/run/hammer/cli.sock"),
+        }
+    }
 }
 
 fn main() {
@@ -82,7 +101,7 @@ fn main() {
         );
         exit_daemon(1);
     });
-    let roots = parse_startup_config(&config).unwrap_or_else(|error| {
+    let startup = parse_startup_config(&config).unwrap_or_else(|error| {
         eprintln!(
             "Failed to deserialize daemon config {}: {error}",
             config_path.display()
@@ -94,7 +113,7 @@ fn main() {
         exit_daemon(1);
     }
 
-    let status = run(config, roots, config_path, log_level).unwrap_or_else(|error| {
+    let status = run(config, startup, config_path, log_level).unwrap_or_else(|error| {
         tracing::error!(%error, "hammer runtime failed");
         1
     });
@@ -147,7 +166,7 @@ fn config_path_from_args() -> PathBuf {
 
 fn run(
     config: String,
-    roots: Vec<String>,
+    startup: DaemonStartupConfig,
     config_path: PathBuf,
     log_level: Level,
 ) -> RuntimeResult<i32> {
@@ -157,20 +176,15 @@ fn run(
     let mut global = GlobalMain::new("hammer".to_owned(), exec_path, argv, config.clone());
     let mut plugins = PluginMain::default();
     plugins.register_image(hammer_service::registration_image());
-    plugins.load(env!("CARGO_PKG_VERSION"), &roots)?;
+    plugins.load(env!("CARGO_PKG_VERSION"), &startup.plugins)?;
     plugins.register_global_declarations(&mut global);
 
     let mut threads = ThreadMain::new()?;
     hammer_runtime::init::run_config_functions(&global, None, true, &config)?;
     threads.configure()?;
-    let mut main = DataPlaneMain::new_main(&threads)?;
-    let run_result = hammer_runtime::main_loop::run(
-        global,
-        threads,
-        plugins,
-        &mut main,
-        run_main_thread(&mut unix),
-    );
+    let main = Rc::new(RefCell::new(DataPlaneMain::new_main(&threads)?));
+    let future = run_main_thread(&mut unix, Rc::clone(&main), &startup.cli.socket);
+    let run_result = hammer_runtime::main_loop::run(global, threads, plugins, &main, future);
     let status = run_result.as_ref().copied().unwrap_or(1);
     let unix_result = unix.shutdown(status);
 
@@ -179,7 +193,23 @@ fn run(
     Ok(status)
 }
 
-async fn run_main_thread(unix: &mut UnixMain) -> RuntimeResult<i32> {
+async fn run_main_thread(
+    unix: &mut UnixMain,
+    main: Rc<RefCell<DataPlaneMain>>,
+    socket: &Path,
+) -> RuntimeResult<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let cli = UnixCliMain::global();
+        cli.listen(&mut main.borrow_mut(), socket)?;
+        tracing::info!(socket = %socket.display(), "hammer CLI listening");
+        return tokio::select! {
+            signal = unix.wait_for_exit_signal() => signal,
+            accepted = cli.accept(&main) => accepted.map(|()| 1),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (&main, &socket);
     tracing::info!("hammer started");
     unix.wait_for_exit_signal().await
 }
@@ -188,10 +218,10 @@ fn read_config(path: &Path) -> std::io::Result<String> {
     std::fs::read_to_string(path)
 }
 
-fn parse_startup_config(document: &str) -> RuntimeResult<Vec<String>> {
+fn parse_startup_config(document: &str) -> RuntimeResult<DaemonStartupConfig> {
     let config: DaemonStartupConfig = toml::from_str(document)
         .map_err(|error| RuntimeError::config_parse(format!("parse startup TOML: {error}")))?;
-    Ok(config.plugins)
+    Ok(config)
 }
 
 #[derive(Debug, thiserror::Error)]

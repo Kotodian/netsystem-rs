@@ -4,26 +4,29 @@
 //! This module owns descriptors, readiness dispatch, and indexed synchronous
 //! descriptor I/O. Device queues own packet and queue semantics.
 
+use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
-
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
-use tokio::runtime::Handle;
 
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::NodeMain;
 use crate::error::{RuntimeError, RuntimeResult};
-pub use hammer_core::file::FileReadinessMode;
-use hammer_core::file::{
-    File as CoreFile, FileFunction as CoreFileFunction, FileFunctions as CoreFileFunctions,
+#[cfg(target_os = "linux")]
+mod async_file;
+mod record;
+#[cfg(target_os = "linux")]
+pub use async_file::AsyncFileMain;
+pub use record::FileReadinessMode;
+use record::{
+    File as GenericFile, FileFunction as GenericFileFunction, FileFunctions as GenericFileFunctions,
 };
 
 /// Data Worker File polling strategy; thread zero retains asynchronous File waiting.
@@ -45,9 +48,9 @@ mod linux;
 use linux::Poller;
 
 /// The runtime's concrete specialization of the shared File ABI.
-pub type File = CoreFile<NodeMain, RuntimeError>;
-pub type FileFunction = CoreFileFunction<NodeMain, RuntimeError>;
-pub type FileFunctions = CoreFileFunctions<NodeMain, RuntimeError>;
+pub type File = GenericFile<NodeMain, RuntimeError>;
+pub type FileFunction = GenericFileFunction<NodeMain, RuntimeError>;
+pub type FileFunctions = GenericFileFunctions<NodeMain, RuntimeError>;
 
 fn duplicate_file_descriptor(file: &File) -> io::Result<OwnedFd> {
     // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh descriptor referencing the
@@ -780,60 +783,10 @@ impl FileMain {
     }
 }
 
-/// Control-plane readiness adapter for the main shard in [`FILE_MAIN`].
-///
-/// The adapter owns only a duplicated wake descriptor. The global `FileMain`
-/// remains the sole owner of files, pollers, worker delivery, and reclamation.
-pub struct AsyncFileMain {
-    wake: AsyncFd<OwnedFd>,
-}
-
 pub(crate) enum FileMode {
     Sync,
-    Async(AsyncFileMain),
-}
-
-impl AsyncFileMain {
-    /// Creates the Tokio adapter for the main-thread shard.
-    pub fn new() -> RuntimeResult<Self> {
-        let duplicate = FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before runtime services start")
-            .io_wake_fd_for_worker(0)?;
-        let handle = Handle::try_current().map_err(|source| RuntimeError::FilePollerIo {
-            operation: "enter Tokio reactor for AsyncFileMain",
-            source: io::Error::other(source),
-        })?;
-        let _enter = handle.enter();
-        let wake = AsyncFd::with_interest(duplicate, Interest::READABLE).map_err(|source| {
-            RuntimeError::FilePollerIo {
-                operation: "register AsyncFileMain wake descriptor with Tokio",
-                source,
-            }
-        })?;
-        Ok(Self { wake })
-    }
-
-    /// Awaits main-shard readiness and performs one nonblocking poll.
-    pub async fn next_ready(&mut self, graph: &mut NodeMain) -> RuntimeResult<usize> {
-        let file_main = FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before runtime services start");
-        if file_main.poller_mut(0)?.has_pending() {
-            return file_main.poll_for_worker(0, graph);
-        }
-        let mut guard =
-            self.wake
-                .readable()
-                .await
-                .map_err(|source| RuntimeError::FilePollerIo {
-                    operation: "await AsyncFileMain wake readiness",
-                    source,
-                })?;
-        file_main.clear_io_wake_for_worker(0)?;
-        guard.clear_ready();
-        file_main.poll_for_worker(0, graph)
-    }
+    #[cfg(target_os = "linux")]
+    Async(Rc<RefCell<AsyncFileMain>>),
 }
 
 pub(super) const POLL_BATCH_SIZE: usize = 16;

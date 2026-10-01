@@ -2423,6 +2423,115 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     }
 }
 
+struct CliCommandArgs {
+    path: LitStr,
+    args: Type,
+    short_help: LitStr,
+    long_help: LitStr,
+    mp_safe: LitBool,
+}
+
+impl Parse for CliCommandArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut path = None;
+        let mut args = None;
+        let mut short_help = None;
+        let mut long_help = None;
+        let mut mp_safe = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "path" => path = Some(input.parse()?),
+                "args" => args = Some(input.parse()?),
+                "short_help" => short_help = Some(input.parse()?),
+                "long_help" => long_help = Some(input.parse()?),
+                "mp_safe" => mp_safe = Some(input.parse()?),
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown CLI command argument `{other}`"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        let path: LitStr = path.ok_or_else(|| Error::new(Span::call_site(), "missing `path`"))?;
+        let short_help = short_help.unwrap_or_else(|| path.clone());
+        Ok(Self {
+            path,
+            args: args.ok_or_else(|| Error::new(Span::call_site(), "missing `args`"))?,
+            short_help,
+            long_help: long_help.unwrap_or_else(|| LitStr::new("", Span::call_site())),
+            mp_safe: mp_safe.unwrap_or_else(|| LitBool::new(false, Span::call_site())),
+        })
+    }
+}
+
+#[proc_macro_attribute]
+pub fn cli_command(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as CliCommandArgs);
+    let function = parse_macro_input!(input as ItemFn);
+    expand_cli_command(args, function)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStream2> {
+    if function.sig.asyncness.is_none() || function.sig.inputs.len() != 1 {
+        return Err(Error::new_spanned(
+            &function.sig,
+            "CLI command handlers must be async functions taking exactly one Args value",
+        ));
+    }
+    let Some(FnArg::Typed(_)) = function.sig.inputs.first() else {
+        return Err(Error::new_spanned(
+            &function.sig,
+            "CLI handlers cannot have a receiver",
+        ));
+    };
+    let function_name = &function.sig.ident;
+    let starter = format_ident!("__cli_start_{}", function_name);
+    let registration = format_ident!(
+        "__CLI_COMMAND_{}",
+        function_name.to_string().to_ascii_uppercase()
+    );
+    let path = &args.path;
+    let args_type = &args.args;
+    let short_help = &args.short_help;
+    let long_help = &args.long_help;
+    let mp_safe = &args.mp_safe;
+    Ok(quote! {
+        #function
+
+        fn #starter(
+            _: &mut ::hammer_runtime::DataPlaneMain,
+            input: &str,
+        ) -> Result<
+            ::hammer_runtime::__private::JoinHandle<Result<String, ::hammer_runtime::cli::CliError>>,
+            ::hammer_runtime::cli::CliError,
+        > {
+            let args: #args_type = input.parse()?;
+            Ok(::hammer_runtime::__private::spawn_local(async move {
+                let output = #function_name(args).await?;
+                Ok(format!("{output}"))
+            }))
+        }
+
+        #[doc(hidden)]
+        pub(crate) static #registration: ::hammer_runtime::cli::CliCommandRegistration =
+            ::hammer_runtime::cli::CliCommandRegistration {
+                path: #path,
+                short_help: #short_help,
+                long_help: #long_help,
+                mp_safe: #mp_safe,
+                start: #starter,
+            };
+    })
+}
+
 struct ProcessFnArgs {
     name: LitStr,
 }
@@ -2592,7 +2701,7 @@ impl Parse for FileArgs {
 }
 
 /// Associates an inline module's generic `read` and `error` callbacks with
-/// one complete `hammer_core::file::FileFunctions` value.
+/// one complete `hammer_runtime::file::FileFunctions` value.
 #[proc_macro_attribute]
 pub fn file(args: TokenStream, input: TokenStream) -> TokenStream {
     let _ = parse_macro_input!(args as FileArgs);
@@ -2725,10 +2834,10 @@ fn expand_file(mut module: ItemMod) -> Result<TokenStream2> {
     );
     let constructor = quote! {
         pub fn file_functions<#generic_params>()
-            -> ::hammer_core::file::FileFunctions<#context_ident, #error_ident>
+            -> ::hammer_runtime::__private::FileFunctions<#context_ident, #error_ident>
             #where_clause
         {
-            ::hammer_core::file::FileFunctions {
+            ::hammer_runtime::__private::FileFunctions {
                 read: Some(read::<#context_ident, #error_ident>),
                 write: #write_constructor,
                 error: Some(error::<#context_ident, #error_ident>),
@@ -3519,6 +3628,7 @@ struct PluginArgs {
     node_functions: Vec<Path>,
     process_nodes: Vec<Path>,
     stats_registrations: Vec<Path>,
+    cli_commands: Vec<Path>,
 }
 
 impl Parse for PluginArgs {
@@ -3536,6 +3646,7 @@ impl Parse for PluginArgs {
         let mut node_functions = Vec::new();
         let mut process_nodes = Vec::new();
         let mut stats_registrations = Vec::new();
+        let mut cli_commands = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -3564,6 +3675,7 @@ impl Parse for PluginArgs {
                 "node_functions" => node_functions = parse_path_array(input)?,
                 "process_nodes" => process_nodes = parse_path_array(input)?,
                 "stats_registrations" => stats_registrations = parse_path_array(input)?,
+                "cli_commands" => cli_commands = parse_path_array(input)?,
                 other => {
                     return Err(Error::new(
                         key.span(),
@@ -3589,6 +3701,7 @@ impl Parse for PluginArgs {
             node_functions,
             process_nodes,
             stats_registrations,
+            cli_commands,
         })
     }
 }
@@ -4085,6 +4198,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let node_functions = &args.node_functions;
     let process_nodes = &args.process_nodes;
     let stats_registrations = &args.stats_registrations;
+    let cli_commands = &args.cli_commands;
     let dependencies_ident = format_ident!(
         "__PLUGIN_LOAD_AFTER_{}",
         name.value().to_ascii_uppercase().replace('-', "_")
@@ -4102,6 +4216,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
             node_functions = [#(#node_functions),*];
             process_nodes = [#(#process_nodes),*];
             stats_registrations = [#(#stats_registrations),*];
+            cli_commands = [#(#cli_commands),*];
         );
 
         // This is deliberately plain TOML data, not an executable entrypoint.

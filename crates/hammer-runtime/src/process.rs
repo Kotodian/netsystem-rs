@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use hammer_core::data_plane::{NodeId, NodeKind};
+use hammer_core::data_plane::{NodeId, NodeKind, NodeState};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -66,6 +66,40 @@ pub(crate) struct RunningProcess {
 }
 
 impl NodeMain {
+    pub(crate) fn take_finished_process(&mut self, node: NodeId) -> Option<RunningProcess> {
+        let index = self
+            .running_processes
+            .iter()
+            .position(|process| process.node == node && process.task.is_finished())?;
+        Some(self.running_processes.swap_remove(index))
+    }
+
+    pub(crate) fn start_local_process<F>(&mut self, node: NodeId, future: F) -> RuntimeResult<()>
+    where
+        F: Future<Output = RuntimeResult<()>> + 'static,
+    {
+        if self.node_kind(node)? != NodeKind::Process {
+            return Err(RuntimeError::ProcessNodeNotRegistered { node });
+        }
+        if self
+            .running_processes
+            .iter()
+            .any(|running| running.node == node)
+        {
+            return Err(RuntimeError::ProcessNodeAlreadyStarted { node });
+        }
+        if !self.process_node_indices.contains(&node) {
+            self.process_node_indices.push(node);
+            let slot = node.slot() as usize;
+            self.process_event_state.resize_with(slot + 1, Vec::new);
+            self.process_event_senders.resize_with(slot + 1, || None);
+        }
+        self.set_node_state(node, NodeState::Polling)?;
+        let task = tokio::task::spawn_local(Process::new(node, (), future));
+        self.running_processes.push(RunningProcess { node, task });
+        Ok(())
+    }
+
     pub(crate) fn register_process<S, F>(
         &mut self,
         node: NodeId,
@@ -306,6 +340,17 @@ impl NodeEntry {
 }
 
 impl DataPlaneMain {
+    pub fn start_process<F>(&mut self, node: NodeId, future: F) -> RuntimeResult<()>
+    where
+        F: Future<Output = RuntimeResult<()>> + 'static,
+    {
+        crate::ensure_main_thread()?;
+        if self.thread_index() != 0 || !self.nodes.processes_started {
+            return Err(RuntimeError::MainProcessRuntimeUnavailable);
+        }
+        self.nodes.start_local_process(node, future)
+    }
+
     pub fn start_processes<'entry>(
         &mut self,
         entries: impl Iterator<Item = &'entry NodeEntry>,

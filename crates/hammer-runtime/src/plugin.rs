@@ -510,7 +510,7 @@ impl PluginMain {
         self.load_order.clone()
     }
 
-    fn registration_images(&self) -> impl Clone + Iterator<Item = &RegistrationImage> {
+    pub(crate) fn registration_images(&self) -> impl Clone + Iterator<Item = &RegistrationImage> {
         self.builtin_registration_images
             .iter()
             .copied()
@@ -563,7 +563,6 @@ impl PluginMain {
             }
         });
     }
-
 }
 
 pub fn host_meets_plugin_requirement(

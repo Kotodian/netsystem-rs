@@ -1,4 +1,4 @@
-//! Shared generic file callback ABI.
+//! Generic File record owned by the runtime's I/O subsystem.
 
 use std::fmt;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -52,8 +52,9 @@ impl<Context, Error> fmt::Debug for FileFunctions<Context, Error> {
 }
 
 /// Descriptor ownership and callback state for one registered file.
-pub struct File<Context, Error> {
+pub struct File<Context, Error, Owner = ()> {
     fd: Option<OwnedFd>,
+    owner: Owner,
     description: String,
     private_data: u64,
     functions: FileFunctions<Context, Error>,
@@ -74,8 +75,21 @@ impl<Context, Error> File<Context, Error> {
         private_data: u64,
         functions: FileFunctions<Context, Error>,
     ) -> Self {
+        Self::with_owner(fd, description, private_data, functions, ())
+    }
+}
+
+impl<Context, Error, Owner> File<Context, Error, Owner> {
+    pub(crate) fn with_owner(
+        fd: OwnedFd,
+        description: String,
+        private_data: u64,
+        functions: FileFunctions<Context, Error>,
+        owner: Owner,
+    ) -> Self {
         Self {
             fd: Some(fd),
+            owner,
             description,
             private_data,
             functions,
@@ -89,10 +103,15 @@ impl<Context, Error> File<Context, Error> {
         }
     }
 
+    #[inline]
+    pub(crate) fn owner(&self) -> &Owner {
+        &self.owner
+    }
+
     /// Returns the registered descriptor without transferring ownership.
     #[inline]
     pub fn fd(&self) -> RawFd {
-        self.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+        self.fd.as_ref().map_or(-1, |fd| fd.as_raw_fd())
     }
 
     /// Closes the descriptor while retaining this File record for deferred free.
@@ -210,7 +229,7 @@ impl<Context, Error> File<Context, Error> {
     }
 }
 
-impl<Context, Error> fmt::Debug for File<Context, Error> {
+impl<Context, Error, Owner> fmt::Debug for File<Context, Error, Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("File")
