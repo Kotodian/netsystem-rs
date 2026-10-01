@@ -3,6 +3,7 @@
 use crate::{DataPlaneMain, NodeRuntime};
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const MASK_WORDS: usize = mask_compare_u16_words(DEFAULT_BUFFER_FRAME_CAPACITY);
 
@@ -28,6 +29,74 @@ fn first_unhandled(nexts: &[u16], used: &[u64]) -> u16 {
 }
 
 impl DataPlaneMain {
+    /// Enqueue by next arc and scalar value. A destination without scalar
+    /// arguments ignores the scalar (for example the output drop arc).
+    /// VPP interface_output.c: enqueue_to_tx_node/enqueue_one_to_tx_node.
+    pub fn enqueue_to_next_with_scalar<N, S>(
+        &mut self,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+        nexts: &[N],
+        scalars: &[S],
+    ) where
+        N: NodeNext,
+        S: Copy + Eq + KnownLayout + FromBytes + Immutable + IntoBytes,
+    {
+        assert_eq!(frame.len(), nexts.len(), "next count matches Frame");
+        assert_eq!(frame.len(), scalars.len(), "scalar count matches Frame");
+        assert!(frame.len() <= DEFAULT_BUFFER_FRAME_CAPACITY);
+        let current = self
+            .current_node()
+            .expect("fanout requires an executing node");
+        let mut handled = [false; DEFAULT_BUFFER_FRAME_CAPACITY];
+        let mut group = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+        for first in 0..frame.len() {
+            if handled[first] {
+                continue;
+            }
+            let next_index = nexts[first].slot();
+            let target = self
+                .nodes()
+                .node_next_slot(current, usize::from(next_index))
+                .expect("registered next slot");
+            let scalar_size = self
+                .nodes()
+                .frame_args_size(target)
+                .expect("registered next layout")
+                .0;
+            assert!(scalar_size == 0 || usize::from(scalar_size) == core::mem::size_of::<S>());
+            let mut count = 0;
+            for index in first..frame.len() {
+                if !handled[index]
+                    && nexts[index].slot() == next_index
+                    && (scalar_size == 0 || scalars[index] == scalars[first])
+                {
+                    group[count] = frame.vector_args()[index];
+                    handled[index] = true;
+                    count += 1;
+                }
+            }
+            let mut copied = 0;
+            while copied < count {
+                let (written, remaining) = if scalar_size == 0 {
+                    let (vectors, _) =
+                        self.get_next_frame::<u32, ()>(node_runtime, u32::from(next_index));
+                    let written = vectors.len().min(count - copied);
+                    vectors[..written].copy_from_slice(&group[copied..copied + written]);
+                    (written, vectors.len() - written)
+                } else {
+                    let vectors =
+                        self.get_next_frame_with_scalar(u32::from(next_index), scalars[first]);
+                    let written = vectors.len().min(count - copied);
+                    vectors[..written].copy_from_slice(&group[copied..copied + written]);
+                    (written, vectors.len() - written)
+                };
+                self.put_next_frame(node_runtime, u32::from(next_index), remaining);
+                copied += written;
+            }
+        }
+    }
+
     /// Enqueue every u32 in `frame` to its parallel current-node-local next.
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled

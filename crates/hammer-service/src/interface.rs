@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeRegistration};
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity,
     NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult, process_frame,
@@ -9,6 +9,40 @@ use crate::net::NetMain;
 use crate::opaque::NetworkOpaque;
 
 pub const DEFAULT_INTERFACE_MTU: u32 = 9_000;
+
+/// Scalar arguments of an interface TX Frame. VPP interface.h:
+/// vnet_hw_if_tx_frame_t and interface_output.c:enqueue_one_to_tx_node.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    zerocopy::KnownLayout,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+)]
+#[repr(C)]
+pub struct TxFrame {
+    pub queue_id: u32,
+    pub hints: u16,
+    pub shared_queue: u8,
+    reserved: u8,
+}
+
+impl From<&TxQueue> for TxFrame {
+    #[inline]
+    fn from(queue: &TxQueue) -> Self {
+        Self {
+            queue_id: queue.queue_id,
+            hints: 7,
+            shared_queue: u8::from(queue.shared_queue),
+            reserved: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -234,7 +268,10 @@ impl Node for InterfaceOutputArcEndNode {
         let interfaces = NetMain::global()
             .expect("interface-output-arc-end requires the network Main")
             .interface_main();
-        process_frame!(runtime, node_runtime, frame, |index| {
+        let worker = runtime.data_worker_id().ok();
+        let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+        let mut scalars = [TxFrame::default(); DEFAULT_BUFFER_FRAME_CAPACITY];
+        for (position, &index) in frame.vector_args().iter().enumerate() {
             let sw_if_index =
                 hammer_core::buffer_opaque!(runtime.buffer(index) => NetworkOpaque).sw_if_index[1];
             let entry = interfaces.interface_lookup_entry(sw_if_index);
@@ -244,21 +281,30 @@ impl Node for InterfaceOutputArcEndNode {
             );
             assert!(entry.has_arc_end(), "arc-end requires a published TX next");
             let hardware = interfaces.hardware_interface(entry.hw_if_index);
-            let has_queue = hardware.tx_queue_indices.is_empty()
-                || runtime.data_worker_id().is_ok_and(|worker| {
-                    interfaces.has_tx_queue_for_worker(worker, entry.hw_if_index)
-                });
+            let queue = worker.and_then(|worker| {
+                interfaces.tx_frame_for_packet(worker, entry.hw_if_index, runtime.buffer(index))
+            });
+            let has_queue = hardware.tx_queue_indices.is_empty() || queue.is_some();
             if has_queue {
                 runtime.buffer_mut(index).clear_node_error();
-                entry.if_out_arc_end_next_index
+                nexts[position] = entry.if_out_arc_end_next_index;
+                if let Some(queue) = queue {
+                    scalars[position] = queue;
+                }
             } else {
                 let error_index = runtime
                     .record_current_node_error(InterfaceOutputError::NoTxQueue)
                     .expect("interface arc-end errors are registered before dispatch");
                 runtime.buffer_mut(index).set_node_error_index(error_index);
-                0
+                nexts[position] = 0;
             }
-        });
+        }
+        runtime.enqueue_to_next_with_scalar(
+            node_runtime,
+            frame,
+            &nexts[..processed],
+            &scalars[..processed],
+        );
         processed
     }
 }
@@ -294,14 +340,15 @@ pub(crate) fn interface_output_template(
             .expect("hardware software interface remains live")
             .flags
             .contains(SwInterfaceFlags::ADMIN_UP);
+    let worker = runtime.data_worker_id().ok();
     let has_queue = hardware.tx_queue_indices.is_empty()
-        || runtime
-            .data_worker_id()
-            .is_ok_and(|worker| interfaces.has_tx_queue_for_worker(worker, hw_if_index));
+        || worker.is_some_and(|worker| interfaces.has_tx_queue_for_worker(worker, hw_if_index));
     let arc_index = interfaces.output_feature_arc_index();
     let features = crate::feature::FeatureMain::global()
         .expect("FeatureMain exists before interface output dispatch");
-    process_frame!(runtime, node_runtime, frame, |index| {
+    let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut scalars = [TxFrame::default(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    for (position, &index) in frame.vector_args().iter().enumerate() {
         let error = if !is_up {
             Some(InterfaceOutputError::InterfaceDown)
         } else if !has_queue {
@@ -314,12 +361,26 @@ pub(crate) fn interface_output_template(
                 .record_current_node_error(error)
                 .expect("interface output errors are registered before dispatch");
             runtime.buffer_mut(index).set_node_error_index(error_index);
-            0
+            nexts[position] = 0;
         } else {
             runtime.buffer_mut(index).clear_node_error();
-            features.start_feature_arc(arc_index, sw_if_index, runtime.buffer_mut(index), 1)
+            nexts[position] =
+                features.start_feature_arc(arc_index, sw_if_index, runtime.buffer_mut(index), 1);
+            if nexts[position] == 1 {
+                scalars[position] = worker
+                    .and_then(|worker| {
+                        interfaces.tx_frame_for_packet(worker, hw_if_index, runtime.buffer(index))
+                    })
+                    .unwrap_or_default();
+            }
         }
-    });
+    }
+    runtime.enqueue_to_next_with_scalar(
+        node_runtime,
+        frame,
+        &nexts[..processed],
+        &scalars[..processed],
+    );
     processed
 }
 

@@ -291,6 +291,11 @@ impl PhysmemMain {
     }
 
     #[inline]
+    pub fn maps(&self) -> impl Iterator<Item = &PhysmemMap> {
+        self.maps.iter().map(|(_, map)| map)
+    }
+
+    #[inline]
     pub fn get_page_index(&self, address: usize) -> u32 {
         self.pmalloc_main.get_page_index(address)
     }

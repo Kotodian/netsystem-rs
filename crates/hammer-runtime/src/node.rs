@@ -106,6 +106,7 @@ pub trait Node {
             registration: Node::node_registration(self),
             initial_nexts: self.node_initial_nexts(),
             trace_formatter: self.node_trace_formatter(),
+            frame_args_size: (0, 4, 0),
         })
     }
 }
@@ -198,6 +199,7 @@ pub struct NodeDescriptor<'a> {
     registration: Option<NodeRegistration>,
     initial_nexts: &'a [NodeId],
     trace_formatter: Option<TraceFormatter>,
+    frame_args_size: (u16, u16, u16),
 }
 
 impl<'a> NodeDescriptor<'a> {
@@ -215,7 +217,30 @@ impl<'a> NodeDescriptor<'a> {
             registration,
             initial_nexts,
             trace_formatter,
+            frame_args_size: (0, 4, 0),
         }
+    }
+
+    #[inline]
+    pub fn with_frame_args<S, V, A>(mut self) -> Self
+    where
+        S: zerocopy::KnownLayout + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::IntoBytes,
+        V: zerocopy::KnownLayout + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::IntoBytes,
+        A: zerocopy::KnownLayout + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::IntoBytes,
+    {
+        const {
+            assert!(core::mem::size_of::<V>() != 0);
+            assert!(core::mem::align_of::<S>() <= 16);
+            assert!(core::mem::align_of::<V>() <= 16);
+            assert!(core::mem::align_of::<A>() <= 16);
+            assert!(Frame::<S, V, A>::ALLOCATION_SIZE <= u16::MAX as usize);
+        }
+        self.frame_args_size = (
+            u16::try_from(core::mem::size_of::<S>()).expect("Frame scalar size fits u16"),
+            u16::try_from(core::mem::size_of::<V>()).expect("Frame vector size fits u16"),
+            u16::try_from(core::mem::size_of::<A>()).expect("Frame auxiliary size fits u16"),
+        );
+        self
     }
 
     #[inline]
@@ -1485,6 +1510,7 @@ impl NodeMain {
         inner.node_trace_formatters[slot] = descriptor.trace_formatter;
         inner.nodes[slot].process = descriptor.process;
         inner.nodes[slot].runtime_data = Some(descriptor.runtime_data);
+        inner.nodes[slot].frame_args_size = descriptor.frame_args_size;
         drop(inner);
 
         if let Some(barrier) =
@@ -1500,14 +1526,17 @@ impl NodeMain {
         kind: NodeKind,
         descriptor: NodeDescriptor<'_>,
     ) -> RuntimeResult<NodeId> {
-        self.register_function_declared(
+        let node = self.register_function_declared(
             kind,
             descriptor.process,
             descriptor.runtime_data,
             descriptor.registration,
             descriptor.initial_nexts,
             descriptor.trace_formatter,
-        )
+        )?;
+        self.inner.borrow_mut().nodes[node.slot() as usize].frame_args_size =
+            descriptor.frame_args_size;
+        Ok(node)
     }
 
     fn register_descriptor_with_handle(
@@ -1531,6 +1560,7 @@ impl NodeMain {
             Some(handle),
             None,
         )?;
+        inner.nodes[id.slot() as usize].frame_args_size = descriptor.frame_args_size;
         Ok(id)
     }
 
@@ -2283,8 +2313,7 @@ impl DataPlaneMain {
             // VPP dispatch_pending_node, vlib/main.c:1064-1066. The input
             // count is captured before dispatch because Hammer may reuse
             // this Frame after the Node returns.
-            self.max_internal_frame_vectors =
-                self.max_internal_frame_vectors.max(input_vectors);
+            self.max_internal_frame_vectors = self.max_internal_frame_vectors.max(input_vectors);
             processed += 1;
             frame.frame_flags &= !((1 << 2) | (1 << 14));
             // The callback may have grown Pending storage or moved the owner.
