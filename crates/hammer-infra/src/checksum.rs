@@ -8,17 +8,14 @@ type ChecksumParts = fn(&[&[u8]]) -> u16;
 const ACCUMULATE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
-pub struct InternetChecksum<const SIMD_BYTES: usize = 1> {
+pub struct InternetChecksum {
     sum: u64,
     trailing_high: Option<u8>,
 }
 
-impl<const SIMD_BYTES: usize> Default for InternetChecksum<SIMD_BYTES> {
+impl Default for InternetChecksum {
     #[inline]
     fn default() -> Self {
-        const {
-            assert!(matches!(SIMD_BYTES, 1 | 16 | 32 | 64));
-        }
         Self {
             sum: 0,
             trailing_high: None,
@@ -26,7 +23,7 @@ impl<const SIMD_BYTES: usize> Default for InternetChecksum<SIMD_BYTES> {
     }
 }
 
-impl<const SIMD_BYTES: usize> Hasher for InternetChecksum<SIMD_BYTES> {
+impl Hasher for InternetChecksum {
     #[inline]
     fn finish(&self) -> u64 {
         let mut sum = self.sum;
@@ -36,30 +33,39 @@ impl<const SIMD_BYTES: usize> Hasher for InternetChecksum<SIMD_BYTES> {
         u64::from(finish_checksum(sum))
     }
 
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
-        let mut start = 0usize;
-        if let Some(high) = self.trailing_high.take() {
-            let Some(&low) = bytes.first() else {
-                self.trailing_high = Some(high);
-                return;
-            };
-            self.sum = self
-                .sum
-                .wrapping_add(u64::from(u16::from_be_bytes([high, low])));
-            start = 1;
-        }
-
-        let remainder = &bytes[start..];
-        let even_len = remainder.len() & !1;
-        for chunk in remainder[..even_len].chunks(ACCUMULATE_CHUNK_BYTES) {
-            self.sum = fold_checksum_sum(
-                self.sum
-                    .wrapping_add(accumulate_for_simd::<SIMD_BYTES>(chunk)),
-            );
-        }
-        self.trailing_high = remainder.get(even_len).copied();
+        write_checksum::<64>(self, bytes);
     }
+}
+
+#[inline(always)]
+fn write_checksum<const SIMD_BYTES: usize>(checksum: &mut InternetChecksum, bytes: &[u8]) {
+    const {
+        assert!(matches!(SIMD_BYTES, 1 | 16 | 32 | 64));
+    }
+    let mut start = 0usize;
+    if let Some(high) = checksum.trailing_high.take() {
+        let Some(&low) = bytes.first() else {
+            checksum.trailing_high = Some(high);
+            return;
+        };
+        checksum.sum = checksum
+            .sum
+            .wrapping_add(u64::from(u16::from_be_bytes([high, low])));
+        start = 1;
+    }
+
+    let remainder = &bytes[start..];
+    let even_len = remainder.len() & !1;
+    for chunk in remainder[..even_len].chunks(ACCUMULATE_CHUNK_BYTES) {
+        checksum.sum = fold_checksum_sum(
+            checksum
+                .sum
+                .wrapping_add(accumulate_for_simd::<SIMD_BYTES>(chunk)),
+        );
+    }
+    checksum.trailing_high = remainder.get(even_len).copied();
 }
 
 #[inline]
@@ -74,9 +80,9 @@ pub fn internet_checksum_parts(parts: &[&[u8]]) -> u16 {
 
 #[inline(always)]
 fn checksum_parts_with_simd<const SIMD_BYTES: usize>(parts: &[&[u8]]) -> u16 {
-    let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
+    let mut checksum = InternetChecksum::default();
     for part in parts {
-        checksum.write(part);
+        write_checksum::<SIMD_BYTES>(&mut checksum, part);
     }
     checksum.finish() as u16
 }

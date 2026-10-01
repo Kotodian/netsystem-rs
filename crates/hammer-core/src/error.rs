@@ -68,11 +68,6 @@ pub enum DataPlaneError {
     HandoffNotConfigured,
     #[error("named next fallback node is not registered")]
     NamedNextFallbackMissing,
-    #[error("duplicate node function for `{node}` at SIMD width {simd_bytes} bytes")]
-    DuplicateNodeFunction {
-        node: &'static str,
-        simd_bytes: usize,
-    },
     #[error("constructor-published graph registration is unnamed")]
     UnnamedGraphRegistration,
     #[error("NUMA node {numa_node} exceeds static memory table capacity {capacity}")]
