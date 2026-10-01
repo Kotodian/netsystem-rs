@@ -19,7 +19,7 @@ use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQError, SvmMsgQ
 use hammer_infra::svm::queue::SvmQueueConditionalWait;
 use hammer_infra::sync::SpinLock;
 #[cfg(target_os = "linux")]
-use hammer_runtime::{File, FileFunctions, FILE_MAIN};
+use hammer_runtime::{File, FileFunctions, FileReadinessMode, FILE_MAIN};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeResult, interrupt_worker_node,
     is_current_worker,
@@ -477,6 +477,7 @@ impl SessionWorker {
             },
         );
         file.set_polling_thread_index(runtime.thread_index());
+        file.set_readiness_mode(FileReadinessMode::Drain);
         let file_index = FILE_MAIN
             .get()
             .expect("FileMain initializes before Data Workers")
