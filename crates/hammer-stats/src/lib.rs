@@ -13,11 +13,13 @@ use std::time::Duration;
 use hammer_infra::mem::{MemError, PageSize};
 
 pub mod buffer_pools;
+mod counter;
 pub mod mem;
 mod metric;
 mod protocol;
 mod segment;
 
+pub use counter::{CombinedCounterMain, SimpleCounterMain};
 pub use metric::{
     CombinedCounter, Gauge, Histogram, NameVector, Ring, RingSchema, SimpleCounter, Timestamp,
 };

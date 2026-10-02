@@ -451,6 +451,292 @@ impl StatsSegment {
         )
     }
 
+    /// Publishes one name-vector element and its symlinks in a single
+    /// reader-visible directory transaction.
+    ///
+    /// VPP's `statseg_sw_interface_add_del` holds the stats segment lock
+    /// across the name and every family symlink. This operation stages both
+    /// replacement vectors before changing the published directory pointer.
+    pub fn add_name_symlinks(
+        &self,
+        name_vector: DirectoryIndex,
+        element: u32,
+        value: &str,
+        links: &[(&str, DirectoryIndex)],
+    ) -> StatsResult<Vec<DirectoryIndex>> {
+        let link_names = links
+            .iter()
+            .map(|(path, _)| NameBytes::try_from(*path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut directory = self.stat_segment_lock.lock();
+        let published = self.directory_pointer();
+        let published_length = self.directory().len();
+        let name_outer = self
+            .entry_of_type(name_vector, DirectoryType::NameVector)?
+            .string_vector_pointer()?;
+        let name_length = if name_outer.is_null() {
+            0
+        } else {
+            unsafe { vector_length(name_outer.cast()) as usize }
+        };
+        let position = element as usize;
+        // Reused interface columns contain VPP's "deleted" name. The new
+        // publication replaces that string after the old symlinks are gone.
+        for (offset, name) in link_names.iter().enumerate() {
+            if directory.vector_by_name.contains_key(name) || link_names[..offset].contains(name) {
+                return Err(StatsError::DuplicateName {
+                    name: links[offset].0.to_owned(),
+                });
+            }
+            let target = links[offset].1;
+            if target.raw() as usize >= published_length {
+                return Err(StatsError::DirectoryIndexOutOfBounds {
+                    index: target.raw(),
+                    length: published_length,
+                });
+            }
+        }
+
+        let mut free = directory.first_free_elt;
+        let mut appended = 0usize;
+        let mut indices = Vec::with_capacity(links.len());
+        for _ in links {
+            if let Some(index) = free {
+                free = {
+                    let next = self.entry(index)?.directory_index()?;
+                    (next.raw() != STAT_SEGMENT_INDEX_INVALID).then_some(next)
+                };
+                indices.push(index);
+            } else {
+                let index = u32::try_from(published_length + appended)
+                    .map_err(|_| StatsError::InvalidShape)?;
+                indices.push(DirectoryIndex::new(index));
+                appended += 1;
+            }
+        }
+        let name = allocate_string(self.heap(), value)?;
+        let replacement_names = match allocate_vector(
+            self.heap(),
+            size_of::<*mut u8>(),
+            name_length.max(position + 1),
+            VEC_MIN_ALIGN,
+            NAME_VECTOR_USER_HEADER,
+            true,
+        ) {
+            Ok(vector) => vector,
+            Err(error) => {
+                unsafe { free_vector(self.heap(), name, 1) };
+                return Err(error);
+            }
+        };
+        let replacement_directory = match allocate_vector(
+            self.heap(),
+            size_of::<DirectoryEntry>(),
+            published_length + appended,
+            VEC_MIN_ALIGN,
+            0,
+            true,
+        ) {
+            Ok(vector) => vector,
+            Err(error) => {
+                unsafe {
+                    free_vector(self.heap(), replacement_names, size_of::<*mut u8>());
+                    free_vector(self.heap(), name, 1);
+                }
+                return Err(error);
+            }
+        };
+        let next_names = replacement_names.as_ptr().cast::<*mut u8>();
+        let next_directory = replacement_directory.as_ptr().cast::<DirectoryEntry>();
+        let old_name = if position < name_length {
+            unsafe { *name_outer.add(position) }
+        } else {
+            ptr::null_mut()
+        };
+        // SAFETY: all destination allocations are private until the pointer
+        // publication below, and every copied prefix is in bounds.
+        unsafe {
+            if name_length != 0 {
+                ptr::copy_nonoverlapping(name_outer, next_names, name_length);
+            }
+            ptr::write(next_names.add(position), name.as_ptr());
+            ptr::write(
+                replacement_names
+                    .as_ptr()
+                    .sub(vector_prefix(NAME_VECTOR_USER_HEADER, VEC_MIN_ALIGN, true))
+                    .cast::<u32>(),
+                name_vector.raw(),
+            );
+            if published_length != 0 {
+                ptr::copy_nonoverlapping(published, next_directory, published_length);
+            }
+            (*next_directory.add(name_vector.raw() as usize))
+                .set_data(DirectoryData::string_vector(next_names));
+            for (offset, &index) in indices.iter().enumerate() {
+                ptr::write(
+                    next_directory.add(index.raw() as usize),
+                    DirectoryEntry::new(
+                        TypeCode::from(DirectoryType::Symlink),
+                        link_names[offset],
+                        DirectoryData::symlink_index(SymlinkIndex {
+                            entry_index: links[offset].1.raw(),
+                            vector_index: element,
+                        }),
+                    ),
+                );
+            }
+        }
+        let transaction = DirectoryWrite::begin(self);
+        unsafe {
+            AtomicPtr::from_ptr(ptr::addr_of_mut!((*self.shared_header()).directory_vector))
+                .store(next_directory, Ordering::Release);
+        }
+        drop(transaction);
+        directory.first_free_elt = free;
+        for (name, &index) in link_names.into_iter().zip(&indices) {
+            directory.vector_by_name.insert(name, index);
+        }
+        drop(directory);
+        if !old_name.is_null() {
+            unsafe { free_vector(self.heap(), NonNull::new_unchecked(old_name), 1) };
+        }
+        if !name_outer.is_null() {
+            unsafe {
+                free_vector(
+                    self.heap(),
+                    NonNull::new_unchecked(name_outer.cast()),
+                    size_of::<*mut u8>(),
+                )
+            };
+        }
+        if !published.is_null() {
+            unsafe {
+                free_vector(
+                    self.heap(),
+                    NonNull::new_unchecked(published.cast()),
+                    size_of::<DirectoryEntry>(),
+                )
+            };
+        }
+        Ok(indices)
+    }
+
+    /// Deletes a name's symlinks and marks that name deleted in one epoch.
+    pub fn remove_name_symlinks(
+        &self,
+        name_vector: DirectoryIndex,
+        element: u32,
+        links: &[DirectoryIndex],
+    ) -> StatsResult<()> {
+        let empty_name = NameBytes::try_from(&[] as &[u8])?;
+        let mut directory = self.stat_segment_lock.lock();
+        let published = self.directory_pointer();
+        let published_length = self.directory().len();
+        let name_outer = self
+            .entry_of_type(name_vector, DirectoryType::NameVector)?
+            .string_vector_pointer()?;
+        let name_length = unsafe { vector_length(name_outer.cast()) as usize };
+        let position = element as usize;
+        if position >= name_length {
+            return Err(StatsError::InvalidShape);
+        }
+        let mut link_names = Vec::with_capacity(links.len());
+        for &index in links {
+            let entry = self.entry_of_type(index, DirectoryType::Symlink)?;
+            link_names.push(entry.name_bytes()?);
+        }
+        let deleted = allocate_string(self.heap(), "deleted")?;
+        let replacement_names = match allocate_vector(
+            self.heap(),
+            size_of::<*mut u8>(),
+            name_length,
+            VEC_MIN_ALIGN,
+            NAME_VECTOR_USER_HEADER,
+            true,
+        ) {
+            Ok(vector) => vector,
+            Err(error) => {
+                unsafe { free_vector(self.heap(), deleted, 1) };
+                return Err(error);
+            }
+        };
+        let replacement_directory = match allocate_vector(
+            self.heap(),
+            size_of::<DirectoryEntry>(),
+            published_length,
+            VEC_MIN_ALIGN,
+            0,
+            true,
+        ) {
+            Ok(vector) => vector,
+            Err(error) => {
+                unsafe {
+                    free_vector(self.heap(), replacement_names, size_of::<*mut u8>());
+                    free_vector(self.heap(), deleted, 1);
+                }
+                return Err(error);
+            }
+        };
+        let next_names = replacement_names.as_ptr().cast::<*mut u8>();
+        let next_directory = replacement_directory.as_ptr().cast::<DirectoryEntry>();
+        let old_name = unsafe { *name_outer.add(position) };
+        let mut free = directory.first_free_elt;
+        unsafe {
+            ptr::copy_nonoverlapping(name_outer, next_names, name_length);
+            ptr::write(next_names.add(position), deleted.as_ptr());
+            ptr::write(
+                replacement_names
+                    .as_ptr()
+                    .sub(vector_prefix(NAME_VECTOR_USER_HEADER, VEC_MIN_ALIGN, true))
+                    .cast::<u32>(),
+                name_vector.raw(),
+            );
+            ptr::copy_nonoverlapping(published, next_directory, published_length);
+            (*next_directory.add(name_vector.raw() as usize))
+                .set_data(DirectoryData::string_vector(next_names));
+            for &index in links {
+                ptr::write(
+                    next_directory.add(index.raw() as usize),
+                    DirectoryEntry::new(
+                        TypeCode::from(DirectoryType::Empty),
+                        empty_name,
+                        DirectoryData::index(u64::from(
+                            free.map_or(STAT_SEGMENT_INDEX_INVALID, DirectoryIndex::raw),
+                        )),
+                    ),
+                );
+                free = Some(index);
+            }
+        }
+        let transaction = DirectoryWrite::begin(self);
+        unsafe {
+            AtomicPtr::from_ptr(ptr::addr_of_mut!((*self.shared_header()).directory_vector))
+                .store(next_directory, Ordering::Release);
+        }
+        drop(transaction);
+        directory.first_free_elt = free;
+        for name in link_names {
+            directory.vector_by_name.remove(&name);
+        }
+        drop(directory);
+        if !old_name.is_null() {
+            unsafe { free_vector(self.heap(), NonNull::new_unchecked(old_name), 1) };
+        }
+        unsafe {
+            free_vector(
+                self.heap(),
+                NonNull::new_unchecked(name_outer.cast()),
+                size_of::<*mut u8>(),
+            );
+            free_vector(
+                self.heap(),
+                NonNull::new_unchecked(published.cast()),
+                size_of::<DirectoryEntry>(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn rename_symlink(&self, index: DirectoryIndex, name: &str) -> StatsResult<()> {
         let previous_name = {
             let entry = self.entry_of_type(index, DirectoryType::Symlink)?;
