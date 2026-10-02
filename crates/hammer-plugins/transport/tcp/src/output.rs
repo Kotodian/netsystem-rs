@@ -1,21 +1,149 @@
-use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, TcpHeader, tcp_header};
+use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, TcpHeader, TcpState, tcp_header};
 use core::hash::Hasher;
 use hammer_core::data_plane::{
     BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext,
 };
 use hammer_infra::checksum::InternetChecksum;
-use hammer_plugin_session::{IpSessionFamily, IpSessionMain};
+use hammer_plugin_session::{IpSessionFamily, IpSessionMain, IpTransportConnectionId};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeRuntime};
+use hammer_runtime::{DataPlaneMain, Node, NodeRuntime, TraceFormatter};
 use hammer_service::session::SessionMain;
 use hammer_service::session::node::SessionQueueNode;
 
 use super::{TCP_EGRESS_TAG, TCP_MAIN, TcpError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 const TCP_PROTOCOL: u8 = 6;
+
+// VPP tcp_output.c:2226-2252,2305-2316. The TCP header is captured before
+// this node prepends the IP header.
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct TcpOutputTrace {
+    pub(crate) tcp_header: [u8; 20],
+    local_ip: [u8; 16],
+    remote_ip: [u8; 16],
+    pub(crate) connection_index: u32,
+    worker_index: u32,
+    local_port: u16,
+    remote_port: u16,
+    pub(crate) state: u8,
+    family: u8,
+    pub(crate) has_connection: u8,
+    pub(crate) header_len: u8,
+}
+
+impl TcpOutputTrace {
+    fn record_connection(&mut self, connection: Option<&crate::connection::TcpConnection>) {
+        let Some(connection) = connection else {
+            return;
+        };
+        self.connection_index = connection.base.connection_index;
+        self.worker_index = connection.base.worker_index;
+        self.state = connection.state() as u8;
+        self.has_connection = 1;
+        match connection.base.endpoint {
+            IpTransportConnectionId::Ip4 {
+                local_address,
+                remote_address,
+                local_port,
+                remote_port,
+                ..
+            } => {
+                self.family = 4;
+                self.local_ip[..4].copy_from_slice(&local_address.octets());
+                self.remote_ip[..4].copy_from_slice(&remote_address.octets());
+                self.local_port = u16::from_be(local_port);
+                self.remote_port = u16::from_be(remote_port);
+            }
+            IpTransportConnectionId::Ip6 {
+                local_address,
+                remote_address,
+                local_port,
+                remote_port,
+                ..
+            } => {
+                self.family = 6;
+                self.local_ip = local_address.octets();
+                self.remote_ip = remote_address.octets();
+                self.local_port = u16::from_be(local_port);
+                self.remote_port = u16::from_be(remote_port);
+            }
+        }
+    }
+}
+
+pub(crate) fn format_tcp_output_trace(bytes: &[u8]) -> String {
+    let (trace, _) =
+        TcpOutputTrace::ref_from_prefix(bytes).expect("TCP output trace has its registered layout");
+    if usize::from(trace.header_len) < core::mem::size_of::<TcpHeader>() {
+        return format!("tcp output truncated header ({} bytes)", trace.header_len);
+    }
+    let (header, _) = TcpHeader::ref_from_prefix(&trace.tcp_header)
+        .expect("TCP output trace has a full TCP header");
+    let states = [
+        TcpState::Closed,
+        TcpState::Listen,
+        TcpState::SynSent,
+        TcpState::SynRcvd,
+        TcpState::Established,
+        TcpState::FinWait1,
+        TcpState::FinWait2,
+        TcpState::CloseWait,
+        TcpState::Closing,
+        TcpState::LastAck,
+        TcpState::TimeWait,
+    ];
+    let state = (trace.has_connection != 0).then(|| {
+        *states
+            .get(usize::from(trace.state))
+            .expect("TCP output trace records a valid connection state")
+    });
+    let connection = match (trace.has_connection, trace.family) {
+        (0, _) => "no tcp connection".to_owned(),
+        (_, 4) => format!(
+            "[{}:{}][T] {}:{}->{}:{} state {:?}",
+            trace.worker_index,
+            trace.connection_index,
+            Ipv4Addr::new(
+                trace.local_ip[0],
+                trace.local_ip[1],
+                trace.local_ip[2],
+                trace.local_ip[3]
+            ),
+            trace.local_port,
+            Ipv4Addr::new(
+                trace.remote_ip[0],
+                trace.remote_ip[1],
+                trace.remote_ip[2],
+                trace.remote_ip[3]
+            ),
+            trace.remote_port,
+            state.expect("connected TCP trace has a state"),
+        ),
+        (_, 6) => format!(
+            "[{}:{}][T] {}:{}->{}:{} state {:?}",
+            trace.worker_index,
+            trace.connection_index,
+            Ipv6Addr::from(trace.local_ip),
+            trace.local_port,
+            Ipv6Addr::from(trace.remote_ip),
+            trace.remote_port,
+            state.expect("connected TCP trace has a state"),
+        ),
+        _ => unreachable!("connected TCP trace has an IP family"),
+    };
+    format!(
+        "{connection}\n  tcp {} -> {} seq {} ack {} flags {:?}",
+        header.source_port(),
+        header.destination_port(),
+        header.sequence_number(),
+        header.acknowledgment_number(),
+        header.flags(),
+    )
+}
 
 #[hammer_component_macros::node_next]
 pub enum TcpOutputNext {
@@ -58,7 +186,10 @@ pub fn register_tcp4_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         .expect("Session Queue Graph Node must be registered before TCP output");
     let next = SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
     IpSessionMain::global()?.register_transport(
-        TCP_MAIN.get().expect("TCP Main initializes before output graph").protocol(),
+        TCP_MAIN
+            .get()
+            .expect("TCP Main initializes before output graph")
+            .protocol(),
         IpSessionFamily::Ip4,
         next,
         crate::tcp_session_tx,
@@ -80,7 +211,10 @@ pub fn register_tcp6_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         .expect("Session Queue Graph Node must be registered before TCP output");
     let next = SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
     IpSessionMain::global()?.register_transport(
-        TCP_MAIN.get().expect("TCP Main initializes before output graph").protocol(),
+        TCP_MAIN
+            .get()
+            .expect("TCP Main initializes before output graph")
+            .protocol(),
         IpSessionFamily::Ip6,
         next,
         crate::tcp_session_tx,
@@ -102,6 +236,10 @@ impl Node for Tcp4OutputNode {
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(NodeRuntime::default())
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_output_trace)
+    }
 }
 
 impl Node for Tcp6OutputNode {
@@ -112,6 +250,10 @@ impl Node for Tcp6OutputNode {
         frame: &mut Frame,
     ) -> usize {
         tcp6_output_node_process(runtime, node_runtime, frame)
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_output_trace)
     }
 }
 
@@ -148,13 +290,18 @@ fn tcp_output_node_process_frame<const IS_IP4: bool>(
     let now = SessionMain::global()
         .expect("Session Main initializes before TCP output")
         .now();
-    let tcp = TCP_MAIN.get().expect("TCP Main initializes before TCP output");
+    let tcp = TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before TCP output");
     {
         let mut worker = tcp
             .worker(runtime.thread_index())
             .expect("TCP output executes on its owner Data Worker");
         worker.time_us = now;
         worker.time_tstamp = ((now * 1_000.0) as u64) as u32;
+    }
+    if hammer_runtime::unlikely(node_runtime.trace_enabled()) {
+        trace_tcp_output_frame(runtime, node_runtime, frame.vector_args());
     }
     let mut error_counts = [0u16; crate::TCP_ERRORS.len()];
     let mut error_codes = [None; crate::TCP_ERRORS.len()];
@@ -214,13 +361,63 @@ fn tcp_output_node_process_frame<const IS_IP4: bool>(
     while error_mask != 0 {
         let code = error_mask.trailing_zeros() as usize;
         error_mask &= error_mask - 1;
-        runtime.record_current_node_error_count(
-            error_codes[code].expect("nonzero TCP error has its typed code"),
-            u64::from(error_counts[code]),
-        )
-        .expect("TCP output registers its error counters");
+        runtime
+            .record_current_node_error_count(
+                error_codes[code].expect("nonzero TCP error has its typed code"),
+                u64::from(error_counts[code]),
+            )
+            .expect("TCP output registers its error counters");
     }
     runtime.enqueue_to_next(node_runtime, frame, &nexts[..packet_count]);
+}
+
+fn trace_tcp_output_frame(runtime: &mut DataPlaneMain, node: &NodeRuntime, indices: &[u32]) {
+    let tcp = TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before TCP output");
+    let worker = tcp
+        .worker(runtime.thread_index())
+        .expect("TCP output traces its owner Data Worker");
+    let worker_index = runtime
+        .data_worker_id()
+        .expect("TCP output executes on a Data Worker")
+        .slot() as u32;
+    for &index in indices {
+        if !runtime.buffer(index).trace_handle().is_some() {
+            continue;
+        }
+        let (header_ptr, header_len, connection) = {
+            let buffer = runtime.buffer(index);
+            let header = buffer.current();
+            let egress = hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).egress();
+            let connection = if egress.tag == TCP_EGRESS_TAG
+                && egress.worker_index == worker_index
+                && egress.connection_index != u32::MAX
+            {
+                worker.connection(egress.connection_index)
+            } else {
+                None
+            };
+            (
+                header.as_ptr(),
+                header.len().min(core::mem::size_of::<TcpHeader>()),
+                connection,
+            )
+        };
+        if let Some(trace) = runtime.add_trace::<TcpOutputTrace>(node, index) {
+            trace.record_connection(connection);
+            trace.header_len = u8::try_from(header_len).expect("TCP base header length fits u8");
+            // SAFETY: add_trace mutates the trace pool/Buffer handle while
+            // this node still owns disjoint, live TCP packet storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    header_ptr,
+                    trace.tcp_header.as_mut_ptr(),
+                    header_len,
+                );
+            }
+        }
+    }
 }
 
 #[inline(always)]

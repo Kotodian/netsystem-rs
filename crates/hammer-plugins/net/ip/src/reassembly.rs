@@ -8,8 +8,7 @@ use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceControlHandle,
-    TraceFormatter, add_packet_trace, format_packet_trace,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -21,7 +20,7 @@ use crate::protocol::ip::{
     Ipv6FragmentHeader, Ipv6Header,
 };
 use hammer_service::opaque::NetworkOpaque;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
 const REASSEMBLY_EXPIRE_WALK_INTERVAL: Duration = Duration::from_millis(50);
@@ -59,8 +58,9 @@ pub enum Ip6ReassemblyNext {
     Drop,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum IpReassemblyTraceAction {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum IpReassemblyTraceAction {
     Pending,
     Drop,
     Reassembled,
@@ -68,13 +68,105 @@ pub enum IpReassemblyTraceAction {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct IpReassemblyTrace {
-    pub key: Option<IpFragmentKey>,
-    pub action: IpReassemblyTraceAction,
-    pub current_worker: DataWorkerId,
-    pub owner_worker: Option<DataWorkerId>,
-    pub next: Option<u16>,
+// VPP ip4/ip6_full_reass.c records each reassembly operation in the traced
+// packet's pool entry. Rust stores the key as fixed fields, not an Option or
+// a serialized temporary object.
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+struct IpReassemblyTrace {
+    source: [u8; 16],
+    destination: [u8; 16],
+    identification: u32,
+    current_worker: u32,
+    owner_worker: u32,
+    next: u16,
+    protocol: u8,
+    action: u8,
+    version: u8,
+    has_key: u8,
+    has_owner: u8,
+    has_next: u8,
+}
+
+fn format_reassembly_trace(bytes: &[u8]) -> String {
+    let (trace, _) = IpReassemblyTrace::ref_from_prefix(bytes)
+        .expect("IP reassembly trace has its registered layout");
+    let action = match trace.action {
+        action if action == IpReassemblyTraceAction::Pending as u8 => "pending",
+        action if action == IpReassemblyTraceAction::Drop as u8 => "drop",
+        action if action == IpReassemblyTraceAction::Reassembled as u8 => "reassembled",
+        action if action == IpReassemblyTraceAction::Handoff as u8 => "handoff",
+        action if action == IpReassemblyTraceAction::Failed as u8 => "failed",
+        _ => "unknown",
+    };
+    let owner = (trace.has_owner != 0).then_some(trace.owner_worker);
+    let next = (trace.has_next != 0).then_some(trace.next);
+    match trace.version {
+        4 if trace.has_key != 0 => format!(
+            "reassembly {action}: {} -> {} protocol {} id {} worker {} owner {owner:?} next {next:?}",
+            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&trace.source[..4]).expect("IPv4 source has four bytes")),
+            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&trace.destination[..4]).expect("IPv4 destination has four bytes")),
+            trace.protocol,
+            trace.identification,
+            trace.current_worker,
+        ),
+        6 if trace.has_key != 0 => format!(
+            "reassembly {action}: {} -> {} next-header {} id {} worker {} owner {owner:?} next {next:?}",
+            std::net::Ipv6Addr::from(trace.source),
+            std::net::Ipv6Addr::from(trace.destination),
+            trace.protocol,
+            trace.identification,
+            trace.current_worker,
+        ),
+        _ => format!(
+            "reassembly {action}: worker {} owner {owner:?} next {next:?}",
+            trace.current_worker,
+        ),
+    }
+}
+
+#[inline(always)]
+fn trace_reassembly(
+    runtime: &mut DataPlaneMain,
+    node: &NodeRuntime,
+    index: u32,
+    key: Option<IpFragmentKey>,
+    action: IpReassemblyTraceAction,
+    current_worker: DataWorkerId,
+    owner_worker: Option<DataWorkerId>,
+    next: Option<u16>,
+) {
+    if !hammer_runtime::unlikely(runtime.buffer(index).trace_handle().is_some()) {
+        return;
+    }
+    let Some(trace) = runtime.add_trace::<IpReassemblyTrace>(node, index) else {
+        return;
+    };
+    trace.action = action as u8;
+    trace.current_worker = current_worker.slot() as u32;
+    trace.has_owner = u8::from(owner_worker.is_some());
+    trace.owner_worker = owner_worker.map_or(0, |owner| owner.slot() as u32);
+    trace.has_next = u8::from(next.is_some());
+    trace.next = next.unwrap_or(0);
+    if let Some(key) = key {
+        trace.has_key = 1;
+        match key {
+            IpFragmentKey::V4 { source, destination, protocol, identification } => {
+                trace.version = 4;
+                trace.source[..4].copy_from_slice(&source.octets());
+                trace.destination[..4].copy_from_slice(&destination.octets());
+                trace.protocol = protocol;
+                trace.identification = u32::from(identification);
+            }
+            IpFragmentKey::V6 { source, destination, next_header, identification } => {
+                trace.version = 6;
+                trace.source = source.octets();
+                trace.destination = destination.octets();
+                trace.protocol = next_header;
+                trace.identification = identification;
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -205,7 +297,7 @@ impl IpReassemblyMain {
         runtime.thread_index().saturating_sub(1) as usize
     }
 
-    fn expire_all(&self, trace: Option<&TraceControlHandle>, now: Instant) -> usize {
+    fn expire_all(&self, now: Instant) -> usize {
         let buffers = BufferMain::global();
         // SAFETY: reassembly expiry runs only on the thread-zero Process.
         let mut caches = unsafe { buffers.borrow_worker_caches(0) };
@@ -216,11 +308,7 @@ impl IpReassemblyMain {
             expired_contexts = expired_contexts
                 .saturating_add(worker.lock().remove_expired(now, &mut expired_buffers));
             for indices in expired_buffers.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
-                buffers.free_buffers(&mut caches, indices, true, |handle| {
-                    if let Some(trace) = trace {
-                        trace.finalize(handle);
-                    }
-                });
+                buffers.free_buffers(&mut caches, indices, true);
             }
         }
         expired_contexts
@@ -397,9 +485,8 @@ fn register_ip6_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 #[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk")]
 fn ip_reassembly_expire_process(
-    runtime: &mut DataPlaneMain,
+    _: &mut DataPlaneMain,
 ) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
-    let trace = runtime.trace_control();
     async move {
         // VPP `ip4_full_reass_walk_expired` reads the module-global main directly;
         // the config phase stores it before Process Nodes start.
@@ -408,7 +495,7 @@ fn ip_reassembly_expire_process(
             .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
         loop {
             tokio::time::sleep(REASSEMBLY_EXPIRE_WALK_INTERVAL).await;
-            main.expire_all(trace.as_ref(), Instant::now());
+            main.expire_all(Instant::now());
         }
     }
 }
@@ -633,17 +720,8 @@ impl IpReassemblyWorker {
                     IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
                     IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
                 };
-                let _ = add_packet_trace!(
-                    runtime,
-                    index,
-                    IpReassemblyTrace {
-                        key: None,
-                        action: IpReassemblyTraceAction::Drop,
-                        current_worker,
-                        owner_worker: None,
-                        next: Some(drop_next),
-                    },
-                );
+                trace_reassembly(runtime, node_runtime, index, None,
+                    IpReassemblyTraceAction::Drop, current_worker, None, Some(drop_next));
                 Self::emit_local(
                     runtime,
                     node_runtime,
@@ -678,17 +756,8 @@ impl IpReassemblyWorker {
         if let (Some(directory), Some(handoff)) = (directory, self.handoff.as_ref()) {
             if let Some((_, owner)) = directory.lookup(key) {
                 if owner != current_worker {
-                    let _ = add_packet_trace!(
-                        runtime,
-                        index,
-                        IpReassemblyTrace {
-                            key: Some(key),
-                            action: IpReassemblyTraceAction::Handoff,
-                            current_worker,
-                            owner_worker: Some(owner),
-                            next: None,
-                        },
-                    );
+                    trace_reassembly(runtime, node_runtime, index, Some(key),
+                        IpReassemblyTraceAction::Handoff, current_worker, Some(owner), None);
                     if let Err(error) = runtime.handoff_index(owner, handoff.reassembly, index) {
                         // A rejected enqueue leaves this Worker owning the chain.
                         runtime.buffer_free_one(index);
@@ -724,17 +793,8 @@ impl IpReassemblyWorker {
                         IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
                         IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
                     };
-                    let _ = add_packet_trace!(
-                        runtime,
-                        index,
-                        IpReassemblyTrace {
-                            key: Some(key),
-                            action: IpReassemblyTraceAction::Drop,
-                            current_worker,
-                            owner_worker: Some(current_worker),
-                            next: Some(drop_next),
-                        },
-                    );
+                    trace_reassembly(runtime, node_runtime, index, Some(key),
+                        IpReassemblyTraceAction::Drop, current_worker, Some(current_worker), Some(drop_next));
                     Self::emit_local(
                         runtime,
                         node_runtime,
@@ -756,17 +816,8 @@ impl IpReassemblyWorker {
                         let _ = self.contexts.remove(ctx_index);
                         if owner != current_worker {
                             if let Some(handoff) = &self.handoff {
-                                let _ = add_packet_trace!(
-                                    runtime,
-                                    index,
-                                    IpReassemblyTrace {
-                                        key: Some(key),
-                                        action: IpReassemblyTraceAction::Handoff,
-                                        current_worker,
-                                        owner_worker: Some(owner),
-                                        next: None,
-                                    },
-                                );
+                                trace_reassembly(runtime, node_runtime, index, Some(key),
+                                    IpReassemblyTraceAction::Handoff, current_worker, Some(owner), None);
                                 if let Err(error) =
                                     runtime.handoff_index(owner, handoff.reassembly, index)
                                 {
@@ -847,17 +898,8 @@ impl IpReassemblyWorker {
         }
 
         if let Some(owner) = pending_sendout {
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpReassemblyTrace {
-                    key: Some(key),
-                    action: IpReassemblyTraceAction::Pending,
-                    current_worker,
-                    owner_worker: Some(owner),
-                    next: None,
-                },
-            );
+            trace_reassembly(runtime, node_runtime, index, Some(key),
+                IpReassemblyTraceAction::Pending, current_worker, Some(owner), None);
         }
 
         if let Some((index, owner)) = drop_trace {
@@ -865,17 +907,8 @@ impl IpReassemblyWorker {
                 IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
             };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpReassemblyTrace {
-                    key: Some(key),
-                    action: IpReassemblyTraceAction::Drop,
-                    current_worker,
-                    owner_worker: Some(owner),
-                    next: Some(drop_next),
-                },
-            );
+            trace_reassembly(runtime, node_runtime, index, Some(key),
+                IpReassemblyTraceAction::Drop, current_worker, Some(owner), Some(drop_next));
             Self::emit_local(
                 runtime,
                 node_runtime,
@@ -901,32 +934,14 @@ impl IpReassemblyWorker {
             let mut indices = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
             for fragments in context.fragments.chunks(indices.len()) {
                 for (index, fragment) in indices.iter_mut().zip(fragments) {
-                    let _ = add_packet_trace!(
-                        runtime,
-                        fragment.index,
-                        IpReassemblyTrace {
-                            key: Some(key),
-                            action: IpReassemblyTraceAction::Failed,
-                            current_worker,
-                            owner_worker: Some(sendout),
-                            next: None,
-                        },
-                    );
+                    trace_reassembly(runtime, node_runtime, fragment.index, Some(key),
+                        IpReassemblyTraceAction::Failed, current_worker, Some(sendout), None);
                     *index = fragment.index;
                 }
                 runtime.buffer_free(&indices[..fragments.len()]);
             }
-            let _ = add_packet_trace!(
-                runtime,
-                failed_index,
-                IpReassemblyTrace {
-                    key: Some(key),
-                    action: IpReassemblyTraceAction::Failed,
-                    current_worker,
-                    owner_worker: Some(current_worker),
-                    next: Some(drop_slot),
-                },
-            );
+            trace_reassembly(runtime, node_runtime, failed_index, Some(key),
+                IpReassemblyTraceAction::Failed, current_worker, Some(current_worker), Some(drop_slot));
             Self::emit_local(
                 runtime,
                 node_runtime,
@@ -961,17 +976,8 @@ impl IpReassemblyWorker {
             }
             if let Some(handoff) = &self.handoff {
                 if sendout != current_worker {
-                    let _ = add_packet_trace!(
-                        runtime,
-                        index,
-                        IpReassemblyTrace {
-                            key: Some(key),
-                            action: IpReassemblyTraceAction::Handoff,
-                            current_worker,
-                            owner_worker: Some(sendout),
-                            next: None,
-                        },
-                    );
+                    trace_reassembly(runtime, node_runtime, index, Some(key),
+                        IpReassemblyTraceAction::Handoff, current_worker, Some(sendout), None);
                     if let Err(error) = runtime.handoff_index(sendout, handoff.input, index) {
                         // A rejected enqueue leaves this Worker owning the chain.
                         runtime.buffer_free_one(index);
@@ -984,17 +990,8 @@ impl IpReassemblyWorker {
                 IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Input),
                 IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Input),
             };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpReassemblyTrace {
-                    key: Some(key),
-                    action: IpReassemblyTraceAction::Reassembled,
-                    current_worker,
-                    owner_worker: Some(sendout),
-                    next: Some(input_next),
-                },
-            );
+            trace_reassembly(runtime, node_runtime, index, Some(key),
+                IpReassemblyTraceAction::Reassembled, current_worker, Some(sendout), Some(input_next));
             Self::emit_local(
                 runtime,
                 node_runtime,
@@ -1031,7 +1028,7 @@ impl Node for Ip4ReassemblyNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpReassemblyTrace))
+        Some(format_reassembly_trace)
     }
 }
 
@@ -1057,7 +1054,7 @@ impl Node for Ip6ReassemblyNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpReassemblyTrace))
+        Some(format_reassembly_trace)
     }
 }
 

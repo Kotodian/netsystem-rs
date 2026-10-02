@@ -4,14 +4,20 @@ use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion, Ipv4Header, Ipv6Header};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter, add_packet_trace,
-    format_packet_trace,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
 };
 
 use hammer_service::data_plane::set_index_node_error;
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 use rand::RngCore;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+// VPP icmp4.h:9-12 and icmp6.h:11-14.
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+struct IcmpInputTrace {
+    packet_data: [u8; 64],
+}
 
 #[hammer_component_macros::runtime_error(subsystem = "icmp")]
 #[derive(Debug, thiserror::Error)]
@@ -100,20 +106,36 @@ impl hammer_runtime::node::NodeErrorCode for IcmpNodeError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct IcmpInputTrace {
-    pub version: Option<IpVersion>,
-    pub icmp_type: Option<u8>,
-    pub code: Option<u8>,
-    pub error: Option<u16>,
-    pub next: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct IcmpEchoRequestTrace {
-    pub packet_len: Option<usize>,
-    pub error: Option<u16>,
-    pub next: u16,
+fn format_icmp_trace(bytes: &[u8]) -> String {
+    let (trace, _) = IcmpInputTrace::ref_from_prefix(bytes)
+        .expect("ICMP trace has its registered packet prefix");
+    let packet = &trace.packet_data;
+    match packet[0] >> 4 {
+        4 => {
+            let (header, _) = Ipv4Header::ref_from_prefix(packet)
+                .expect("ICMP4 trace has an IPv4 header prefix");
+            let offset = header.header_len();
+            format!(
+                "icmp4 {} -> {} type {} code {}",
+                header.source(),
+                header.destination(),
+                packet[offset],
+                packet[offset + 1],
+            )
+        }
+        6 => {
+            let (header, _) = Ipv6Header::ref_from_prefix(packet)
+                .expect("ICMP6 trace has an IPv6 header prefix");
+            format!(
+                "icmp6 {} -> {} type {} code {}",
+                header.source(),
+                header.destination(),
+                packet[40],
+                packet[41],
+            )
+        }
+        version => format!("ip version {version} (truncated or invalid header)"),
+    }
 }
 
 impl IcmpNodeError {
@@ -342,7 +364,7 @@ impl Node for Icmp4InputNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IcmpInputTrace))
+        Some(format_icmp_trace)
     }
 
     #[inline]
@@ -368,7 +390,7 @@ impl Node for Icmp6InputNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IcmpInputTrace))
+        Some(format_icmp_trace)
     }
 
     #[inline]
@@ -422,7 +444,7 @@ impl Node for Icmp4EchoRequestNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IcmpEchoRequestTrace))
+        Some(format_icmp_trace)
     }
 }
 
@@ -471,7 +493,7 @@ impl Node for Icmp6EchoRequestNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IcmpEchoRequestTrace))
+        Some(format_icmp_trace)
     }
 }
 
@@ -482,6 +504,9 @@ fn icmp_input_process(
     version: IpVersion,
 ) -> usize {
     let processed_vectors = frame.len();
+    if node_runtime.trace_enabled() {
+        runtime.trace_frame_buffers_only::<IcmpInputTrace>(node_runtime, frame.vector_args());
+    }
     (|| {
         let drop_slot = match version {
             IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
@@ -506,6 +531,9 @@ fn icmp_echo_request_process_frame(
     frame: &mut Frame,
     version: IpVersion,
 ) -> () {
+    if node_runtime.trace_enabled() {
+        runtime.trace_frame_buffers_only::<IcmpInputTrace>(node_runtime, frame.vector_args());
+    }
     hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         match next_for_echo_request_index(runtime, index, version) {
             Ok(next) => next,
@@ -531,13 +559,6 @@ fn next_slot_for_index(
     let default_next = match version {
         IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
         IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Punt),
-    };
-    let mut trace = IcmpInputTrace {
-        version: None,
-        icmp_type: None,
-        code: None,
-        error: None,
-        next: default_next,
     };
     let selected = (|| {
         let cursor = network.packet_cursor();
@@ -571,7 +592,6 @@ fn next_slot_for_index(
                 Some(header.hop_limit())
             }
         };
-        trace.version = Some(version);
         let expected_version = match version {
             IpVersion::V4 => 4,
             IpVersion::V6 => 6,
@@ -598,8 +618,6 @@ fn next_slot_for_index(
         let (header, _) =
             IcmpHeader::ref_from_prefix(transport).map_err(|_| IcmpInputError::BadLength)?;
         let icmp_type = header.icmp_type();
-        trace.icmp_type = Some(icmp_type);
-        trace.code = Some(header.code());
         // SAFETY: only the main-thread publication scope writes these tables.
         // Copy one entry; no table reference escapes into graph or trace calls.
         let entry = unsafe {
@@ -627,24 +645,23 @@ fn next_slot_for_index(
             None => Ok(entry.next),
         }
     })();
-    match selected {
+    let next = match selected {
         Ok(next) => {
             runtime.buffer_mut(index).clear_node_error();
-            trace.next = next;
+            next
         }
         Err(error) => {
             set_index_node_error(runtime, index, error)?;
-            trace.error = Some(error.code());
             if matches!(error, IcmpInputError::UnknownType) {
-                trace.next = match version {
+                match version {
                     IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Punt),
                     IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Punt),
-                };
+                }
+            } else {
+                default_next
             }
         }
-    }
-    let next = trace.next;
-    add_packet_trace!(runtime, index, trace)?;
+    };
     Ok(next)
 }
 
@@ -709,15 +726,6 @@ fn next_for_echo_request_index(
                         cursor.transport_header_offset() + ICMP_ECHO_HEADER_LEN,
                     ),
             );
-            add_packet_trace!(
-                runtime,
-                index,
-                IcmpEchoRequestTrace {
-                    packet_len: Some(cursor.packet_len()),
-                    error: None,
-                    next,
-                },
-            )?;
             Ok(next)
         }
         Err(error) => {
@@ -727,15 +735,6 @@ fn next_for_echo_request_index(
                 IpVersion::V4 => NodeNext::slot(Icmp4EchoRequestNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Icmp6EchoRequestNext::Drop),
             };
-            add_packet_trace!(
-                runtime,
-                index,
-                IcmpEchoRequestTrace {
-                    packet_len: None,
-                    error: Some(error.code()),
-                    next,
-                },
-            )?;
             Ok(next)
         }
     }

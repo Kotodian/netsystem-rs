@@ -6,9 +6,7 @@ use hammer_core::data_plane::{
     BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext,
 };
 use hammer_infra::checksum::InternetChecksum;
-use hammer_runtime::{
-    DataPlaneMain, Node, TraceFormatter, add_packet_trace, format_packet_trace,
-};
+use hammer_runtime::{DataPlaneMain, Node, TraceFormatter};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::feature::FeatureMain;
@@ -65,23 +63,6 @@ impl hammer_runtime::node::NodeErrorCode for IpLocalError {
     fn local_code(self) -> u16 {
         self as u16
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum IpLocalTraceStage {
-    Head,
-    Receive,
-    End,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct IpLocalTrace {
-    pub stage: IpLocalTraceStage,
-    pub version: Option<IpVersion>,
-    pub protocol: Option<IpProtocol>,
-    pub transport_header_len: usize,
-    pub error: Option<u16>,
-    pub next: u16,
 }
 
 impl IpLocalError {
@@ -153,7 +134,7 @@ impl Node for Ip4LocalNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
+        Some(crate::lookup::format_ip4_lookup_trace)
     }
 }
 
@@ -211,7 +192,7 @@ impl Node for Ip4ReceiveNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
+        Some(crate::lookup::format_ip4_lookup_trace)
     }
 }
 
@@ -239,7 +220,7 @@ impl Node for Ip4LocalEndOfArcNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
+        Some(crate::lookup::format_ip4_lookup_trace)
     }
 }
 
@@ -308,7 +289,7 @@ impl Node for Ip6LocalNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
+        Some(crate::lookup::format_ip6_lookup_trace)
     }
 }
 
@@ -366,7 +347,7 @@ impl Node for Ip6ReceiveNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
+        Some(crate::lookup::format_ip6_lookup_trace)
     }
 }
 
@@ -394,7 +375,7 @@ impl Node for Ip6LocalEndOfArcNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
+        Some(crate::lookup::format_ip6_lookup_trace)
     }
 }
 
@@ -446,14 +427,6 @@ impl LocalStage {
         matches!(self, Self::Head | Self::Receive)
     }
 
-    #[inline(always)]
-    fn trace_stage(self) -> IpLocalTraceStage {
-        match self {
-            Self::Head => IpLocalTraceStage::Head,
-            Self::Receive => IpLocalTraceStage::Receive,
-            Self::End => IpLocalTraceStage::End,
-        }
-    }
 }
 
 #[inline(always)]
@@ -466,6 +439,8 @@ fn process_frame(
 ) {
     let count = frame.len();
     let indices = frame.vector_args();
+    // VPP ip4_forward.c:1716-1720 and ip6_forward.c:1252-1254.
+    crate::lookup::trace_lookup_frame(runtime, node_runtime, indices, version);
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut errors = [None; DEFAULT_BUFFER_FRAME_CAPACITY];
     let drop_next = match version {
@@ -709,18 +684,6 @@ fn process_index(
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
             };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: Some(version),
-                    protocol: Some(protocol),
-                    transport_header_len: 0,
-                    error: Some(IpLocalError::BadLength.code()),
-                    next: resolved,
-                },
-            );
             return Ok((resolved, Some(IpLocalError::BadLength)));
         }
     };
@@ -737,18 +700,6 @@ fn process_index(
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
             };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: Some(version),
-                    protocol: Some(protocol),
-                    transport_header_len: 0,
-                    error: Some(error.code()),
-                    next: resolved,
-                },
-            );
             return Ok((resolved, Some(error)));
         }
     };
@@ -891,18 +842,6 @@ fn process_index(
     } else {
         None
     };
-    let _ = add_packet_trace!(
-        runtime,
-        index,
-        IpLocalTrace {
-            stage: stage.trace_stage(),
-            version: Some(version),
-            protocol: Some(protocol),
-            transport_header_len: transport_len.unwrap_or_default(),
-            error: local_error.map(IpLocalError::code),
-            next: resolved,
-        },
-    );
     Ok((resolved, local_error))
 }
 

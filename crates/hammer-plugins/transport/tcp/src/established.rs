@@ -1,12 +1,14 @@
 use crate::read_session_id;
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::{RxDelivery, SessionHandle};
 
 use super::TcpError;
 use super::TcpNodeError;
+use super::input::{TcpReceiveTrace, format_tcp_receive_trace};
 use super::segment::tcp_packet;
+use hammer_service::opaque::NetworkOpaque;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -49,9 +51,10 @@ pub fn register_tcp4_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
 }
 
 pub fn register_tcp6_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let node = runtime
-        .nodes()
-        .try_register_internal_with_next_names(Tcp6EstablishedNode::new(), &["tcp6-output", "drop"])?;
+    let node = runtime.nodes().try_register_internal_with_next_names(
+        Tcp6EstablishedNode::new(),
+        &["tcp6-output", "drop"],
+    )?;
     crate::register_tcp_node_errors(runtime, node)?;
     Ok(node)
 }
@@ -66,6 +69,10 @@ impl Node for Tcp4EstablishedNode {
         let process: NodeProcessFn = tcp_established_process::<true>;
         process(runtime, node_runtime, frame)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_receive_trace)
+    }
 }
 
 impl Node for Tcp6EstablishedNode {
@@ -77,6 +84,10 @@ impl Node for Tcp6EstablishedNode {
     ) -> usize {
         let process: NodeProcessFn = tcp_established_process::<false>;
         process(runtime, node_runtime, frame)
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -95,6 +106,55 @@ fn tcp_established_frame<const IS_IP4: bool>(
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
 ) -> () {
+    // VPP tcp_input.c:1272-1303,1350-1351: trace before established
+    // processing can alter the connection or consume the received Buffer.
+    if hammer_runtime::unlikely(node_runtime.trace_enabled()) {
+        let tcp = crate::TCP_MAIN
+            .get()
+            .expect("TCP Main initializes before established input");
+        let worker = tcp
+            .worker(runtime.thread_index())
+            .expect("established trace reads its owner TCP worker");
+        for &index in frame.vector_args() {
+            if !hammer_runtime::unlikely(runtime.buffer(index).trace_handle().is_some()) {
+                continue;
+            }
+            let (header_ptr, header_len, connection) = {
+                let buffer = runtime.buffer(index);
+                let cursor = hammer_core::buffer_opaque!(buffer => NetworkOpaque).packet_cursor();
+                let header = buffer
+                    .current()
+                    .get(cursor.transport_header_offset()..)
+                    .unwrap_or(&[]);
+                let route =
+                    hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).route();
+                let connection = if crate::read_session_route_opaque(route).is_some() {
+                    worker.connection(route.connection_index)
+                } else {
+                    None
+                };
+                (
+                    header.as_ptr(),
+                    header.len().min(core::mem::size_of::<crate::TcpHeader>()),
+                    connection,
+                )
+            };
+            if let Some(trace) = runtime.add_trace::<TcpReceiveTrace>(node_runtime, index) {
+                trace.record_connection(connection);
+                trace.header_len =
+                    u8::try_from(header_len).expect("TCP base header length fits u8");
+                // SAFETY: add_trace changes only trace storage/Buffer metadata;
+                // the received packet remains live in disjoint packet storage.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        header_ptr,
+                        trace.tcp_header.as_mut_ptr(),
+                        header_len,
+                    );
+                }
+            }
+        }
+    }
     let mut output = Frame::<(), u32, ()>::new(0);
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -176,11 +236,12 @@ fn tcp_established_frame<const IS_IP4: bool>(
     while error_mask != 0 {
         let code = error_mask.trailing_zeros() as usize;
         error_mask &= error_mask - 1;
-        runtime.record_current_node_error_count(
-            error_codes[code].expect("nonzero TCP error has its typed code"),
-            u64::from(error_counts[code]),
-        )
-        .expect("TCP established node registers its error counters");
+        runtime
+            .record_current_node_error_count(
+                error_codes[code].expect("nonzero TCP error has its typed code"),
+                u64::from(error_counts[code]),
+            )
+            .expect("TCP established node registers its error counters");
     }
     ()
 }
@@ -246,13 +307,7 @@ fn tcp_established_index<const IS_IP4: bool>(
             .session_from_handle(handle)
             .map(|session| session.connection_index())
             .ok_or(TcpNodeError::EstablishedSessionMissing)?;
-        let (
-            control,
-            acked_tx_len,
-            accept_payload,
-            accepted_sequence,
-            duplicate_payload,
-        ) = {
+        let (control, acked_tx_len, accept_payload, accepted_sequence, duplicate_payload) = {
             let crate::worker::TcpWorker {
                 connections,
                 timer_wheel: timers,
@@ -295,14 +350,15 @@ fn tcp_established_index<const IS_IP4: bool>(
             runtime.buffer_free_one(index);
             return Ok(());
         }
-        let retransmit_pending = tcp.connection(connection_index)
-            .is_some_and(|connection| {
-                connection.recovery.in_recovery()
-                    && (connection.recovery.retransmit_candidate().is_some()
-                        || (!connection.negotiated_options().sack
-                            && connection.recovery.oldest_unacked()
-                                .is_some_and(|sample| !sample.retransmitted)))
-            });
+        let retransmit_pending = tcp.connection(connection_index).is_some_and(|connection| {
+            connection.recovery.in_recovery()
+                && (connection.recovery.retransmit_candidate().is_some()
+                    || (!connection.negotiated_options().sack
+                        && connection
+                            .recovery
+                            .oldest_unacked()
+                            .is_some_and(|sample| !sample.retransmitted)))
+        });
         if retransmit_pending {
             tcp.program_retransmit(runtime, sessions, connection_index);
         }
@@ -313,10 +369,15 @@ fn tcp_established_index<const IS_IP4: bool>(
             let accepted_len = packet.payload_len.saturating_sub(trim) as u32;
             crate::expose_payload(runtime, index, &packet, trim)?;
             let delivery = sessions.enqueue_rx(runtime, handle, index, offset)?;
-            let send_mss = tcp.connection(connection_index)
-                .expect("payload retains its TCP connection").send_mss;
+            let send_mss = tcp
+                .connection(connection_index)
+                .expect("payload retains its TCP connection")
+                .send_mss;
             *error = Some(crate::payload_node_error(
-                delivery, accepted_len, send_mss, offset,
+                delivery,
+                accepted_len,
+                send_mss,
+                offset,
             ));
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
@@ -364,7 +425,11 @@ fn tcp_established_index<const IS_IP4: bool>(
         }
 
         let fin_control = {
-            let crate::worker::TcpWorker { connections, timer_wheel, .. } = tcp;
+            let crate::worker::TcpWorker {
+                connections,
+                timer_wheel,
+                ..
+            } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 *error = Some(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing

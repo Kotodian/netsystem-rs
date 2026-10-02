@@ -6,23 +6,143 @@ use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion};
 use hammer_plugin_session::{IpSessionEndpoint, IpSessionMain, IpTransportConnectionId};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
-    add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::{SessionLookup, SessionLookupResult, SessionMain};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::{TcpInputNext, read_session_route_opaque, write_session_route_opaque};
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct TcpInputTrace {
-    pub version: Option<IpVersion>,
-    pub protocol: Option<IpProtocol>,
-    pub source_port: Option<u16>,
-    pub destination_port: Option<u16>,
-    pub flags: u16,
-    pub error: Option<u16>,
-    pub next: u16,
+// VPP tcp_input.c:1213-1268,1272-1303,1590-1607,1967-2005,2410-2428.
+// Input and state nodes retain the received TCP header and connection state.
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct TcpReceiveTrace {
+    pub(crate) tcp_header: [u8; 20],
+    local_ip: [u8; 16],
+    remote_ip: [u8; 16],
+    pub(crate) connection_index: u32,
+    worker_index: u32,
+    local_port: u16,
+    remote_port: u16,
+    pub(crate) state: u8,
+    family: u8,
+    pub(crate) has_connection: u8,
+    pub(crate) header_len: u8,
+}
+
+impl TcpReceiveTrace {
+    pub(crate) fn record_connection(
+        &mut self,
+        connection: Option<&crate::connection::TcpConnection>,
+    ) {
+        let Some(connection) = connection else {
+            return;
+        };
+        self.connection_index = connection.base.connection_index;
+        self.worker_index = connection.base.worker_index;
+        self.state = connection.state() as u8;
+        self.has_connection = 1;
+        match connection.base.endpoint {
+            IpTransportConnectionId::Ip4 {
+                local_address,
+                remote_address,
+                local_port,
+                remote_port,
+                ..
+            } => {
+                self.family = 4;
+                self.local_ip[..4].copy_from_slice(&local_address.octets());
+                self.remote_ip[..4].copy_from_slice(&remote_address.octets());
+                self.local_port = u16::from_be(local_port);
+                self.remote_port = u16::from_be(remote_port);
+            }
+            IpTransportConnectionId::Ip6 {
+                local_address,
+                remote_address,
+                local_port,
+                remote_port,
+                ..
+            } => {
+                self.family = 6;
+                self.local_ip = local_address.octets();
+                self.remote_ip = remote_address.octets();
+                self.local_port = u16::from_be(local_port);
+                self.remote_port = u16::from_be(remote_port);
+            }
+        }
+    }
+}
+
+pub(crate) fn format_tcp_receive_trace(bytes: &[u8]) -> String {
+    let (trace, _) = TcpReceiveTrace::ref_from_prefix(bytes)
+        .expect("TCP receive trace has its registered layout");
+    if usize::from(trace.header_len) < core::mem::size_of::<crate::TcpHeader>() {
+        return format!("tcp input truncated header ({} bytes)", trace.header_len);
+    }
+    let (header, _) = crate::TcpHeader::ref_from_prefix(&trace.tcp_header)
+        .expect("TCP receive trace has a full TCP header");
+    let states = [
+        TcpState::Closed,
+        TcpState::Listen,
+        TcpState::SynSent,
+        TcpState::SynRcvd,
+        TcpState::Established,
+        TcpState::FinWait1,
+        TcpState::FinWait2,
+        TcpState::CloseWait,
+        TcpState::Closing,
+        TcpState::LastAck,
+        TcpState::TimeWait,
+    ];
+    let state = (trace.has_connection != 0).then(|| {
+        *states
+            .get(usize::from(trace.state))
+            .expect("TCP receive trace records a valid connection state")
+    });
+    let connection = match (trace.has_connection, trace.family) {
+        (0, _) => "no tcp connection".to_owned(),
+        (_, 4) => format!(
+            "[{}:{}][T] {}:{}->{}:{} state {:?}",
+            trace.worker_index,
+            trace.connection_index,
+            Ipv4Addr::new(
+                trace.local_ip[0],
+                trace.local_ip[1],
+                trace.local_ip[2],
+                trace.local_ip[3]
+            ),
+            trace.local_port,
+            Ipv4Addr::new(
+                trace.remote_ip[0],
+                trace.remote_ip[1],
+                trace.remote_ip[2],
+                trace.remote_ip[3]
+            ),
+            trace.remote_port,
+            state.expect("connected TCP trace has a state"),
+        ),
+        (_, 6) => format!(
+            "[{}:{}][T] {}:{}->{}:{} state {:?}",
+            trace.worker_index,
+            trace.connection_index,
+            Ipv6Addr::from(trace.local_ip),
+            trace.local_port,
+            Ipv6Addr::from(trace.remote_ip),
+            trace.remote_port,
+            state.expect("connected TCP trace has a state"),
+        ),
+        _ => unreachable!("connected TCP trace has an IP family"),
+    };
+    format!(
+        "{connection}\n  tcp {} -> {} seq {} ack {} flags {:?}",
+        header.source_port(),
+        header.destination_port(),
+        header.sequence_number(),
+        header.acknowledgment_number(),
+        header.flags(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +314,7 @@ impl Node for Tcp4InputNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(TcpInputTrace))
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -211,7 +331,7 @@ impl Node for Tcp6InputNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(TcpInputTrace))
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -228,7 +348,7 @@ impl Node for Tcp4InputNoLookupNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(TcpInputTrace))
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -245,7 +365,7 @@ impl Node for Tcp6InputNoLookupNode {
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(TcpInputTrace))
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -298,7 +418,10 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
         let index0 = indices[position];
         let mut error0 = None;
         let next0 = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(
-            runtime, index0, handoff_worker, &mut error0,
+            runtime,
+            index0,
+            handoff_worker,
+            &mut error0,
         );
         let slot0 = match next0 {
             Ok(slot) => slot,
@@ -320,7 +443,10 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
         let index1 = indices[position + 1];
         let mut error1 = None;
         let next1 = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(
-            runtime, index1, handoff_worker, &mut error1,
+            runtime,
+            index1,
+            handoff_worker,
+            &mut error1,
         );
         let slot1 = match next1 {
             Ok(slot) => slot,
@@ -348,7 +474,10 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
         let index = indices[position];
         let mut error = None;
         let next = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(
-            runtime, index, handoff_worker, &mut error,
+            runtime,
+            index,
+            handoff_worker,
+            &mut error,
         );
         if let Some(error) = error {
             let code = error as usize;
@@ -374,16 +503,78 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
     while error_mask != 0 {
         let code = error_mask.trailing_zeros() as usize;
         error_mask &= error_mask - 1;
-        runtime.record_current_node_error_count(
-            error_codes[code].expect("nonzero TCP input error has its typed code"),
-            u64::from(error_counts[code]),
-        ).expect("TCP input registers its error counters");
+        runtime
+            .record_current_node_error_count(
+                error_codes[code].expect("nonzero TCP input error has its typed code"),
+                u64::from(error_counts[code]),
+            )
+            .expect("TCP input registers its error counters");
     }
     let count = output.len();
     if count != 0 {
+        if hammer_runtime::unlikely(node_runtime.trace_enabled()) {
+            trace_tcp_input_frame(runtime, node_runtime, output.vector_args(), &nexts[..count]);
+        }
         runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..count]);
     }
     ()
+}
+
+// VPP tcp_input.c:1644-1675,2888-2891. The frame's decisions are final;
+// only Buffers marked by an upstream source append records here.
+fn trace_tcp_input_frame(
+    runtime: &mut DataPlaneMain,
+    node: &NodeRuntime,
+    indices: &[u32],
+    nexts: &[u16],
+) {
+    let tcp = crate::TCP_MAIN
+        .get()
+        .expect("TCP Main initializes before input trace");
+    let worker = tcp
+        .worker(runtime.thread_index())
+        .expect("TCP input trace reads its owner worker");
+    for (&index, &next) in indices.iter().zip(nexts) {
+        if !runtime.buffer(index).trace_handle().is_some() {
+            continue;
+        }
+        let (header_ptr, header_len, connection) = {
+            let buffer = runtime.buffer(index);
+            let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+            let offset = network.packet_cursor().transport_header_offset();
+            let header = buffer.current().get(offset..).unwrap_or(&[]);
+            let route = hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).route();
+            let connection = if next == TcpInputNext::Drop.slot() as u16
+                || next == TcpInputNext::Punt.slot() as u16
+                || next == TcpInputNext::Reset.slot() as u16
+                || route.origin == crate::TcpRouteOrigin::Absent as u8
+            {
+                None
+            } else if route.origin == crate::TcpRouteOrigin::Listener as u8 {
+                tcp.listener_connection(route.connection_index)
+            } else {
+                worker.connection(route.connection_index)
+            };
+            (
+                header.as_ptr(),
+                header.len().min(core::mem::size_of::<crate::TcpHeader>()),
+                connection,
+            )
+        };
+        if let Some(trace) = runtime.add_trace::<TcpReceiveTrace>(node, index) {
+            trace.record_connection(connection);
+            trace.header_len = u8::try_from(header_len).expect("TCP base header length fits u8");
+            // SAFETY: add_trace changes only the trace pool/Buffer handle;
+            // the input Buffer's packet storage remains live and disjoint.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    header_ptr,
+                    trace.tcp_header.as_mut_ptr(),
+                    header_len,
+                );
+            }
+        }
+    }
 }
 
 #[inline(always)]
@@ -409,7 +600,11 @@ fn tcp_input_local_next_for_index<const IS_IP4: bool, const NO_LOOKUP: bool>(
     let buffer = runtime.buffer(index);
     let parsed = tcp_input_buffer(&buffer)?;
     next_slot_for_index_with_runtime::<IS_IP4, NO_LOOKUP>(
-        runtime, index, parsed, handoff_worker, error,
+        runtime,
+        index,
+        parsed,
+        handoff_worker,
+        error,
     )
 }
 
@@ -426,21 +621,11 @@ enum TcpInputError {
 fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
-    parsed: Result<
-        (
-            IpVersion,
-            IpProtocol,
-            SocketAddr,
-            SocketAddr,
-            TcpInputFlags,
-        ),
-        TcpInputError,
-    >,
+    parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
     handoff_worker: Option<DataWorkerId>,
     classified_error: &mut Option<TcpError>,
 ) -> RuntimeResult<Option<u16>> {
-    let traced = runtime.buffer(index).trace_handle().is_some();
-    let (version, protocol, local, remote, flags) = match parsed {
+    let (_, _, local, remote, flags) = match parsed {
         Ok(parsed) => parsed,
         Err(TcpInputError::BadLength) => {
             return resolve_error_next_with_runtime(
@@ -448,39 +633,25 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 TcpInputNext::Drop,
                 TcpError::Length,
-                None,
-                None,
-                0,
-                traced,
                 classified_error,
             );
         }
-        Err(TcpInputError::WrongProtocol { version, protocol }) => {
+        Err(TcpInputError::WrongProtocol { .. }) => {
             return resolve_error_next_with_runtime(
                 runtime,
                 index,
                 TcpInputNext::Drop,
                 TcpError::Dispatch,
-                Some(version),
-                Some(protocol),
-                0,
-                traced,
                 classified_error,
             );
         }
     };
-    let source_port = remote.port();
-    let destination_port = local.port();
     if local.is_ipv4() != IS_IP4 {
         return resolve_error_next_with_runtime(
             runtime,
             index,
             TcpInputNext::Drop,
             TcpError::SegmentInvalid,
-            Some(version),
-            Some(protocol),
-            u16::from(flags.bits()),
-            traced,
             classified_error,
         );
     }
@@ -502,10 +673,6 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 TcpInputNext::Drop,
                 TcpError::InvalidConnection,
-                Some(version),
-                Some(protocol),
-                u16::from(flags.bits()),
-                traced,
                 classified_error,
             );
         };
@@ -534,10 +701,6 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 TcpInputNext::Drop,
                 TcpError::InvalidConnection,
-                Some(version),
-                Some(protocol),
-                u16::from(flags.bits()),
-                traced,
                 classified_error,
             );
         };
@@ -559,24 +722,10 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 dispatch,
                 error,
-                Some(version),
-                Some(protocol),
-                u16::from(flags.bits()),
-                traced,
                 classified_error,
             );
         }
-        return resolve_success_next_with_trace(
-            runtime,
-            index,
-            dispatch,
-            version,
-            protocol,
-            source_port,
-            destination_port,
-            u16::from(flags.bits()),
-            traced,
-        );
+        return Ok(Some(dispatch.slot()));
     }
     let fib_index = hammer_core::buffer_opaque!(runtime.buffer(index) => NetworkOpaque)
         .ip()
@@ -595,7 +744,9 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
     // VPP tcp_input.c prefetches the established and listener tuple tables
     // before the first lookup; the lookup owner keeps both family tables
     // concrete and performs the family-specific key prefetch here.
-    main.worker(runtime.thread_index())?.lookup.prefetch_tuple(local, remote);
+    main.worker(runtime.thread_index())?
+        .lookup
+        .prefetch_tuple(local, remote);
     let exact_session = match ip_session.lookup_main().lookup_exact(&connection) {
         SessionLookupResult::Session(handle) => Some(handle),
         SessionLookupResult::HalfOpen(_)
@@ -631,10 +782,6 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 TcpInputNext::Drop,
                 TcpError::InvalidConnection,
-                Some(version),
-                Some(protocol),
-                u16::from(flags.bits()),
-                traced,
                 classified_error,
             );
         }
@@ -652,7 +799,9 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
         let connection_index = {
             // SAFETY: this input node executes on the Session worker's Data Worker.
             let sessions = unsafe { ip_session.session().worker_mut(runtime) }?;
-            sessions.session(session_id).map(|session| session.connection_index())
+            sessions
+                .session(session_id)
+                .map(|session| session.connection_index())
         };
         let state = if let Some(connection_index) = connection_index {
             let worker = main.worker(runtime.thread_index())?;
@@ -668,10 +817,6 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 TcpInputNext::Drop,
                 TcpError::InvalidConnection,
-                Some(version),
-                Some(protocol),
-                u16::from(flags.bits()),
-                traced,
                 classified_error,
             );
         };
@@ -695,24 +840,10 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 index,
                 dispatch,
                 error,
-                Some(version),
-                Some(protocol),
-                u16::from(flags.bits()),
-                traced,
                 classified_error,
             );
         }
-        return resolve_success_next_with_trace(
-            runtime,
-            index,
-            dispatch,
-            version,
-            protocol,
-            source_port,
-            destination_port,
-            u16::from(flags.bits()),
-            traced,
-        );
+        return Ok(Some(dispatch.slot()));
     }
 
     if exact_session.is_some() {
@@ -721,31 +852,7 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
             index,
             TcpInputNext::Drop,
             TcpError::InvalidConnection,
-            Some(version),
-            Some(protocol),
-            u16::from(flags.bits()),
-            traced,
             classified_error,
-        );
-    }
-
-    if listener_pending {
-        {
-            let buffer = runtime.buffer_mut(index);
-            buffer.clear_node_error();
-            *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
-                Default::default();
-        }
-        return resolve_success_next_with_trace(
-            runtime,
-            index,
-            TcpInputNext::Listen,
-            version,
-            protocol,
-            source_port,
-            destination_port,
-            u16::from(flags.bits()),
-            traced,
         );
     }
 
@@ -759,93 +866,65 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
             index,
             TcpInputNext::Reset,
             TcpError::NoListener,
-            Some(version),
-            Some(protocol),
-            u16::from(flags.bits()),
-            traced,
             classified_error,
         );
     };
-    let state = main
-        .listener_control
-        .listener_for_session(listener)
-        .and_then(|registration| main.listener_connection(registration.lookup_id))
-        .map(|connection| connection.state());
-    let Some(state) = state else {
+    let Some(registration) = main.listener_control.listener_for_session(listener) else {
         return resolve_error_next_with_runtime(
             runtime,
             index,
             TcpInputNext::Drop,
             TcpError::InvalidConnection,
-            Some(version),
-            Some(protocol),
-            u16::from(flags.bits()),
-            traced,
             classified_error,
         );
     };
-    let dispatch = TCP_INPUT_DISPATCH[state.index()][usize::from(flags.bits())];
-    if let Some(error) = dispatch.error {
+    let Some(connection) = main.listener_connection(registration.lookup_id) else {
         return resolve_error_next_with_runtime(
             runtime,
             index,
-            dispatch,
-            error,
-            Some(version),
-            Some(protocol),
-            u16::from(flags.bits()),
-            traced,
+            TcpInputNext::Drop,
+            TcpError::InvalidConnection,
             classified_error,
         );
+    };
+    let state = connection.state();
+    if listener_pending {
+        let buffer = runtime.buffer_mut(index);
+        buffer.clear_node_error();
+        *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
+            crate::TcpRouteOpaque {
+                session_raw: 0,
+                owner_worker: registration.owner_worker.slot() as u32,
+                connection_index: registration.lookup_id,
+                next: TcpInputNext::Listen as u8,
+                origin: crate::TcpRouteOrigin::Listener as u8,
+                reserved: [0; 38],
+            };
+        return Ok(Some(TcpInputNext::Listen.slot()));
+    }
+    let dispatch = TCP_INPUT_DISPATCH[state.index()][usize::from(flags.bits())];
+    if let Some(error) = dispatch.error {
+        return resolve_error_next_with_runtime(runtime, index, dispatch, error, classified_error);
     }
     {
         let buffer = runtime.buffer_mut(index);
         buffer.clear_node_error();
-        *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
-            Default::default();
+        let route =
+            hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut();
+        *route = if matches!(dispatch.next, TcpInputNext::Listen) {
+            crate::TcpRouteOpaque {
+                session_raw: 0,
+                owner_worker: registration.owner_worker.slot() as u32,
+                connection_index: registration.lookup_id,
+                next: TcpInputNext::Listen as u8,
+                origin: crate::TcpRouteOrigin::Listener as u8,
+                reserved: [0; 38],
+            }
+        } else {
+            Default::default()
+        };
     }
-    resolve_success_next_with_trace(
-        runtime,
-        index,
-        dispatch,
-        version,
-        protocol,
-        source_port,
-        destination_port,
-        u16::from(flags.bits()),
-        traced,
-    )
-}
-
-#[inline(always)]
-fn resolve_success_next_with_trace(
-    runtime: &DataPlaneMain,
-    index: u32,
-    next_key: impl NodeNext,
-    version: IpVersion,
-    protocol: IpProtocol,
-    source_port: u16,
-    destination_port: u16,
-    flags: u16,
-    traced: bool,
-) -> RuntimeResult<Option<u16>> {
-    let slot = next_key.slot();
-    if traced {
-        add_packet_trace!(
-            runtime,
-            index,
-            TcpInputTrace {
-                version: Some(version),
-                protocol: Some(protocol),
-                source_port: Some(source_port),
-                destination_port: Some(destination_port),
-                flags,
-                error: None,
-                next: slot,
-            },
-        )?;
-    }
-    Ok(Some(slot))
+    Ok(Some(dispatch.slot()))
 }
 
 #[inline(always)]
@@ -854,48 +933,19 @@ fn resolve_error_next_with_runtime(
     index: u32,
     next_key: impl NodeNext,
     error: TcpError,
-    version: Option<IpVersion>,
-    protocol: Option<IpProtocol>,
-    flags: u16,
-    traced: bool,
     classified_error: &mut Option<TcpError>,
 ) -> RuntimeResult<Option<u16>> {
     let error_index = runtime.record_current_node_error_count(error, 0)?;
     runtime.buffer_mut(index).set_node_error_index(error_index);
     *classified_error = Some(error);
-    let slot = next_key.slot();
-    if traced {
-        add_packet_trace!(
-            runtime,
-            index,
-            TcpInputTrace {
-                version,
-                protocol,
-                source_port: None,
-                destination_port: None,
-                flags,
-                error: Some(error as u16),
-                next: slot,
-            },
-        )?;
-    }
-    Ok(Some(slot))
+    Ok(Some(next_key.slot()))
 }
 
 #[inline(always)]
 fn tcp_input_buffer(
     buffer: &hammer_core::data_plane::Buffer,
 ) -> RuntimeResult<
-    Result<
-        (
-            IpVersion,
-            IpProtocol,
-            SocketAddr,
-            SocketAddr,
-            TcpInputFlags,
-        ),
-        TcpInputError,
-    >,
+    Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
 > {
     tcp_input_parts(
         buffer.current(),
@@ -908,16 +958,7 @@ fn tcp_input_parts(
     current: &[u8],
     network: &NetworkOpaque,
 ) -> RuntimeResult<
-    Result<
-        (
-            IpVersion,
-            IpProtocol,
-            SocketAddr,
-            SocketAddr,
-            TcpInputFlags,
-        ),
-        TcpInputError,
-    >,
+    Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
 > {
     let cursor = network.packet_cursor();
     let Some((version, protocol)) = ip_facts(network) else {

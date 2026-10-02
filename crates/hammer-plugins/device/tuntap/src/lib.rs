@@ -16,7 +16,9 @@ use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_plugin_ip::{Ip4InputNode, Ip6InputNode, IpInterfaceAddressError};
 use hammer_runtime::file::{FILE_MAIN, File, FileFunctions};
 use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
-use hammer_runtime::{DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult};
+use hammer_runtime::{
+    DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult, TraceFormatter,
+};
 use hammer_service::data_plane::DropNode;
 use hammer_service::feature::FeatureMain;
 use hammer_service::interface::{
@@ -28,6 +30,7 @@ use hammer_service::net::NetMain;
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use wide::{CmpEq, u16x8};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use vhost::{Descriptor, Virtqueue};
 
@@ -898,6 +901,38 @@ const TUN_TX_ERRORS: [NodeErrorDescriptor; 5] = [
 )]
 struct TunInputNode;
 
+// VPP tap/internal.h:24-31 and tap/rx_node.c:330-349. Length remains u32 so
+// a valid multi-buffer packet is reported without truncation.
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+struct TunInputTrace {
+    hw_if_index: u32,
+    next_index: u16,
+    ring: u16,
+    len: u32,
+    hdr: [u8; vhost::NET_HEADER_LEN],
+}
+
+fn format_tun_input_trace(bytes: &[u8]) -> String {
+    let (trace, _) = TunInputTrace::ref_from_prefix(bytes)
+        .expect("TUN input trace record has its registered layout");
+    let header = &trace.hdr;
+    format!(
+        "virtio: hw_if_index {} next-index {} vring {} len {}\n  hdr: flags 0x{:02x} gso_type 0x{:02x} hdr_len {} gso_size {} csum_start {} csum_offset {} num_buffers {}",
+        trace.hw_if_index,
+        trace.next_index,
+        trace.ring,
+        trace.len,
+        header[0],
+        header[1],
+        u16::from_le_bytes([header[2], header[3]]),
+        u16::from_le_bytes([header[4], header[5]]),
+        u16::from_le_bytes([header[6], header[7]]),
+        u16::from_le_bytes([header[8], header[9]]),
+        u16::from_le_bytes([header[10], header[11]]),
+    )
+}
+
 fn register_tun_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime.nodes().try_register_driver(TunInputNode::new())?;
     runtime.nodes().set_node_state(node, NodeState::Interrupt)?;
@@ -1008,6 +1043,7 @@ impl Node for TunInputNode {
         let mut packets = 0;
         let mut alloc_error = 0;
         let mut full_queue = 0;
+        let mut remaining_trace = runtime.trace_count(node);
         let worker_id = DataWorkerId::try_from(runtime.thread_index())
             .expect("tun-input runs only on a Data Worker");
         for poll in interfaces.rx_queue_poll_vector(worker_id, main.input_node) {
@@ -1130,6 +1166,38 @@ impl Node for TunInputNode {
                 *next =
                     features.start_device_input(main.sw_if_index, runtime.buffer_mut(index), *next);
             }
+            if remaining_trace > 0 {
+                for (position, &index) in frame.vector_args().iter().enumerate() {
+                    if remaining_trace == 0 {
+                        break;
+                    }
+                    let next = nexts[position];
+                    if runtime.trace_buffer(node, next, index, false) {
+                        let buffer = runtime.buffer(index);
+                        let length = buffer.current_len() + buffer.total_len_not_including_first();
+                        // RX consumed this fixed virtio header with advance;
+                        // its bytes still precede the current packet window.
+                        let header = unsafe { buffer.current().as_ptr().sub(vhost::NET_HEADER_LEN) };
+                        let trace = runtime
+                            .add_trace::<TunInputTrace>(node, index)
+                            .expect("new TUN trace has a local pool slot");
+                        trace.hw_if_index = main.hw_if_index;
+                        trace.next_index = next;
+                        trace.ring = queue.queue_id;
+                        trace.len = u32::try_from(length).expect("TUN packet length fits u32");
+                        // SAFETY: the just-consumed header belongs to this
+                        // allocated Buffer and cannot overlap the trace pool.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                header,
+                                trace.hdr.as_mut_ptr(),
+                                vhost::NET_HEADER_LEN,
+                            );
+                        }
+                        remaining_trace -= 1;
+                    }
+                }
+            }
             runtime.enqueue_to_next(node, frame, &nexts[..count]);
             frame.set_vector_count(0);
             packets += count;
@@ -1151,7 +1219,18 @@ impl Node for TunInputNode {
         runtime
             .record_current_node_error_count(TunRxError::FullRxQueue, full_queue)
             .expect("tun-input error counters are registered");
+        if runtime.trace_count(node) > 0 {
+            runtime.set_trace_count(node, remaining_trace);
+        }
         packets
+    }
+
+    fn trace_supported(&self) -> bool {
+        true
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tun_input_trace)
     }
 }
 

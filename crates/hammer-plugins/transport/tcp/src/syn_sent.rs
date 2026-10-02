@@ -1,12 +1,14 @@
 use crate::read_session_id;
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter};
 
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::TcpError;
 use super::TcpNodeError;
+use super::input::{TcpReceiveTrace, format_tcp_receive_trace};
 use super::segment::tcp_packet;
+use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::{ApplicationMain, SessionEventType, SessionHandle, SessionState};
 
 #[hammer_component_macros::node_next]
@@ -41,9 +43,10 @@ pub fn register_tcp4_syn_sent(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> 
     if let Some(node) = runtime.nodes().node_by_name("tcp4-syn-sent") {
         return Ok(node);
     }
-    let node = runtime
-        .nodes()
-        .try_register_internal_with_next_names(Tcp4SynSentNode::new(), &TcpSynSentNext::NEXT_NAMES)?;
+    let node = runtime.nodes().try_register_internal_with_next_names(
+        Tcp4SynSentNode::new(),
+        &TcpSynSentNext::NEXT_NAMES,
+    )?;
     crate::register_tcp_node_errors(runtime, node)?;
     Ok(node)
 }
@@ -66,6 +69,10 @@ impl Node for Tcp4SynSentNode {
         let process: NodeProcessFn = tcp_syn_sent_process::<true>;
         process(runtime, node_runtime, frame)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_receive_trace)
+    }
 }
 
 impl Node for Tcp6SynSentNode {
@@ -77,6 +84,10 @@ impl Node for Tcp6SynSentNode {
     ) -> usize {
         let process: NodeProcessFn = tcp_syn_sent_process::<false>;
         process(runtime, node_runtime, frame)
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -95,6 +106,55 @@ fn tcp_syn_sent_frame<const IS_IP4: bool>(
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
 ) -> () {
+    // VPP tcp_input.c:1590-1607,1692-1693: capture the half-open
+    // connection before SYN-SENT processing changes its state.
+    if hammer_runtime::unlikely(node_runtime.trace_enabled()) {
+        let tcp = crate::TCP_MAIN
+            .get()
+            .expect("TCP Main initializes before SYN-SENT input");
+        let worker = tcp
+            .worker(runtime.thread_index())
+            .expect("SYN-SENT trace reads its owner TCP worker");
+        for &index in frame.vector_args() {
+            if !hammer_runtime::unlikely(runtime.buffer(index).trace_handle().is_some()) {
+                continue;
+            }
+            let (header_ptr, header_len, connection) = {
+                let buffer = runtime.buffer(index);
+                let cursor = hammer_core::buffer_opaque!(buffer => NetworkOpaque).packet_cursor();
+                let header = buffer
+                    .current()
+                    .get(cursor.transport_header_offset()..)
+                    .unwrap_or(&[]);
+                let route =
+                    hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).route();
+                let connection = if crate::read_session_route_opaque(route).is_some() {
+                    worker.connection(route.connection_index)
+                } else {
+                    None
+                };
+                (
+                    header.as_ptr(),
+                    header.len().min(core::mem::size_of::<crate::TcpHeader>()),
+                    connection,
+                )
+            };
+            if let Some(trace) = runtime.add_trace::<TcpReceiveTrace>(node_runtime, index) {
+                trace.record_connection(connection);
+                trace.header_len =
+                    u8::try_from(header_len).expect("TCP base header length fits u8");
+                // SAFETY: add_trace changes only trace storage/Buffer metadata;
+                // the received packet remains live in disjoint packet storage.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        header_ptr,
+                        trace.tcp_header.as_mut_ptr(),
+                        header_len,
+                    );
+                }
+            }
+        }
+    }
     let mut output = Frame::<(), u32, ()>::new(0);
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -137,7 +197,8 @@ fn tcp_syn_sent_frame<const IS_IP4: bool>(
             }
         }
         if let Some(error) = error {
-            runtime.record_current_node_error(error)
+            runtime
+                .record_current_node_error(error)
                 .expect("TCP SYN-SENT node registers its packet error");
         }
     }
@@ -148,15 +209,18 @@ fn tcp_syn_sent_frame<const IS_IP4: bool>(
         .expect("Session Main initializes before TCP SYN-SENT input");
     let sessions = unsafe { session_main.worker_mut(runtime) }
         .expect("TCP SYN-SENT input runs on its Session worker");
-    let main = crate::TCP_MAIN.get()
+    let main = crate::TCP_MAIN
+        .get()
         .expect("TCP Main initializes before SYN-SENT input");
     sessions.flush_enqueue_events(runtime, main.protocol());
-    if main.worker(runtime.thread_index())
+    if main
+        .worker(runtime.thread_index())
         .expect("SYN-SENT input runs on its TCP worker")
         .handle_postponed_dequeues(runtime, sessions)
         .is_err()
     {
-        runtime.record_current_node_error(crate::TcpNodeError::TimerUpdateFailed)
+        runtime
+            .record_current_node_error(crate::TcpNodeError::TimerUpdateFailed)
             .expect("TCP input owns its timer node error");
     }
     ()
@@ -279,8 +343,11 @@ fn tcp_syn_sent_index<const IS_IP4: bool>(
                 crate::expose_payload(runtime, index, &packet, trim)?;
                 let delivery = sessions.enqueue_rx(runtime, handle, index, offset)?;
                 let requested = packet.payload_len.saturating_sub(trim) as u32;
-                let send_mss = tcp.connections.get(connection_index)
-                    .expect("SYN-ACK input retains its TCP connection").send_mss;
+                let send_mss = tcp
+                    .connections
+                    .get(connection_index)
+                    .expect("SYN-ACK input retains its TCP connection")
+                    .send_mss;
                 *error = Some(crate::payload_node_error(
                     delivery, requested, send_mss, offset,
                 ));
