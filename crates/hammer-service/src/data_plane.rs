@@ -224,6 +224,10 @@ mod tests {
         for process in [DropNode::process as NodeProcessFn, PuntNode::process] {
             let mut indices = [0; 3];
             assert_eq!(runtime.buffer_alloc(&mut indices), 3);
+            for index in indices {
+                *hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque) =
+                    NetworkOpaque::default();
+            }
             runtime.buffer_chain_buffer(indices[0], indices[1]);
             let cached_free = runtime.cached_free_buffers();
             let mut frame = Frame::<(), u32, ()>::new(0);

@@ -925,15 +925,22 @@ if dropped != 0 {
 
 VPP 的 `interface_drop_punt` 按 RX 软件接口分组计数
 （`vnet/interface_output.c:927-1046`），不是 tap RX 的逐包失败
-分类。Hammer 当前 `hammer-service/src/data_plane.rs:97-155` 的
-`drop_node_process` 尚未写该计数；实施时由这个通用 service node
-在释放 frame 前归并同一有效 `NetworkOpaque.sw_if_index[0]` 的包数并写
-`InterfaceSimpleCounter::Drop`。`NetworkOpaque::default()` 将 RX 索引
-置为 `u32::MAX`（`opaque.rs:339-345`）；没有 ingress interface 的本地
-生成包仍须释放，但不访问 counter 列。非哨兵索引必须属于已注册接口，
-否则是 owner 不变量错误。VPP 的 `interface-drop` 与 `interface-punt`
+分类。Hammer `hammer-service/src/data_plane.rs` 的 `drop_node_process`
+现于释放 frame 前归并同一有效 `NetworkOpaque.sw_if_index[0]` 的包数并写
+`InterfaceSimpleCounter::Drop`。显式写入 `NetworkOpaque::default()` 的包将
+RX 索引置为 `u32::MAX`（`opaque.rs:339-345`），释放时不访问接口列；
+新分配 Buffer 的 core opaque 模板虽为零（`hammer-core/src/buffer/opaque.rs`），
+却不是已初始化的 `NetworkOpaque`。网络包的生产者必须在进入 drop 路径前
+明确写入 RX 接口索引，或以 `NetworkOpaque::default()` 标记无 ingress；
+TUN RX 已在入图前完成该写入（`tuntap/src/lib.rs:1104-1108`），对应 VPP
+在 TUN 专用模板中设置 RX 软件接口和 TX `~0`
+（`plugins/tap/tap.c:1019-1025`）。VPP `interface_drop_punt` 直接取已设置的
+RX 索引并计数（`vnet/interface_output.c:992-1037`）。只有生产者明确
+指定 `local0` 时，索引 0 才代表该接口；未初始化的零值不能据此计数。
+非哨兵索引必须属于已注册接口，否则是 owner 不变量错误。VPP 的
+`interface-drop` 与 `interface-punt`
 分别使用 `DROP` 和 `PUNT`（`interface_output.c:927-990`）；Hammer
-`PuntNode` 当前复用同一释放实现，实施时须区分调用者，**不能**给
+`PuntNode` 复用同一释放实现，但已区分调用者，**不会**给
 `PuntNode` 写 Drop。本 ADR 只保留 `Drop` family，不借此引入 `PUNT`
 枚举空洞。node-local
 `buffer.error` 与接口 Drop 是两个不同维度，前者不因接口计数而清除。
@@ -943,8 +950,9 @@ queue 同 worker 累加到同一接口列、跨 worker
 分别落在各自行、单/多片段 RX 字节数、virtio header 不计入 L3 bytes、
 IP 版本不合法时仍计 RX 后转 drop、设备 TX 分类丢包与 no-slot
 互不重复、service output 的 TX 先于设备失败计入、output 提前拒绝
-不计 TX，以及 drop node 只按有效 ingress interface 记一次、本地无
-ingress 包和 punt 不记 Drop。不能只核对
+不计 TX，以及 drop node 只按已初始化的有效 RX 接口记一次、显式
+`u32::MAX` 和 punt 不记 Drop；网络包生产者不得将原始零值 opaque 送入
+drop。不能只核对
 stats 路径存在，还需核对实际 RX/TX/drop 写入点。
 
 ## 6. 验收与公开面
