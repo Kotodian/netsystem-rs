@@ -408,7 +408,7 @@ mod tests {
         });
         hammer_runtime::ThreadMain::new().unwrap();
         let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-        let net = NetMain::init(&mut runtime, Arc::new(InterfaceMain::new()))?;
+        let net = NetMain::init(&mut runtime, Arc::new(InterfaceMain::new()?))?;
         let terminal = hammer_service::data_plane::register_drop(&mut runtime)?;
         let punt_terminal = runtime
             .nodes()

@@ -348,6 +348,8 @@ pub(crate) fn interface_output_template(
         .expect("FeatureMain exists before interface output dispatch");
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut scalars = [TxFrame::default(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut tx_packets = 0u64;
+    let mut tx_bytes = 0u64;
     for (position, &index) in frame.vector_args().iter().enumerate() {
         let error = if !is_up {
             Some(InterfaceOutputError::InterfaceDown)
@@ -363,6 +365,9 @@ pub(crate) fn interface_output_template(
             runtime.buffer_mut(index).set_node_error_index(error_index);
             nexts[position] = 0;
         } else {
+            let buffer = runtime.buffer(index);
+            tx_packets += 1;
+            tx_bytes += (buffer.current_len() + buffer.total_len_not_including_first()) as u64;
             runtime.buffer_mut(index).clear_node_error();
             nexts[position] =
                 features.start_feature_arc(arc_index, sw_if_index, runtime.buffer_mut(index), 1);
@@ -374,6 +379,11 @@ pub(crate) fn interface_output_template(
                     .unwrap_or_default();
             }
         }
+    }
+    if tx_packets != 0 {
+        interfaces
+            .combined_counter(InterfaceCombinedCounter::Tx)
+            .increment(runtime.thread_index(), sw_if_index, tx_packets, tx_bytes);
     }
     runtime.enqueue_to_next_with_scalar(
         node_runtime,
