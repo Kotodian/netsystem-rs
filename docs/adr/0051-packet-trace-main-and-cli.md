@@ -494,11 +494,13 @@ main.register_node_errors(handoff_trace_node, &HANDOFF_TRACE_ERRORS)?;
 `add_trace<T>` 调用者不传第二个 next；接收 Worker 的 handoff 入口与
 直接目标 Frame 必须保留 trace bit 提示。VPP
 `vlib/handoff.c:178-180,389-406` 在生产者标记对应队列范围，在接收者
-创建直接 Frame 时设置 `VLIB_NODE_FLAG_TRACE`。Hammer 的 handoff slot
-持有完整的 Buffer index 列表；接收者在调用现有 `put_frame_to_node`
-前，检查该 slot 是否含已标记 Buffer，给直接 Frame 设置同一 trace 位。
-此位只让目标 Node 进入逐包检查，不在跨线程时复制记录或改写 Buffer
-handle；目标 Node 第一次 `add_trace` 仍创建本 Worker 的 handoff 记录。
+创建直接 Frame 时设置 `VLIB_NODE_FLAG_TRACE`。ADR-0052 的新 handoff
+queue 以 `trace_stop` 记录源 Node trace 位覆盖到的已接受 slot 序号；
+接收者在取得 slot 后比较水位并给直接 Frame 设置 trace 位，**不扫描
+slot 内的 Buffer，也不在 dequeue 创建 handoff trace 记录**。旧的
+`HandoffSlot` 扫描仅描述当前待删除实现，不属于新设计。此位只让目标
+Node 进入逐包检查，不在跨线程时复制记录或改写 Buffer handle；目标
+Node 第一次 `add_trace` 仍创建本 Worker 的 handoff 记录。
 clear 后在途 Buffer 的旧 index 无效时
 返回 None；若新 pool 恰好重用该 index，VPP 明确允许极低概率混入
 （`trace_funcs.h:53-66`）。

@@ -20,6 +20,7 @@ exclude = [
     "netsystem-client",
     "third_party/allocator-api2",
     "third_party/io-uring",
+    "third_party/wide",
 ]
 
 [workspace.package]
@@ -89,3 +90,4 @@ zerocopy = { version = "0.8", features = ["derive"] }
 
 [patch.crates-io]
 io-uring = { path = "third_party/io-uring" }
+wide = { path = "third_party/wide" }
