@@ -5,6 +5,8 @@ Status: proposed
 The `ThreadOwned<T>` and generic main-to-Data-Worker control-path portions of
 this proposal are superseded by ADR-0010. The remaining runtime-authority and
 thread-zero Process design is unchanged.
+The historical `TraceControlPlane`/`DataPlaneTrace` rows below are superseded
+by ADR-0051's per-DataPlaneMain `TraceMain`, source capture, and CLI ownership.
 
 Date: 2026-09-09
 
