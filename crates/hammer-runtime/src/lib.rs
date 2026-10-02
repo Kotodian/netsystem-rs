@@ -97,6 +97,9 @@ mod process;
 pub use error::{RuntimeError, RuntimeResult};
 pub use hammer_infra::hint::unlikely;
 pub use hammer_infra::simd::Simd;
+pub use hammer_stats::{
+    CombinedCounterMain, DirectoryIndex, DirectoryType, NameVector, SimpleCounterMain, StatsMain,
+};
 
 pub mod data_plane;
 pub mod handoff;
