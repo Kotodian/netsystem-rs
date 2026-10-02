@@ -1,6 +1,6 @@
 # ADR-0050: Simple 与 Combined Counter Main
 
-Status: proposed; design only
+Status: accepted; implementation pending verification
 Date: 2026-10-02
 
 ## 1. 决定与源码依据
@@ -19,7 +19,8 @@ VPP 的 counter main。
 （`name == NULL && stat_segment_name == NULL`）真实存在，但 Hammer
 尚无需要它的具体 owner，本 ADR 不伪装已经实现该分支。`new` 传一个确定
 的目录名，不保存两份 `Option<String>`。类型所在层只负责存储与方法，
-对象索引及业务语义仍归调用它的 owner。本文只改 ADR，不改实现代码。
+对象索引及业务语义仍归调用它的 owner。实现由 issue #372 跟踪；
+本 ADR 的 Rust 代码块保留设计契约，不代替源码或验证结果。
 
 以下路径均相对于 `third_party/vpp/src/`。
 
@@ -966,5 +967,6 @@ symlink 消失、family entry 仍在，以及复用 slot 不保留旧 symlink；
 拟议公开面是两个 counter main 及其方法、两个 interface counter 枚举、
 两个 `InterfaceMain` 访问方法和既有 `Counter` 的三个纯值方法；stats
 回调及 symlink 索引均为 service 私有，不新增段内 `*_data` 方法。
-实现这些新 API 前仍须按仓库
-规则批准。本 ADR 不改代码，不运行编译、测试或 CI。
+issue #372 已按本 ADR 接入两个 counter main、接口 family 和 TUN
+RX/TX/drop 写入点；编译、测试与 CI 按本次执行要求未运行，不能将
+上述验收项视为已验证通过。
