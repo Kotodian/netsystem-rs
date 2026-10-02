@@ -5,11 +5,9 @@
 
 pub mod physmem;
 pub mod stats;
-pub mod trace;
 pub mod worker;
 
 pub use stats::StatsConfig;
-pub use trace::{Trace, TraceInput};
 pub use worker::CpuConfig;
 #[cfg(target_os = "linux")]
 pub use worker::WorkerNuma;

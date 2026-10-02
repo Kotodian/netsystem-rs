@@ -21,7 +21,6 @@ crate::__declare_registration_image!(
     ];
     config_functions = [
         config::physmem::__CONFIG_FN_RUNTIME_PHYSMEM_CONFIG,
-        trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG,
         config::worker::__CONFIG_FN_RUNTIME_CPU_CONFIG,
         config::worker::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
@@ -51,7 +50,15 @@ crate::__declare_registration_image!(
         data_plane::buffer_stats::__STATS_COLLECT_REGISTRATION_REGISTER_BUFFER_POOLS,
         node_stats::__STATS_COLLECT_REGISTRATION_REGISTER_NODE_STATS,
     ];
-    cli_commands = [cli::__CLI_COMMAND_SHOW_VERSION, cli::__CLI_COMMAND_WAIT];
+    cli_commands = [
+        cli::__CLI_COMMAND_SHOW_VERSION,
+        cli::__CLI_COMMAND_WAIT,
+        trace::cli::__CLI_COMMAND_TRACE_ADD,
+        trace::cli::__CLI_COMMAND_SHOW_TRACE,
+        trace::cli::__CLI_COMMAND_CLEAR_TRACE,
+        trace::cli::__CLI_COMMAND_SET_TRACE_TIMESTAMP_FORMAT,
+        trace::cli::__CLI_COMMAND_SHOW_TRACE_TIMESTAMP_FORMAT,
+    ];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {
@@ -127,10 +134,7 @@ pub use thread_main::ThreadMain;
 pub use thread_main::interrupt_worker_node;
 pub use thread_main::is_current_worker;
 pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
-pub use trace::{
-    PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
-    TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,
-};
+pub use trace::TraceFormatter;
 pub use unix_main::UnixMain;
 pub mod graph;
 

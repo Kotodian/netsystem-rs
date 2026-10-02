@@ -2480,10 +2480,11 @@ pub fn cli_command(args: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStream2> {
-    if function.sig.asyncness.is_none() || function.sig.inputs.len() != 1 {
+    let synchronous = function.sig.asyncness.is_none();
+    if function.sig.inputs.len() != if synchronous { 2 } else { 1 } {
         return Err(Error::new_spanned(
             &function.sig,
-            "CLI command handlers must be async functions taking exactly one Args value",
+            "CLI handlers take Args, or synchronous &mut DataPlaneMain and Args",
         ));
     }
     let Some(FnArg::Typed(_)) = function.sig.inputs.first() else {
@@ -2503,21 +2504,81 @@ fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStr
     let short_help = &args.short_help;
     let long_help = &args.long_help;
     let mp_safe = &args.mp_safe;
-    Ok(quote! {
-        #function
-
-        fn #starter(
-            _: &mut ::hammer_runtime::DataPlaneMain,
-            input: &str,
-        ) -> Result<
-            ::hammer_runtime::__private::JoinHandle<Result<String, ::hammer_runtime::cli::CliError>>,
-            ::hammer_runtime::cli::CliError,
-        > {
+    let start_body = if synchronous {
+        let Some(FnArg::Typed(main_input)) = function.sig.inputs.first() else {
+            return Err(Error::new_spanned(
+                &function.sig,
+                "synchronous CLI handler requires &mut DataPlaneMain",
+            ));
+        };
+        let Type::Reference(main_reference) = main_input.ty.as_ref() else {
+            return Err(Error::new_spanned(
+                &main_input.ty,
+                "synchronous CLI handler requires &mut DataPlaneMain",
+            ));
+        };
+        if main_reference.mutability.is_none()
+            || !matches!(main_reference.elem.as_ref(), Type::Path(path)
+                if path.path.segments.last().is_some_and(|segment| segment.ident == "DataPlaneMain"))
+        {
+            return Err(Error::new_spanned(
+                &main_input.ty,
+                "synchronous CLI handler requires &mut DataPlaneMain",
+            ));
+        }
+        let unit_output = match &function.sig.output {
+            ReturnType::Type(_, result) => match result.as_ref() {
+                Type::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .filter(|segment| segment.ident == "Result")
+                    .and_then(|segment| match &segment.arguments {
+                        PathArguments::AngleBracketed(arguments) => arguments.args.first(),
+                        _ => None,
+                    })
+                    .is_some_and(|argument| matches!(argument,
+                        GenericArgument::Type(Type::Tuple(tuple)) if tuple.elems.is_empty())),
+                _ => false,
+            },
+            ReturnType::Default => false,
+        };
+        let format_output = if unit_output {
+            quote! {
+                #function_name(runtime, args)?;
+                String::new()
+            }
+        } else {
+            quote! {
+                let output = #function_name(runtime, args)?;
+                format!("{output}")
+            }
+        };
+        quote! {
+            let args: #args_type = input.parse()?;
+            let output = { #format_output };
+            Ok(::hammer_runtime::__private::spawn_local(async move { Ok(output) }))
+        }
+    } else {
+        quote! {
             let args: #args_type = input.parse()?;
             Ok(::hammer_runtime::__private::spawn_local(async move {
                 let output = #function_name(args).await?;
                 Ok(format!("{output}"))
             }))
+        }
+    };
+    Ok(quote! {
+        #function
+
+        fn #starter(
+            runtime: &mut ::hammer_runtime::DataPlaneMain,
+            input: &str,
+        ) -> Result<
+            ::hammer_runtime::__private::JoinHandle<Result<String, ::hammer_runtime::cli::CliError>>,
+            ::hammer_runtime::cli::CliError,
+        > {
+            #start_body
         }
 
         #[doc(hidden)]

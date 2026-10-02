@@ -86,7 +86,7 @@ pub use connection::{
 };
 pub use established::{Tcp4EstablishedNode, Tcp6EstablishedNode, TcpEstablishedNext};
 pub use input::{
-    Tcp4InputNode, Tcp4InputNoLookupNode, Tcp6InputNode, Tcp6InputNoLookupNode, TcpInputTrace,
+    Tcp4InputNode, Tcp4InputNoLookupNode, Tcp6InputNode, Tcp6InputNoLookupNode,
 };
 pub use listen::{Tcp4ListenNode, Tcp6ListenNode, TcpListenNext};
 pub use output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, Tcp4OutputNode, Tcp6OutputNode, TcpOutputNext};
@@ -1617,8 +1617,15 @@ struct TcpRouteOpaque {
     owner_worker: u32,
     connection_index: u32,
     next: u8,
-    present: u8,
+    origin: u8,
     reserved: [u8; 38],
+}
+
+#[repr(u8)]
+enum TcpRouteOrigin {
+    Absent,
+    Session,
+    Listener,
 }
 
 const _: () = assert!(std::mem::size_of::<TcpRouteOpaque>() == 56);
@@ -1631,7 +1638,7 @@ impl Default for TcpRouteOpaque {
             owner_worker: 0,
             connection_index: u32::MAX,
             next: 0,
-            present: 0,
+            origin: TcpRouteOrigin::Absent as u8,
             reserved: [0; 38],
         }
     }
@@ -1735,7 +1742,7 @@ pub(crate) fn write_session_route_opaque(
         owner_worker: owner.slot() as u32,
         connection_index,
         next: next as u8,
-        present: 1,
+        origin: TcpRouteOrigin::Session as u8,
         reserved: [0; 38],
     };
 }
@@ -1744,7 +1751,7 @@ pub(crate) fn write_session_route_opaque(
 pub(crate) fn read_session_route_opaque(
     opaque: &TcpRouteOpaque,
 ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
-    if opaque.present == 0 {
+    if opaque.origin != TcpRouteOrigin::Session as u8 {
         return None;
     }
     Some((

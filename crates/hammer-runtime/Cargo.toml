@@ -27,7 +27,6 @@ async-trait = { workspace = true }
 bitflags = "2.10"
 abi_stable = { workspace = true }
 bytes = { workspace = true }
-bincode = { workspace = true }
 crossbeam-queue = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }

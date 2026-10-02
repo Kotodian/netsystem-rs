@@ -1,9 +1,7 @@
 use hammer_core::data_plane::{BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame};
 use hammer_infra::checksum::internet_checksum;
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{
-    DataPlaneMain, Node, TraceFormatter, add_packet_trace, format_packet_trace, unlikely,
-};
+use hammer_runtime::{DataPlaneMain, Node, TraceFormatter};
 
 use crate::ip::{IpInputError, IpInputTarget, IpProtocol, IpVersion};
 use crate::protocol::ip::{
@@ -14,7 +12,7 @@ use crate::protocol::ip::{
 use crate::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_service::feature::FeatureMain;
 use hammer_service::opaque::NetworkOpaque;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[hammer_component_macros::node_next]
 pub enum Ip4InputNext {
@@ -56,14 +54,34 @@ pub struct Ip4InputNode;
 #[hammer_component_macros::graph_node(graph = ip, kind = internal, name = "ip6-input", next = Ip6InputNext)]
 pub struct Ip6InputNode;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+/// VPP `ip4_input_trace_t` and `ip6_input_trace_t`: packet bytes at Node entry.
+#[repr(C)]
+#[derive(Debug, Clone, KnownLayout, FromBytes, IntoBytes, Immutable)]
 pub struct IpInputTrace {
-    pub version: Option<IpVersion>,
-    pub protocol: Option<IpProtocol>,
-    pub input_target: Option<IpInputTarget>,
-    pub input_error: Option<IpInputError>,
-    pub packet_len: usize,
-    pub next: u16,
+    pub packet_data: [u8; 64],
+}
+
+fn format_ip_input_trace(bytes: &[u8]) -> String {
+    let (trace, _) = IpInputTrace::ref_from_prefix(bytes)
+        .expect("IP input trace has its registered layout");
+    let packet = &trace.packet_data;
+    match packet[0] >> 4 {
+        4 => format!(
+            "ip4 {} -> {} protocol {} length {}",
+            std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+            std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+            packet[9],
+            u16::from_be_bytes([packet[2], packet[3]]),
+        ),
+        6 => format!(
+            "ip6 {} -> {} next-header {} payload-length {}",
+            std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("IP6 source has 16 bytes")),
+            std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("IP6 destination has 16 bytes")),
+            packet[6],
+            u16::from_be_bytes([packet[4], packet[5]]),
+        ),
+        version => format!("ip version {version} (truncated or invalid header)"),
+    }
 }
 
 impl Node for Ip4InputNode {
@@ -78,7 +96,7 @@ impl Node for Ip4InputNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpInputTrace))
+        Some(format_ip_input_trace)
     }
 }
 
@@ -94,7 +112,7 @@ impl Node for Ip6InputNode {
     }
 
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpInputTrace))
+        Some(format_ip_input_trace)
     }
 }
 
@@ -107,6 +125,9 @@ fn ip_input_process_frame(
 ) {
     let count = frame.len();
     let indices = frame.vector_args();
+    if node_runtime.trace_enabled() {
+        runtime.trace_frame_buffers_only::<IpInputTrace>(node_runtime, indices);
+    }
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut errors = [IpInputError::None; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut offset = 0;
@@ -229,10 +250,9 @@ fn process_input_packet(
     packet_error: &mut IpInputError,
 ) -> RuntimeResult<()> {
     let drop_next = input_drop_slot(version);
-    let (traced, classification, ip_ecn) = {
+    let (classification, ip_ecn) = {
         let buffer = runtime.buffer(index);
         (
-            buffer.trace_handle().is_some(),
             match version {
                 IpVersion::V4 => classify_ipv4_input(
                     buffer.current(),
@@ -253,20 +273,6 @@ fn process_input_packet(
     ) = match classification {
         Err(error) => {
             runtime.buffer_mut(index).clear_node_error();
-            if unlikely(traced) {
-                let _ = add_packet_trace!(
-                    runtime,
-                    index,
-                    IpInputTrace {
-                        version: None,
-                        protocol: None,
-                        input_target: None,
-                        input_error: Some(error),
-                        packet_len: 0,
-                        next: drop_next,
-                    },
-                );
-            }
             *next = drop_next;
             *packet_error = error;
             return Ok(());
@@ -297,14 +303,6 @@ fn process_input_packet(
             sw_if_index,
         ));
     }
-    let trace = traced.then_some(IpInputTrace {
-        version: Some(version),
-        protocol: Some(protocol),
-        input_target: Some(input_target),
-        input_error: Some(input_error),
-        packet_len,
-        next: drop_next,
-    });
     let fallback_next = match input_target {
         IpInputTarget::Drop => drop_next,
         IpInputTarget::Punt => match version {
@@ -388,16 +386,6 @@ fn process_input_packet(
     } else {
         fallback_next
     };
-    if let Some(trace) = trace {
-        let _ = add_packet_trace!(
-            runtime,
-            index,
-            IpInputTrace {
-                next: resolved,
-                ..trace
-            },
-        );
-    }
     *next = resolved;
     *packet_error = input_error;
     Ok(())

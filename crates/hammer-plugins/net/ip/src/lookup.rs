@@ -12,7 +12,9 @@ use hammer_core::data_plane::{
     BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext,
 };
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
+use hammer_runtime::{
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult, TraceFormatter, unlikely,
+};
 use hammer_service::net::adj::AdjacencyMain;
 use hammer_service::net::adj_glean::AdjacencyGleanMain;
 use hammer_service::net::adj_nbr::AdjacencyNeighborMain;
@@ -23,7 +25,54 @@ use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol};
 use crate::fib::{Ip4FibTable, Ip6FibTable};
 use crate::interface::IpInterfaceAddressCallback;
 use crate::protocol::ip::{IpProtocol, IpVersion, Ipv4Header, Ipv6Header};
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+// VPP ip4_forward.c:1142-1153 and ip6_forward.c:899-910.
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+struct Ip4LookupTrace {
+    dpo_index: u32,
+    flow_hash: u32,
+    fib_index: u32,
+    packet_data: [u8; 60],
+}
+
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+struct Ip6LookupTrace {
+    dpo_index: u32,
+    flow_hash: u32,
+    fib_index: u32,
+    packet_data: [u8; 124],
+}
+
+pub(crate) fn format_ip4_lookup_trace(bytes: &[u8]) -> String {
+    let (trace, _) = Ip4LookupTrace::ref_from_prefix(bytes)
+        .expect("IP4 lookup trace has its registered layout");
+    let packet = &trace.packet_data;
+    format!(
+        "fib {} dpo-idx {} flow hash: 0x{:08x}\n  ip4 {} -> {}",
+        trace.fib_index,
+        trace.dpo_index,
+        trace.flow_hash,
+        Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+        Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+    )
+}
+
+pub(crate) fn format_ip6_lookup_trace(bytes: &[u8]) -> String {
+    let (trace, _) = Ip6LookupTrace::ref_from_prefix(bytes)
+        .expect("IP6 lookup trace has its registered layout");
+    let packet = &trace.packet_data;
+    format!(
+        "fib {} dpo-idx {} flow hash: 0x{:08x}\n  ip6 {} -> {}",
+        trace.fib_index,
+        trace.dpo_index,
+        trace.flow_hash,
+        Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("IP6 source has 16 bytes")),
+        Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("IP6 destination has 16 bytes")),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct IpInterfaceAddressKey<A> {
@@ -837,6 +886,10 @@ impl Node for Ip4LookupNode {
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip4_lookup_trace)
+    }
 }
 
 impl Node for Ip6LookupNode {
@@ -851,6 +904,10 @@ impl Node for Ip6LookupNode {
 
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip6_lookup_trace)
     }
 }
 
@@ -867,6 +924,10 @@ impl Node for Ip4LoadBalanceNode {
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip4_lookup_trace)
+    }
 }
 
 impl Node for Ip6LoadBalanceNode {
@@ -881,6 +942,87 @@ impl Node for Ip6LoadBalanceNode {
 
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip6_lookup_trace)
+    }
+}
+
+// VPP ip4_forward_next_trace/ip6_forward_next_trace: append only for a
+// Buffer already marked by an input source Node.
+pub(crate) fn trace_lookup_frame(
+    runtime: &mut DataPlaneMain,
+    node: &NodeRuntime,
+    indices: &[u32],
+    version: IpVersion,
+) {
+    if !node.trace_enabled() {
+        return;
+    }
+    let mut offset = 0;
+    while offset + 4 <= indices.len() {
+        runtime.prefetch_header(indices[offset + 2]);
+        runtime.prefetch_header(indices[offset + 3]);
+        trace_lookup_buffer(runtime, node, indices[offset], version);
+        trace_lookup_buffer(runtime, node, indices[offset + 1], version);
+        offset += 2;
+    }
+    while offset < indices.len() {
+        trace_lookup_buffer(runtime, node, indices[offset], version);
+        offset += 1;
+    }
+}
+
+#[inline(always)]
+fn trace_lookup_buffer(runtime: &mut DataPlaneMain, node: &NodeRuntime, index: u32, version: IpVersion) {
+    if unlikely(runtime.buffer(index).trace_handle().is_some()) {
+        let (dpo_index, flow_hash, fib_index, packet_ptr, copy_len) = {
+            let buffer = runtime.buffer(index);
+            let lookup = &hammer_core::buffer_opaque!(buffer => IpSecondaryOpaque).lookup;
+            let packet = buffer.current();
+            (
+                lookup.forwarding.index(),
+                lookup.flow_hash,
+                lookup.fib_index,
+                packet.as_ptr(),
+                packet.len(),
+            )
+        };
+        match version {
+            IpVersion::V4 => {
+                if let Some(trace) = runtime.add_trace::<Ip4LookupTrace>(node, index) {
+                    trace.dpo_index = dpo_index;
+                    trace.flow_hash = flow_hash;
+                    trace.fib_index = fib_index;
+                    // SAFETY: add_trace changes the trace pool and handle,
+                    // not the allocated packet bytes. Pools do not overlap.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            packet_ptr,
+                            trace.packet_data.as_mut_ptr(),
+                            copy_len.min(trace.packet_data.len()),
+                        );
+                    }
+                }
+            }
+            IpVersion::V6 => {
+                if let Some(trace) = runtime.add_trace::<Ip6LookupTrace>(node, index) {
+                    trace.dpo_index = dpo_index;
+                    trace.flow_hash = flow_hash;
+                    trace.fib_index = fib_index;
+                    // SAFETY: the Buffer remains allocated through this
+                    // Node, and the trace pool owns separate storage.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            packet_ptr,
+                            trace.packet_data.as_mut_ptr(),
+                            copy_len.min(trace.packet_data.len()),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -925,6 +1067,7 @@ fn process_lookup_frame(
     if offset < count {
         nexts[offset] = lookup_index(runtime, indices[offset], version);
     }
+    trace_lookup_frame(runtime, node_runtime, indices, version);
     runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
 }
 
@@ -1218,6 +1361,7 @@ fn process_load_balance_frame(
     if offset < count {
         nexts[offset] = load_balance_index(runtime, indices[offset], version);
     }
+    trace_lookup_frame(runtime, node_runtime, indices, version);
     runtime.enqueue_to_next(node_runtime, frame, &nexts[..count]);
 }
 

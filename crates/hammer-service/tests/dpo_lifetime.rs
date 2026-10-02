@@ -97,6 +97,7 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
             None,
             &[],
             None,
+            false,
         ),
     )?;
     let output_class = net.register_dpo(

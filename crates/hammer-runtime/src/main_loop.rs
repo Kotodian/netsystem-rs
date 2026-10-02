@@ -179,6 +179,7 @@ where
             global.node_registrations.iter().copied(),
             global.node_function_registrations.iter().copied(),
         )?;
+        main.borrow_mut().start_main_loop_trace_clock();
         crate::init::run_main_loop_enter(global, &mut main.borrow_mut())?;
 
         // VPP applies post-worker configuration while the worker barrier is
@@ -242,26 +243,38 @@ where
 /// 5. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
 /// 6. Dispatch timer nodes (no timer wheel in data-plane yet)
 /// 7. Advance timers, increment the thread's main-loop counter and check exit
-pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i32 {
-    main.attach_worker_interrupt_thread();
+pub fn data_plane_main_loop(worker: &crate::WorkerThread, idle_slice: Duration) -> i32 {
+    // SAFETY: this is the owning Worker, before the first barrier check.
+    unsafe { crate::ThreadMain::global().worker_main_on_worker(worker) }
+        .attach_worker_interrupt_thread();
     let file_poll = crate::config::worker::file_poll();
 
     loop {
-        let mut progress = false;
-        // VPP vlib/main.h:426-431 resets this worker's maximum each round.
-        main.max_internal_frame_vectors = 0;
-
-        // Step 1: Barrier check — VPP threads.c:296
-        if let Some(barrier) = crate::barrier::global()
+        // The preceding iteration's mutable main borrow has ended before
+        // this VPP worker-barrier acknowledgement.
+        let barrier = crate::barrier::global();
+        let refork_required = if let Some(barrier) = &barrier
             && barrier.is_pending()
-            && barrier.check_for_refork()
         {
+            barrier.check_for_refork()
+        } else {
+            false
+        };
+        // SAFETY: the barrier check has returned and only this Worker borrows
+        // its main until the end of this loop iteration.
+        let main = unsafe { crate::ThreadMain::global().worker_main_on_worker(worker) };
+        if refork_required {
+            let barrier = barrier.expect("refork requires an installed barrier");
             barrier.refork(&mut main.nodes);
             if let Err(error) = main.select_node_functions() {
                 tracing::error!(worker = main.thread_index(), %error, "Node Function selection failed");
                 return 1;
             }
         }
+
+        let mut progress = false;
+        // VPP vlib/main.h:426-431 resets this worker's maximum each round.
+        main.max_internal_frame_vectors = 0;
 
         // VPP `main.c:1519`: one timestamp per iteration; every dispatch in
         // this iteration measures from it or from the previous dispatch's end.

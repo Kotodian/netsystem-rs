@@ -4,6 +4,10 @@ Status: implemented; validation deferred by issue #370
 
 ## 1. 结论和 VPP 依据
 
+ADR-0051 adds a narrow synchronous `fn(&mut DataPlaneMain, Args)` command
+form for non-MP-safe main-aware commands. The async Args-only form below remains
+the default for commands that do not borrow the main during execution.
+
 `CliMain` 是独立、非泛型的命令目录。`static` 只发布这个具体目录，不发布
 `CliMain<T>`。每条命令的 `Args` 从 path 后的 `&str` 解析为拥有型结构体；
 handler 只接收 `Args`，返回实现 `Display` 的输出值，不接收连接、输出句柄

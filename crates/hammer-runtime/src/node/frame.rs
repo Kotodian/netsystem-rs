@@ -19,6 +19,13 @@ pub(super) struct NextFrame {
 }
 
 impl NodeMain {
+    /// VPP `vlib_trace_next_frame`: mark the destination Frame as possibly traced.
+    #[inline(always)]
+    pub(crate) fn trace_next_frame(&mut self, source: NodeId, next: u16) {
+        let index = self.prepare_next_frame(source, u32::from(next));
+        self.next_frames[index].flags |= 1 << 5;
+    }
+
     pub(super) fn next_frames_for_graph(
         graph: &NodeRuntimeInner,
     ) -> (Vec<NextFrame>, Vec<Vec<usize>>) {
@@ -284,6 +291,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-output", 0)),
                     &[],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -296,6 +304,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-input", 1)),
                     &[output],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -314,6 +323,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-auxiliary", 0)),
                     &[],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -328,6 +338,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-idle", 1)),
                     &[output],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -374,6 +385,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-punt", 0)),
                     &[],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -527,6 +539,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-output", 0)),
                     &[],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -540,6 +553,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-input", 1)),
                     &[output],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -553,6 +567,7 @@ mod tests {
                     Some(NodeRegistration::next("packet-receive", 1)),
                     &[output],
                     None,
+                    false,
                 ),
             )
             .unwrap();

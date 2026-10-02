@@ -25,6 +25,15 @@ impl DataPlaneMain {
             {
                 *destination = index;
             }
+            // VPP handoff.c marks the direct destination Frame when its
+            // transferred slot may contain a traced Buffer.
+            if frame
+                .vector_args()
+                .iter()
+                .any(|&index| self.buffer(index).trace_handle().is_some())
+            {
+                frame.frame_flags |= 1 << 5;
+            }
             self.put_frame_to_node(handoff_frame.target, frame)
                 .expect("queued handoff target accepts its Frame");
         }
@@ -145,7 +154,7 @@ mod tests {
             .nodes()
             .try_register_descriptor(
                 NodeKind::Internal,
-                NodeDescriptor::new(local_input, NodeRuntime::empty(), None, &[], None),
+                NodeDescriptor::new(local_input, NodeRuntime::empty(), None, &[], None, false),
             )
             .unwrap();
         let target = source
@@ -158,6 +167,7 @@ mod tests {
                     None,
                     &[],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -165,10 +175,8 @@ mod tests {
         let mut source =
             DataPlaneMain::attach_handoff_worker(source, handoff.worker(DataWorkerId::new(0)));
         let receiver = handoff.worker(DataWorkerId::new(1));
-        let (nodes, simd_bytes, _, trace_control) = source.worker_parts();
-        let mut receiver =
-            DataPlaneMain::new_worker(nodes, simd_bytes, Some(receiver), trace_control, 2, 0)
-                .unwrap();
+        let (nodes, _) = source.worker_parts();
+        let mut receiver = DataPlaneMain::new_worker(&source, nodes, Some(receiver), 2, 0).unwrap();
 
         let destination = DataWorkerId::new(1);
         let mut frame = Frame::<(), u32, ()>::new(0);

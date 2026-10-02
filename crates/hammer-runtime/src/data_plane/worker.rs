@@ -130,27 +130,14 @@ impl DataPlaneMain {
 }
 
 impl DataPlaneMain {
-    pub(crate) fn worker_parts(
-        &self,
-    ) -> (
-        NodeMain,
-        usize,
-        Option<DataPlaneHandoffWorker>,
-        Option<TraceControlHandle>,
-    ) {
-        (
-            self.nodes.clone(),
-            self.simd_bytes,
-            self.handoff.clone(),
-            self.trace.control(),
-        )
+    pub(crate) fn worker_parts(&self) -> (NodeMain, Option<DataPlaneHandoffWorker>) {
+        (self.nodes.clone(), self.handoff.clone())
     }
 
     pub(crate) fn new_worker(
+        source: &Self,
         nodes: NodeMain,
-        simd_bytes: usize,
         handoff: Option<DataPlaneHandoffWorker>,
-        trace_control: Option<TraceControlHandle>,
         thread_index: u32,
         numa_node: u32,
     ) -> RuntimeResult<Self> {
@@ -160,24 +147,21 @@ impl DataPlaneMain {
                 active_numa_node: numa_node,
                 ..Default::default()
             },
-            simd_bytes,
+            source.simd_bytes,
         )?;
         runtime.nodes = nodes;
         runtime.handoff = handoff;
-        runtime.trace.set_control(trace_control);
+        runtime.handoff_trace_node = source.handoff_trace_node;
+        runtime.main_loop_start_ticks = source.main_loop_start_ticks;
+        runtime.seconds_per_cpu_tick = source.seconds_per_cpu_tick;
+        runtime.cpu_reference_ticks = source.cpu_reference_ticks;
+        runtime.unix_reference_seconds = source.unix_reference_seconds;
         Ok(runtime)
     }
 
     pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> RuntimeResult<Self> {
-        let (nodes, simd_bytes, handoff, trace_control) = self.worker_parts();
-        Self::new_worker(
-            nodes,
-            simd_bytes,
-            handoff,
-            trace_control,
-            thread_index,
-            numa_node,
-        )
+        let (nodes, handoff) = self.worker_parts();
+        Self::new_worker(self, nodes, handoff, thread_index, numa_node)
     }
 
     #[inline]

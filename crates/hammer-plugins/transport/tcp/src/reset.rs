@@ -2,10 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::{TcpCapabilities, TcpSegmentFlags, tcp_header};
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult, TraceFormatter};
 use hammer_service::opaque::{NetworkFlags, NetworkOpaque};
 
-use super::output::{tcp_output_push_ipv4, tcp_output_push_ipv6};
+use super::output::{
+    TcpOutputTrace, format_tcp_output_trace, tcp_output_push_ipv4, tcp_output_push_ipv6,
+};
 use super::segment::TcpSegment;
 
 #[hammer_component_macros::node_next]
@@ -57,6 +59,10 @@ impl Node for Tcp4ResetNode {
         let process: NodeProcessFn = tcp_reset_process::<true>;
         process(runtime, node_runtime, frame)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_output_trace)
+    }
 }
 
 impl Node for Tcp6ResetNode {
@@ -69,6 +75,10 @@ impl Node for Tcp6ResetNode {
         let process: NodeProcessFn = tcp_reset_process::<false>;
         process(runtime, node_runtime, frame)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_output_trace)
+    }
 }
 
 fn tcp_reset_process<const IS_IP4: bool>(
@@ -77,8 +87,42 @@ fn tcp_reset_process<const IS_IP4: bool>(
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
+    let trace_enabled = hammer_runtime::unlikely(node_runtime.trace_enabled());
     hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        tcp_reset_next_for_index::<IS_IP4>(runtime, index).unwrap_or(TcpResetNext::Drop)
+        let next = tcp_reset_next_for_index::<IS_IP4>(runtime, index)
+            .unwrap_or(TcpResetNext::Drop);
+        // VPP tcp_output.c:2502-2549 records the completed RST after its
+        // TCP and IP headers have been constructed, before next enqueue.
+        if trace_enabled
+            && matches!(next, TcpResetNext::Lookup)
+            && hammer_runtime::unlikely(runtime.buffer(index).trace_handle().is_some())
+        {
+            let (header_ptr, header_len) = {
+                let buffer = runtime.buffer(index);
+                let cursor = hammer_core::buffer_opaque!(buffer => NetworkOpaque).packet_cursor();
+                let header = buffer
+                    .current()
+                    .get(cursor.transport_header_offset()..)
+                    .unwrap_or(&[]);
+                (header.as_ptr(), header.len().min(core::mem::size_of::<crate::TcpHeader>()))
+            };
+            if let Some(trace) = runtime.add_trace::<TcpOutputTrace>(node_runtime, index) {
+                trace.connection_index = u32::MAX;
+                trace.has_connection = 0;
+                trace.header_len = u8::try_from(header_len)
+                    .expect("TCP base header length fits u8");
+                // SAFETY: add_trace mutates the trace pool/Buffer handle;
+                // the completed reset packet remains live in disjoint storage.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        header_ptr,
+                        trace.tcp_header.as_mut_ptr(),
+                        header_len,
+                    );
+                }
+            }
+        }
+        next
     });
     processed_vectors
 }

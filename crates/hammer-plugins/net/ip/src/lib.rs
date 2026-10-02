@@ -145,8 +145,8 @@ pub use interface::{
 pub use ip::{
     Ip4InputNext, Ip4InputNode, Ip4LocalNext, Ip4LocalNode, Ip4ReassemblyNext, Ip4ReassemblyNode,
     Ip4ReceiveNode, Ip6InputNext, Ip6InputNode, Ip6LocalNext, Ip6LocalNode, Ip6ReassemblyNext,
-    Ip6ReassemblyNode, Ip6ReceiveNode, IpInputTrace, IpLocalError, IpLocalTrace, IpLocalTraceStage,
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyTrace, IpReassemblyTraceAction,
+    Ip6ReassemblyNode, Ip6ReceiveNode, IpInputTrace, IpLocalError,
+    IpReassemblyDirectory, IpReassemblyHandoff,
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use ip::{IpPathFlags, IpRoutePathBehavior};

@@ -144,6 +144,29 @@ impl<T> Pool<T> {
         Some(value)
     }
 
+    /// Drops all occupied values and restores the pool's initial index state.
+    ///
+    /// Dynamic pools restart at index zero. Fixed pools keep their reservation
+    /// and make every slot available again. Backing capacity is retained.
+    pub fn clear(&mut self) {
+        for position in 0..self.vector.len() {
+            let index = position as u32;
+            if self.contains_key(index) {
+                drop(self.remove(index));
+            }
+        }
+
+        self.opaque = 0;
+        if let Some(max_elts) = self.max_elts {
+            self.free_indices.clear();
+            self.free_indices.extend((0..max_elts).rev());
+        } else {
+            self.vector.clear();
+            self.free_bitmap.clear_all();
+            self.free_indices.clear();
+        }
+    }
+
     /// Returns whether `index` currently refers to an initialized value.
     #[inline]
     pub fn contains_key(&self, index: u32) -> bool {

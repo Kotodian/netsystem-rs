@@ -50,9 +50,8 @@ const _: () = {
     assert!(core::mem::offset_of!(WorkerThread, loops_per_second) % CACHE_LINE == 0);
 };
 
-// SAFETY: node_interrupts is installed before worker launch. join_handle has
-// one main-thread writer; its release-ready flag gates every concurrent read.
-// Neither allocation changes after publication.
+// SAFETY: node_interrupts are installed before worker launch. join_handle has
+// one main-thread writer and its release-ready flag gates concurrent reads.
 unsafe impl Sync for WorkerThread {}
 
 impl WorkerThread {
@@ -197,17 +196,15 @@ impl WorkerThread {
             == std::thread::current().id()
     }
 
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
     pub(crate) fn launch(
         &self,
-        main: Option<Box<crate::DataPlaneMain>>,
         init_functions: Arc<[&'static crate::init::InitFunction]>,
     ) -> RuntimeResult<()> {
         assert_ne!(self.thread_index, 0);
-        assert_eq!(
-            main.is_none(),
-            self.no_data_structure_clone,
-            "no-data-structure-clone registration controls DataPlaneMain ownership"
-        );
         assert!(
             unsafe { &*self.join_handle.get() }.is_none(),
             "WorkerThread launches once"
@@ -251,21 +248,31 @@ impl WorkerThread {
                     return Ok(());
                 }
 
-                let Some(mut main) = main else {
+                let descriptor = crate::ThreadMain::global()
+                    .thread_by_index(thread_index)
+                    .expect("launched Worker has a descriptor");
+                if descriptor.no_data_structure_clone {
                     assert!(
                         !refork_required,
                         "a no-data-structure-clone thread cannot refork a graph"
                     );
                     return entry(thread_index);
-                };
-                if refork_required {
-                    barrier.refork(&mut main.nodes);
                 }
-                main.select_architecture_functions(
-                    cfg!(target_os = "linux") && cpu_index.is_some(),
-                )?;
-                crate::init::run_worker_init_functions(&mut main, &init_functions)?;
-                let exit_status = crate::main_loop::data_plane_main_loop(&mut main, idle_slice);
+                {
+                    // SAFETY: startup barrier has released; only this Worker
+                    // accesses its main until the next barrier check.
+                    let main = unsafe {
+                        crate::ThreadMain::global().worker_main_on_worker(descriptor)
+                    };
+                    if refork_required {
+                        barrier.refork(&mut main.nodes);
+                    }
+                    main.select_architecture_functions(
+                        cfg!(target_os = "linux") && cpu_index.is_some(),
+                    )?;
+                    crate::init::run_worker_init_functions(main, &init_functions)?;
+                }
+                let exit_status = crate::main_loop::data_plane_main_loop(descriptor, idle_slice);
                 if exit_status == 0 {
                     Ok(())
                 } else {

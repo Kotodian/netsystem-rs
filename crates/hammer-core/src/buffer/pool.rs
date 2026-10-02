@@ -318,14 +318,13 @@ impl BufferMain {
         caches: &mut [RefMut<'_, BufferThreadCache>],
         indices: &[u32],
         follow_next: bool,
-        mut release_trace: impl FnMut(u32),
     ) {
         self.validate_caches(caches);
         for &index in indices {
             let mut current = Some(index);
             while let Some(index) = current {
                 let pool = self.pool(index);
-                let trace = {
+                {
                     let cache = &mut caches[usize::from(pool.index)];
                     // SAFETY: the caller retains this live segment until the
                     // reference decrement transfers its last release obligation.
@@ -342,12 +341,9 @@ impl BufferMain {
                         .cacheline0
                         .ref_count
                         .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                    if references != 1 {
-                        None
-                    } else {
+                    if references == 1 {
                         // SAFETY: this decrement observed the final reference.
                         let buffer = unsafe { pool.buffer_mut(index) };
-                        let trace = buffer.take_trace_handle();
                         buffer.cacheline0 = pool.template.clone();
                         #[cfg(debug_assertions)]
                         assert!(
@@ -373,13 +369,7 @@ impl BufferMain {
                             u32::try_from(cached + 1).expect("a cache length fits u32"),
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        trace
                     }
-                };
-                // Trace finalization may call into runtime state; never invoke it
-                // while holding the Pool lock or a mutable reference to a cache entry.
-                if let Some(trace) = trace {
-                    release_trace(trace);
                 }
             }
         }

@@ -96,10 +96,10 @@ pub(crate) enum IpControlError {
 pub use input::{Ip4InputNext, Ip4InputNode, Ip6InputNext, Ip6InputNode, IpInputTrace};
 pub use local::{
     Ip4LocalNext, Ip4LocalNode, Ip4ReceiveNode, Ip6LocalNext, Ip6LocalNode, Ip6ReceiveNode,
-    IpLocalError, IpLocalTrace, IpLocalTraceStage,
+    IpLocalError,
 };
 pub use reassembly::{
     Ip4ReassemblyNext, Ip4ReassemblyNode, Ip6ReassemblyNext, Ip6ReassemblyNode,
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyTrace, IpReassemblyTraceAction,
+    IpReassemblyDirectory, IpReassemblyHandoff,
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };

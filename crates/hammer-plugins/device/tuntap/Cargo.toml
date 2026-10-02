@@ -27,3 +27,4 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 wide = "1.7"
+zerocopy = "0.8.48"

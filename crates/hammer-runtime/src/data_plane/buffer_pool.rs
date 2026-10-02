@@ -7,7 +7,9 @@ impl DataPlaneMain {
 
     #[inline]
     pub fn try_new(config: DataPlaneBufferConfig) -> RuntimeResult<Self> {
-        Self::from_config(config, native_simd_bytes())
+        let mut main = Self::from_config(config, native_simd_bytes())?;
+        main.initialize_trace_clock();
+        Ok(main)
     }
 
     #[inline]
@@ -19,6 +21,11 @@ impl DataPlaneMain {
     }
 
     pub fn new_main(threads: &crate::ThreadMain) -> RuntimeResult<Self> {
+        let thread_count = usize::try_from(threads.worker_count())
+            .expect("configured worker count fits usize") + 1;
+        if thread_count > crate::trace::TRACE_THREAD_LIMIT as usize {
+            return Err(RuntimeError::TraceThreadCapacity { count: thread_count });
+        }
         let buffer = crate::config::worker::buffer();
         let physmem = crate::config::physmem::physmem();
         let mut numa_nodes = (1..=threads.worker_count())
@@ -106,6 +113,7 @@ impl DataPlaneMain {
             native_simd_bytes(),
             main_file_mode,
         )?;
+        main.initialize_trace_clock();
         main.nodes.process_runtime = Some(process_runtime);
         Ok(main)
     }
@@ -131,7 +139,12 @@ impl DataPlaneMain {
             current_node: Cell::new(None),
             node_error_stats_entry_index: Cell::new(None),
             handoff: None,
-            trace: DataPlaneTrace::default(),
+            trace_main: TraceMain::default(),
+            handoff_trace_node: NodeId::new(0),
+            main_loop_start_ticks: 0,
+            seconds_per_cpu_tick: 0.0,
+            cpu_reference_ticks: 0,
+            unix_reference_seconds: 0.0,
             simd_bytes,
             cpu_pinned: false,
             enqueue_next: crate::graph::fanout::enqueue_next_base,
@@ -352,17 +365,13 @@ impl DataPlaneMain {
     pub fn buffer_free(&mut self, indices: &[u32]) {
         let mut caches = self.borrow_buffer_caches();
         let main = hammer_core::buffer::BufferMain::global();
-        main.free_buffers(&mut caches, indices, true, |handle| {
-            self.trace.finalize(handle)
-        });
+        main.free_buffers(&mut caches, indices, true);
     }
 
     pub fn buffer_free_no_next(&mut self, indices: &[u32]) {
         let mut caches = self.borrow_buffer_caches();
         let main = hammer_core::buffer::BufferMain::global();
-        main.free_buffers(&mut caches, indices, false, |handle| {
-            self.trace.finalize(handle)
-        });
+        main.free_buffers(&mut caches, indices, false);
     }
 
     pub fn buffer_free_one(&mut self, index: u32) {

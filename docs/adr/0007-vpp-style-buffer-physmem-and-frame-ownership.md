@@ -2,6 +2,10 @@
 
 Status: accepted
 
+Trace lifecycle references below are historical. ADR-0051 supersedes Buffer
+free trace finalization: records live in each DataPlaneMain trace pool until
+`clear trace`; Buffer release does not finalize them.
+
 Date: 2026-09-07
 
 Hammer will replace its generational packet-pool identity, guarded Buffer

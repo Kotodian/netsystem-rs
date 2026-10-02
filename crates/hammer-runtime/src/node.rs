@@ -96,6 +96,11 @@ pub trait Node {
     }
 
     #[inline]
+    fn trace_supported(&self) -> bool {
+        false
+    }
+
+    #[inline]
     fn node_descriptor(&self) -> RuntimeResult<NodeDescriptor<'_>>
     where
         Self: Sized,
@@ -106,16 +111,25 @@ pub trait Node {
             registration: Node::node_registration(self),
             initial_nexts: self.node_initial_nexts(),
             trace_formatter: self.node_trace_formatter(),
+            trace_supported: self.trace_supported(),
             frame_args_size: (0, 4, 0),
         })
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeRuntime {
     words: [u64; 4],
     cached_next_index: u32,
     flags: u16,
+    node_index: NodeId,
+}
+
+impl Default for NodeRuntime {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl NodeRuntime {
@@ -130,7 +144,19 @@ impl NodeRuntime {
             words,
             cached_next_index: 0,
             flags: 0,
+            node_index: NodeId::new(0),
         }
+    }
+
+    #[inline(always)]
+    pub const fn node_index(&self) -> NodeId {
+        self.node_index
+    }
+
+    /// VPP `VLIB_NODE_FLAG_TRACE`: this Frame may contain traced Buffers.
+    #[inline(always)]
+    pub const fn trace_enabled(&self) -> bool {
+        self.flags & (1 << 5) != 0
     }
 
     #[inline]
@@ -260,6 +286,7 @@ pub struct NodeDescriptor<'a> {
     registration: Option<NodeRegistration>,
     initial_nexts: &'a [NodeId],
     trace_formatter: Option<TraceFormatter>,
+    trace_supported: bool,
     frame_args_size: (u16, u16, u16),
 }
 
@@ -271,6 +298,7 @@ impl<'a> NodeDescriptor<'a> {
         registration: Option<NodeRegistration>,
         initial_nexts: &'a [NodeId],
         trace_formatter: Option<TraceFormatter>,
+        trace_supported: bool,
     ) -> Self {
         Self {
             process,
@@ -278,6 +306,7 @@ impl<'a> NodeDescriptor<'a> {
             registration,
             initial_nexts,
             trace_formatter,
+            trace_supported,
             frame_args_size: (0, 4, 0),
         }
     }
@@ -588,6 +617,7 @@ struct NodeRuntimeSlot {
     declared_process: NodeFunction,
     frame_args_size: (u16, u16, u16),
     runtime_data: Option<NodeRuntime>,
+    trace_supported: bool,
 }
 
 impl Copy for NodeRuntimeSlot {}
@@ -737,8 +767,11 @@ impl NodeRuntimeInner {
         Ok(NodeErrorIndex::new(column).expect("a registered column is non-zero"))
     }
 
-    fn push_node_slot(&mut self, slot: NodeRuntimeSlot) -> NodeId {
+    fn push_node_slot(&mut self, mut slot: NodeRuntimeSlot) -> NodeId {
         let id = NodeId::new(u32::try_from(self.nodes.len()).expect("node index fits u32"));
+        if let Some(runtime_data) = slot.runtime_data.as_mut() {
+            runtime_data.node_index = id;
+        }
         self.nodes.push(slot);
         self.node_states.push(NodeState::Polling);
         self.interrupt_pending.push(false);
@@ -758,6 +791,7 @@ impl NodeRuntimeInner {
         kind: NodeKind,
         process: NodeProcessFn,
         runtime_data: NodeRuntime,
+        trace_supported: bool,
     ) -> NodeId {
         self.push_node_slot(NodeRuntimeSlot {
             kind,
@@ -765,6 +799,7 @@ impl NodeRuntimeInner {
             declared_process: process,
             frame_args_size: (0, 4, 0),
             runtime_data: Some(runtime_data),
+            trace_supported,
         })
     }
 
@@ -776,6 +811,7 @@ impl NodeRuntimeInner {
         registration: Option<NodeRegistration>,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
+        trace_supported: bool,
         handle: Option<NodeHandle>,
         next_names: Option<&[&'static str]>,
     ) -> RuntimeResult<NodeId> {
@@ -834,7 +870,7 @@ impl NodeRuntimeInner {
 
         match registration {
             None => {
-                let id = self.push_function_node(kind, process, runtime_data);
+                let id = self.push_function_node(kind, process, runtime_data, trace_supported);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 if let Some(handle) = handle {
                     self.handles.insert(handle, id);
@@ -842,7 +878,7 @@ impl NodeRuntimeInner {
                 Ok(id)
             }
             Some(NodeRegistration::Next { name, next_count }) => {
-                let id = self.push_function_node(kind, process, runtime_data);
+                let id = self.push_function_node(kind, process, runtime_data, trace_supported);
                 self.node_names[id.slot() as usize] = Some(name);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 if let Some(next_names) = next_names {
@@ -877,7 +913,7 @@ impl NodeRuntimeInner {
                     .get(owner.slot() as usize)
                     .cloned()
                     .ok_or(RuntimeError::NodeNotRegistered { node: owner })?;
-                let id = self.push_function_node(kind, process, runtime_data);
+                let id = self.push_function_node(kind, process, runtime_data, trace_supported);
                 self.node_names[id.slot() as usize] = Some(name);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 self.next_nodes[id.slot() as usize] = owner_nexts;
@@ -1443,6 +1479,7 @@ impl NodeMain {
                 DriverNode::node_registration(&node),
                 DriverNode::node_initial_nexts(&node),
                 node.node_trace_formatter(),
+                node.trace_supported(),
             ),
         )
     }
@@ -1463,6 +1500,7 @@ impl NodeMain {
                 DriverNode::node_registration(&node),
                 DriverNode::node_initial_nexts(&node),
                 node.node_trace_formatter(),
+                node.trace_supported(),
             ),
         )
     }
@@ -1495,6 +1533,7 @@ impl NodeMain {
                 InternalNode::node_registration(&node),
                 InternalNode::node_initial_nexts(&node),
                 node.node_trace_formatter(),
+                node.trace_supported(),
             ),
         )
     }
@@ -1513,6 +1552,7 @@ impl NodeMain {
                 Some(NodeRegistration::next(name, 0)),
                 &[],
                 None,
+                false,
             ),
         )?;
         self.set_node_state(node, NodeState::Disabled)?;
@@ -1536,6 +1576,7 @@ impl NodeMain {
                 InternalNode::node_registration(&node),
                 InternalNode::node_initial_nexts(&node),
                 node.node_trace_formatter(),
+                node.trace_supported(),
             ),
         )
     }
@@ -1605,7 +1646,10 @@ impl NodeMain {
         inner.node_names[slot] = Some(name);
         inner.node_trace_formatters[slot] = descriptor.trace_formatter;
         inner.nodes[slot].process = descriptor.process;
-        inner.nodes[slot].runtime_data = Some(descriptor.runtime_data);
+        let mut runtime_data = descriptor.runtime_data;
+        runtime_data.node_index = node;
+        inner.nodes[slot].runtime_data = Some(runtime_data);
+        inner.nodes[slot].trace_supported = descriptor.trace_supported;
         inner.nodes[slot].frame_args_size = descriptor.frame_args_size;
         drop(inner);
 
@@ -1629,6 +1673,7 @@ impl NodeMain {
             descriptor.registration,
             descriptor.initial_nexts,
             descriptor.trace_formatter,
+            descriptor.trace_supported,
         )?;
         self.inner.borrow_mut().nodes[node.slot() as usize].frame_args_size =
             descriptor.frame_args_size;
@@ -1653,6 +1698,7 @@ impl NodeMain {
             descriptor.registration,
             descriptor.initial_nexts,
             descriptor.trace_formatter,
+            descriptor.trace_supported,
             Some(handle),
             None,
         )?;
@@ -1668,6 +1714,7 @@ impl NodeMain {
         registration: Option<NodeRegistration>,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
+        trace_supported: bool,
     ) -> RuntimeResult<NodeId> {
         self.ensure_topology_owner()?;
         let mut inner = self.inner.borrow_mut();
@@ -1678,6 +1725,7 @@ impl NodeMain {
             registration,
             initial_nexts,
             trace_formatter,
+            trace_supported,
             None,
             None,
         )
@@ -1702,6 +1750,7 @@ impl NodeMain {
             InternalNode::node_registration(&node),
             &[],
             node.node_trace_formatter(),
+            node.trace_supported(),
             None,
             Some(next_names),
         )
@@ -1726,6 +1775,7 @@ impl NodeMain {
             DriverNode::node_registration(&node),
             &[],
             node.node_trace_formatter(),
+            node.trace_supported(),
             None,
             Some(next_names),
         )
@@ -1749,6 +1799,7 @@ impl NodeMain {
             DriverNode::node_registration(&node),
             &[],
             node.node_trace_formatter(),
+            node.trace_supported(),
             None,
             Some(next_names),
         )
@@ -1894,10 +1945,11 @@ impl NodeMain {
     pub(crate) fn set_node_runtime_data(
         &self,
         node: NodeId,
-        runtime_data: NodeRuntime,
+        mut runtime_data: NodeRuntime,
     ) -> RuntimeResult<()> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
+        runtime_data.node_index = node;
         *inner.nodes[node.slot() as usize]
             .runtime_data
             .as_mut()
@@ -1971,6 +2023,13 @@ impl NodeMain {
             .get(node.slot() as usize)
             .copied()
             .flatten())
+    }
+
+    #[inline]
+    pub fn node_trace_supported(&self, node: NodeId) -> RuntimeResult<bool> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.nodes[node.slot() as usize].trace_supported)
     }
 
     pub fn ready(&self) -> NodeRuntimeReady<'_> {
@@ -2135,6 +2194,7 @@ impl NodeMain {
                     .take()
                     .expect("Node runtime has one active invocation"),
             ),
+            trace_supported: slot.trace_supported,
         })
     }
 
@@ -2202,7 +2262,7 @@ mod tests {
         frame.set_vector_count(2);
         frame.vector_args_mut().copy_from_slice(&[11, 17]);
         frame.aux_args_mut().unwrap().copy_from_slice(&[3, 5]);
-        *state = NodeRuntime::from_words([
+        state.words = [
             *frame.scalar_args().unwrap(),
             frame
                 .vector_args()
@@ -2216,7 +2276,7 @@ mod tests {
                 .map(|next| u64::from(*next))
                 .sum(),
             frame.len() as u64,
-        ]);
+        ];
         frame.len()
     }
 
@@ -2246,6 +2306,7 @@ mod tests {
                     Some(NodeRegistration::next(PacketInputNode::NODE_NAME, 0)),
                     &[],
                     None,
+                    false,
                 ),
             )
             .unwrap();
@@ -2261,10 +2322,9 @@ mod tests {
         for calls in 1..=2 {
             runtime.schedule_empty_frame(node).unwrap();
             assert_eq!(runtime.run_ready_nodes().unwrap(), 1);
-            assert_eq!(
-                runtime.nodes().node_runtime_data(node).unwrap(),
-                NodeRuntime::from_words([calls, 28, 8, 2])
-            );
+            let data = runtime.nodes().node_runtime_data(node).unwrap();
+            assert_eq!(data.words, [calls, 28, 8, 2]);
+            assert_eq!(data.node_index(), node);
             assert_eq!(runtime.nodes().frames_in_use(), 0);
         }
     }
@@ -2286,6 +2346,7 @@ mod tests {
                     None,
                     &[],
                     None,
+                    false,
                 ),
             )
             .expect("register existing node");
@@ -2310,21 +2371,23 @@ mod tests {
                     None,
                     &[],
                     None,
+                    false,
                 ),
             )
             .expect("register added node");
         worker.refork(main.inner.borrow().clone());
 
-        assert_eq!(worker.node_runtime_data(existing).unwrap(), worker_data);
+        let existing_data = worker.node_runtime_data(existing).unwrap();
+        assert_eq!(existing_data.words, worker_data.words);
+        assert_eq!(existing_data.node_index(), existing);
         assert_eq!(worker.node_state(existing).unwrap(), NodeState::Interrupt);
         assert_eq!(
             worker.inner.borrow().input_main_loops_per_call[existing.slot() as usize],
             4
         );
-        assert_eq!(
-            worker.node_runtime_data(added).unwrap(),
-            NodeRuntime::from_words([2, 3, 4, 5])
-        );
+        let added_data = worker.node_runtime_data(added).unwrap();
+        assert_eq!(added_data.words, [2, 3, 4, 5]);
+        assert_eq!(added_data.node_index(), added);
         assert_eq!(worker.node_state(added).unwrap(), NodeState::Polling);
     }
 }

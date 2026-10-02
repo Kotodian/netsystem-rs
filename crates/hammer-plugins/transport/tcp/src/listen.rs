@@ -2,9 +2,10 @@ use crate::{TcpCapabilities, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_plugin_session::{IpSessionEndpoint, IpSessionFamily, IpSessionMain};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter};
 
 use super::connection::TcpConnection;
+use super::input::{TcpReceiveTrace, format_tcp_receive_trace};
 use super::segment::{TcpSegment, tcp_packet};
 use super::{TcpInputNext, TcpNodeError, write_session_route_opaque};
 use hammer_service::opaque::NetworkOpaque;
@@ -69,6 +70,10 @@ impl Node for Tcp4ListenNode {
         let process: NodeProcessFn = tcp_listen_process::<true>;
         process(runtime, node_runtime, frame)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_receive_trace)
+    }
 }
 
 impl Node for Tcp6ListenNode {
@@ -80,6 +85,10 @@ impl Node for Tcp6ListenNode {
     ) -> usize {
         let process: NodeProcessFn = tcp_listen_process::<false>;
         process(runtime, node_runtime, frame)
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tcp_receive_trace)
     }
 }
 
@@ -105,6 +114,57 @@ fn tcp_listen_process_frame<const IS_IP4: bool>(
     frame: &mut Frame,
     main: &crate::TcpMain,
 ) -> () {
+    // VPP tcp_input.c:2410-2428,2499-2501: listen traces the incoming
+    // header before listener lookup and possible child creation.
+    if hammer_runtime::unlikely(node_runtime.trace_enabled()) {
+        let main = crate::TCP_MAIN
+            .get()
+            .expect("TCP Main initializes before listener input");
+        let worker = main
+            .worker(runtime.thread_index())
+            .expect("listen trace reads its owner TCP worker");
+        for &index in frame.vector_args() {
+            if !hammer_runtime::unlikely(runtime.buffer(index).trace_handle().is_some()) {
+                continue;
+            }
+            let (header_ptr, header_len, connection) = {
+                let buffer = runtime.buffer(index);
+                let cursor = hammer_core::buffer_opaque!(buffer => NetworkOpaque).packet_cursor();
+                let header = buffer
+                    .current()
+                    .get(cursor.transport_header_offset()..)
+                    .unwrap_or(&[]);
+                let route =
+                    hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).route();
+                let connection = if route.origin == crate::TcpRouteOrigin::Listener as u8 {
+                    main.listener_connection(route.connection_index)
+                } else if route.origin == crate::TcpRouteOrigin::Session as u8 {
+                    worker.connection(route.connection_index)
+                } else {
+                    None
+                };
+                (
+                    header.as_ptr(),
+                    header.len().min(core::mem::size_of::<crate::TcpHeader>()),
+                    connection,
+                )
+            };
+            if let Some(trace) = runtime.add_trace::<TcpReceiveTrace>(node_runtime, index) {
+                trace.record_connection(connection);
+                trace.header_len =
+                    u8::try_from(header_len).expect("TCP base header length fits u8");
+                // SAFETY: add_trace changes only trace storage/Buffer metadata;
+                // the received packet remains live in disjoint packet storage.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        header_ptr,
+                        trace.tcp_header.as_mut_ptr(),
+                        header_len,
+                    );
+                }
+            }
+        }
+    }
     let mut output = Frame::<(), u32, ()>::new(0);
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -205,17 +265,29 @@ fn tcp_listen_index<const IS_IP4: bool>(
             let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
             TcpError::NoListener
         })?;
+    let route = *hammer_core::buffer_opaque!(runtime.buffer(index) => crate::TcpSecondaryOpaque)
+        .route();
+    let listener_connection_index = if route.origin == crate::TcpRouteOrigin::Listener as u8 {
+        assert_eq!(
+            route.connection_index, listener.lookup_id,
+            "TCP input listener route matches the published listener"
+        );
+        route.connection_index
+    } else {
+        // A SYN from TIME-WAIT carries the old Session connection index.
+        listener.lookup_id
+    };
     // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
     let sessions = unsafe { ip_session.session().worker_mut(runtime) }?;
     let mut tcp = main.worker(runtime.thread_index())?;
     let listener_connection = main
-        .listener_connection(listener.lookup_id)
+        .listener_connection(listener_connection_index)
         .expect("published TCP listener retains its transport connection");
     let (control_segment, established_session) = TcpListener::new(
         &mut *sessions,
         &mut tcp,
         ip_session,
-        listener.lookup_id,
+        listener_connection_index,
         listener.session_listener.into(),
         listener_connection.base.endpoint.fib_index(),
         listener.capabilities,

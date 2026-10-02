@@ -108,6 +108,12 @@ pub enum CliError {
     UnexpectedArgument { argument: String },
     #[error("invalid CLI argument: {argument}")]
     InvalidArgument { argument: String },
+    #[error("trace Node not found: {name}")]
+    TraceNodeMissing { name: String },
+    #[error("Node does not support source tracing: {node}")]
+    TraceUnsupported { node: String },
+    #[error("trace limit overflows for Node: {node}")]
+    TraceLimitOverflow { node: String },
     #[error("CLI input is not UTF-8")]
     InputEncoding {
         #[source]
