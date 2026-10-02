@@ -8,7 +8,8 @@ use hammer_core::data_plane::{NodeId, NodeKind, NodeRegistration};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, NodeDescriptor, NodeProcessFn, NodeRuntime, RuntimeResult,
+    CombinedCounterMain, DataPlaneMain, DataWorkerId, NodeDescriptor, NodeProcessFn, NodeRuntime,
+    RuntimeResult, SimpleCounterMain, StatsMain,
 };
 
 use crate::ethernet::{EthernetInterface, EthernetInterfaceRegistration, EthernetMain};
@@ -458,19 +459,87 @@ pub struct InterfaceMain {
     state: UnsafeCell<InterfaceState>,
     rx_polls: Vec<UnsafeCell<RxPoll>>,
     tx_lookups: Vec<UnsafeCell<Vec<Vec<TxFrame>>>>,
+    sw_if_counters: Vec<SimpleCounterMain>,
+    combined_sw_if_counters: Vec<CombinedCounterMain>,
 }
 
 unsafe impl Send for InterfaceMain {}
 unsafe impl Sync for InterfaceMain {}
 
-impl Default for InterfaceMain {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceSimpleCounter {
+    Drop,
+    RxNoBuf,
+    RxMiss,
+    RxError,
+    TxError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceCombinedCounter {
+    Rx,
+    RxUnicast,
+    RxMulticast,
+    RxBroadcast,
+    Tx,
+    TxUnicast,
+    TxMulticast,
+    TxBroadcast,
 }
 
 impl InterfaceMain {
-    pub fn new() -> Self {
+    pub fn new() -> RuntimeResult<Self> {
+        let segment = &StatsMain::global()?.segment;
+        let thread_count = u32::try_from(hammer_runtime::config::worker::worker_count() + 1)
+            .expect("configured runtime thread count fits u32");
+        let mut sw_if_counters = Vec::with_capacity(5);
+        for name in [
+            "/if/drops",
+            "/if/rx-no-buf",
+            "/if/rx-miss",
+            "/if/rx-error",
+            "/if/tx-error",
+        ] {
+            match SimpleCounterMain::new(segment, name, thread_count, 0) {
+                Ok(counter) => sw_if_counters.push(counter),
+                Err(source) => {
+                    for counter in sw_if_counters.into_iter().rev() {
+                        counter
+                            .remove()
+                            .expect("startup simple counter entry remains removable");
+                    }
+                    return Err(source.into());
+                }
+            }
+        }
+        let mut combined_sw_if_counters = Vec::with_capacity(8);
+        for name in [
+            "/if/rx",
+            "/if/rx-unicast",
+            "/if/rx-multicast",
+            "/if/rx-broadcast",
+            "/if/tx",
+            "/if/tx-unicast",
+            "/if/tx-multicast",
+            "/if/tx-broadcast",
+        ] {
+            match CombinedCounterMain::new(segment, name, thread_count, 0) {
+                Ok(counter) => combined_sw_if_counters.push(counter),
+                Err(source) => {
+                    for counter in combined_sw_if_counters.into_iter().rev() {
+                        counter
+                            .remove()
+                            .expect("startup combined counter entry remains removable");
+                    }
+                    for counter in sw_if_counters.into_iter().rev() {
+                        counter
+                            .remove()
+                            .expect("startup simple counter entry remains removable");
+                    }
+                    return Err(source.into());
+                }
+            }
+        }
         let mut state = InterfaceState::default();
         state.output_feature_arc_index = u8::MAX;
         let interfaces = Self {
@@ -481,6 +550,8 @@ impl InterfaceMain {
             tx_lookups: (0..hammer_runtime::config::worker::worker_count())
                 .map(|_| UnsafeCell::new(Vec::new()))
                 .collect(),
+            sw_if_counters,
+            combined_sw_if_counters,
         };
         interfaces
             .consume_class_registrations(
@@ -488,7 +559,17 @@ impl InterfaceMain {
                 SERVICE_INTERFACE_REGISTRATION_IMAGE.hw_interface_class_registrations,
             )
             .expect("built-in interface classes fit the class index space");
-        interfaces
+        Ok(interfaces)
+    }
+
+    #[inline(always)]
+    pub fn simple_counter(&self, counter: InterfaceSimpleCounter) -> &SimpleCounterMain {
+        &self.sw_if_counters[counter as usize]
+    }
+
+    #[inline(always)]
+    pub fn combined_counter(&self, counter: InterfaceCombinedCounter) -> &CombinedCounterMain {
+        &self.combined_sw_if_counters[counter as usize]
     }
 
     fn state(&self) -> &InterfaceState {
@@ -682,6 +763,18 @@ impl InterfaceMain {
             .get_mut(sw_if_index)
             .expect("inserted software interface")
             .sup_sw_if_index = sw_if_index;
+        for counter in &self.sw_if_counters {
+            counter
+                .validate(sw_if_index)
+                .expect("registered interface simple counter has a valid shape");
+            counter.zero(sw_if_index);
+        }
+        for counter in &self.combined_sw_if_counters {
+            counter
+                .validate(sw_if_index)
+                .expect("registered interface combined counter has a valid shape");
+            counter.zero(sw_if_index);
+        }
         state.names.insert(name, hw_if_index);
         self.if_update_lookup_tables(sw_if_index);
 
@@ -869,9 +962,7 @@ impl InterfaceMain {
             .hw_if_index
             .or(primary.hw_if_index)
             .expect("hardware software-interface has a hardware owner");
-        let hardware = state
-            .hardware_interfaces
-            .get(hw_if_index)
+        let hardware = state.hardware_interfaces.get(hw_if_index)
             .expect("software interface names an occupied hardware owner");
         let device_callback = state
             .device_classes
@@ -1451,7 +1542,9 @@ impl InterfaceMain {
         // VPP interface/runtime.c rebuilds each worker's power-of-two queue
         // lookup under the worker barrier, not on the packet path.
         let state = self.state();
-        let hardware = state.hardware_interfaces.get(hw_if_index)
+        let hardware = state
+            .hardware_interfaces
+            .get(hw_if_index)
             .expect("TX queue belongs to a live interface");
         let frames = hardware.tx_queue_indices.iter()
             .filter_map(|&index| state.tx_queues.get(index))
@@ -1743,13 +1836,30 @@ pub(crate) static SERVICE_INTERFACE_REGISTRATION_IMAGE: InterfaceRegistrationIma
         &crate::__HAMMER_DEVICE_CLASS_REGISTRATIONS,
         &crate::__HAMMER_HW_CLASS_REGISTRATIONS,
         &[],
-        &crate::feature::FEATURE_SW_INTERFACE_CALLBACKS,
+        &[
+            crate::interface_stats::INTERFACE_STATS_CALLBACK,
+            crate::feature::FEATURE_SW_INTERFACE_CALLBACKS[0],
+        ],
         &[],
     );
 
-#[hammer_component_macros::init_function(name = "interface_main_init")]
+#[hammer_component_macros::init_function(name = "interface_main_init", runs_after = ["stats_main_init"])]
 pub fn interface_main_init() -> RuntimeResult<()> {
-    let interfaces = Arc::new(InterfaceMain::new());
+    let mut interfaces = InterfaceMain::new()?;
+    if let Err(source) = crate::interface_stats::init() {
+        for counter in interfaces.combined_sw_if_counters.drain(..).rev() {
+            counter
+                .remove()
+                .expect("startup combined counter entry remains removable");
+        }
+        for counter in interfaces.sw_if_counters.drain(..).rev() {
+            counter
+                .remove()
+                .expect("startup simple counter entry remains removable");
+        }
+        return Err(source);
+    }
+    let interfaces = Arc::new(interfaces);
     interfaces.consume_callback_registrations(
         SERVICE_INTERFACE_REGISTRATION_IMAGE.hw_interface_callbacks,
         SERVICE_INTERFACE_REGISTRATION_IMAGE.sw_interface_callbacks,

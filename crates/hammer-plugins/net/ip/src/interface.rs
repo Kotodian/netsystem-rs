@@ -1567,7 +1567,7 @@ mod tests {
         assert!(IP6_MAIN.set(crate::lookup::Ip6Main::new()).is_ok());
         (super::__INIT_FN_IP6_LINK_INIT.func)(&mut data_plane).unwrap();
 
-        let interfaces = Arc::new(InterfaceMain::new());
+        let interfaces = Arc::new(InterfaceMain::new().unwrap());
         interfaces
             .consume_registration_image(&crate::HAMMER_INTERFACE_REGISTRATION_IMAGE)
             .unwrap();

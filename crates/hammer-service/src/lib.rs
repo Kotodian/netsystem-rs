@@ -109,6 +109,7 @@ pub mod ethernet;
 /// Interface / adjacency control plane — shared infrastructure, not a plugin.
 pub mod interface;
 mod interface_model;
+mod interface_stats;
 pub use interface_model::InterfaceRegistrationImage;
 pub mod feature;
 pub mod net;

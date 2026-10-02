@@ -787,7 +787,7 @@ mod tests {
 
         hammer_service::net::NetMain::init(
             &mut runtime,
-            Arc::new(hammer_service::interface::InterfaceMain::new()),
+            Arc::new(hammer_service::interface::InterfaceMain::new()?),
         )?;
         crate::IcmpMain::init()?;
         let main = crate::IcmpMain::global()?;

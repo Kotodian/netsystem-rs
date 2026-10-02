@@ -1,10 +1,10 @@
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{
-    DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeProcessFn, add_packet_trace,
-};
+use hammer_runtime::{DataPlaneMain, InternalNode, Node, NodeErrorCode, add_packet_trace};
 
+use crate::interface::InterfaceSimpleCounter;
 use crate::net::{DpoProto, DpoType, NetMain};
+use crate::opaque::NetworkOpaque;
 
 /// Record a generated node-local error and store its preinstalled global
 /// index in the packet buffer identified by `index`.
@@ -41,7 +41,7 @@ impl Node for PuntNode {
     ) -> usize {
         // vlib/drop.c uses the ordinary drop path when no OS punt consumer
         // is installed. Frame storage is recycled separately by dispatch.
-        drop_node_process(runtime, node_runtime, frame)
+        drop_node_process(runtime, node_runtime, frame, false)
     }
 }
 
@@ -89,8 +89,7 @@ impl Node for DropNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = drop_node_process;
-        process(runtime, node_runtime, frame)
+        drop_node_process(runtime, node_runtime, frame, true)
     }
 }
 
@@ -98,6 +97,7 @@ fn drop_node_process(
     runtime: &mut DataPlaneMain,
     _: &mut hammer_runtime::node::NodeRuntime,
     frame: &mut Frame,
+    count_interface_drop: bool,
 ) -> usize {
     let processed_vectors = frame.len();
     (|| {
@@ -151,6 +151,39 @@ fn drop_node_process(
         }
         ()
     })();
+    // The terminal node also runs before network initialization; only packets
+    // with a published interface owner contribute to interface counters.
+    if let (true, Ok(net)) = (count_interface_drop, NetMain::global()) {
+        let interfaces = net.interface_main();
+        let mut counted_interface = None;
+        let mut count = 0u64;
+        for &index in frame.vector_args() {
+            let sw_if_index =
+                hammer_core::buffer_opaque!(runtime.buffer(index) => NetworkOpaque).sw_if_index[0];
+            if sw_if_index == u32::MAX {
+                continue;
+            }
+            assert!(
+                interfaces.software_interface(sw_if_index).is_some(),
+                "drop buffer ingress interface {sw_if_index} remains registered"
+            );
+            if counted_interface != Some(sw_if_index) {
+                if let Some(previous) = counted_interface {
+                    interfaces
+                        .simple_counter(InterfaceSimpleCounter::Drop)
+                        .increment(runtime.thread_index(), previous, count);
+                }
+                counted_interface = Some(sw_if_index);
+                count = 0;
+            }
+            count += 1;
+        }
+        if let Some(sw_if_index) = counted_interface {
+            interfaces
+                .simple_counter(InterfaceSimpleCounter::Drop)
+                .increment(runtime.thread_index(), sw_if_index, count);
+        }
+    }
     runtime.buffer_free(frame.vector_args());
     processed_vectors
 }
@@ -168,7 +201,7 @@ impl InternalNode for DropNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_runtime::{DataPlaneBufferConfig, NodeRuntime};
+    use hammer_runtime::{DataPlaneBufferConfig, NodeProcessFn, NodeRuntime};
 
     #[test]
     fn terminal_nodes_release_buffer_chains() {
@@ -191,6 +224,10 @@ mod tests {
         for process in [DropNode::process as NodeProcessFn, PuntNode::process] {
             let mut indices = [0; 3];
             assert_eq!(runtime.buffer_alloc(&mut indices), 3);
+            for index in indices {
+                *hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque) =
+                    NetworkOpaque::default();
+            }
             runtime.buffer_chain_buffer(indices[0], indices[1]);
             let cached_free = runtime.cached_free_buffers();
             let mut frame = Frame::<(), u32, ()>::new(0);
