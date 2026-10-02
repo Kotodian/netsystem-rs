@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use std::{sync::OnceLock, thread::ThreadId};
@@ -57,7 +58,15 @@ pub struct ThreadMain {
     cpu_core_bitmap: Bitmap,
     cpu_socket_bitmap: Bitmap,
     worker_threads: Vec<WorkerThread>,
+    worker_mains: UnsafeCell<Vec<UnsafeCell<Box<crate::DataPlaneMain>>>>,
 }
+
+// SAFETY: worker_mains is installed once before launch and its Vec never
+// changes afterward. Each Data Worker exclusively borrows its own entry
+// between barrier checks; thread zero borrows entries only while all workers
+// have acknowledged the barrier and released those borrows.
+unsafe impl Send for ThreadMain {}
+unsafe impl Sync for ThreadMain {}
 
 impl ThreadMain {
     pub fn new() -> RuntimeResult<Self> {
@@ -91,6 +100,7 @@ impl ThreadMain {
             cpu_core_bitmap,
             cpu_socket_bitmap,
             worker_threads: Vec::new(),
+            worker_mains: UnsafeCell::new(Vec::new()),
         })
     }
 
@@ -366,6 +376,65 @@ impl ThreadMain {
         self.worker_threads
             .iter()
             .find(|thread| thread.thread_index() == index)
+    }
+
+    pub(crate) fn data_workers(&self) -> impl Iterator<Item = &WorkerThread> {
+        self.worker_threads
+            .iter()
+            .skip(1)
+            .take(self.worker_count as usize)
+    }
+
+    pub(crate) fn install_worker_mains(
+        &self,
+        mains: Vec<UnsafeCell<Box<crate::DataPlaneMain>>>,
+    ) {
+        crate::ensure_main_thread().expect("Data Worker mains install on thread zero");
+        assert_eq!(mains.len(), self.worker_count as usize);
+        for (slot, main) in mains.iter().enumerate() {
+            // SAFETY: these cells are not published until installation ends.
+            assert_eq!(unsafe { &*main.get() }.thread_index(), slot as u32 + 1);
+        }
+        // SAFETY: installation precedes every Worker launch, and this Vec is
+        // never structurally modified after publication to the workers.
+        let worker_mains = unsafe { &mut *self.worker_mains.get() };
+        assert!(worker_mains.is_empty(), "Data Worker mains install once");
+        *worker_mains = mains;
+    }
+
+    /// # Safety
+    /// The caller is this Worker and holds no other borrow of its main. Its
+    /// preceding main borrow ended before the latest barrier check.
+    pub(crate) unsafe fn worker_main_on_worker(
+        &self,
+        worker: &WorkerThread,
+    ) -> &mut crate::DataPlaneMain {
+        assert!(worker.is_current(), "only the owning Worker borrows its main");
+        assert!(!worker.no_data_structure_clone());
+        let index = worker.thread_index() as usize - 1;
+        let mains = unsafe { &*self.worker_mains.get() };
+        let main = mains
+            .get(index)
+            .expect("Data Worker mains install before launch");
+        unsafe { &mut **main.get() }
+    }
+
+    /// # Safety
+    /// Thread zero holds WorkerBarrier, this Worker has released its mutable
+    /// borrow, and no other borrow of this main overlaps the returned one.
+    pub(crate) unsafe fn worker_main_at_barrier(
+        &self,
+        worker: &WorkerThread,
+    ) -> &mut crate::DataPlaneMain {
+        crate::ensure_main_thread().expect("trace CLI runs on thread zero");
+        assert!(crate::barrier::global().is_some_and(|barrier| barrier.is_pending()));
+        assert!(!worker.no_data_structure_clone());
+        let index = worker.thread_index() as usize - 1;
+        let mains = unsafe { &*self.worker_mains.get() };
+        let main = mains
+            .get(index)
+            .expect("Data Worker mains install before barrier CLI");
+        unsafe { &mut **main.get() }
     }
 
     /// The main-loop count of the Data Worker with `thread_index`.

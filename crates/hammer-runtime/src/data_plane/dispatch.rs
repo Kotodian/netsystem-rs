@@ -7,7 +7,7 @@ use hammer_stats::{DirectoryType, StatsError, StatsMain};
 const NODE_ERROR_COUNTERS_NAME: &str = "/node/errors";
 
 impl DataPlaneMain {
-    pub fn init_graph(&self, entries: &[NodeEntry]) -> RuntimeResult<()> {
+    pub fn init_graph(&mut self, entries: &[NodeEntry]) -> RuntimeResult<()> {
         let node_functions = crate::builtin_registration_image()
             .node_functions()
             .collect::<Vec<_>>();
@@ -15,7 +15,7 @@ impl DataPlaneMain {
     }
 
     pub fn init_graph_with_node_functions(
-        &self,
+        &mut self,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
@@ -23,7 +23,7 @@ impl DataPlaneMain {
     }
 
     pub(crate) fn init_graph_from_declarations<'entry, 'function>(
-        &self,
+        &mut self,
         entries: impl Clone + Iterator<Item = &'entry NodeEntry>,
         node_functions: impl Clone + Iterator<Item = &'function NodeFunctionRegistration>,
     ) -> RuntimeResult<()> {
@@ -58,13 +58,21 @@ impl DataPlaneMain {
                 processes.push(entry.process);
             }
         }
+        let handoff_trace_node = self.nodes.try_register_internal_with_next_names(
+            crate::trace::HandoffTraceNode,
+            &["drop"],
+        )?;
+        nodes.push((handoff_trace_node, &crate::trace::HANDOFF_TRACE_ERRORS));
+        processes.push(<crate::trace::HandoffTraceNode as crate::Node>::process);
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.register_node_errors(node, error_counters)?;
             self.nodes
                 .install_node_function(node, node_functions.clone(), process)?;
         }
-        self.nodes.resolve_named_next_nodes()
+        self.nodes.resolve_named_next_nodes()?;
+        self.handoff_trace_node = handoff_trace_node;
+        Ok(())
     }
 
     pub(crate) fn extend_graph_with_node_functions(

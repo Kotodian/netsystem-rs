@@ -237,11 +237,8 @@ pub enum RuntimeError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[error("packet trace serialization failed")]
-    PacketTraceSerialization {
-        #[source]
-        source: bincode::Error,
-    },
+    #[error("trace handle cannot encode {count} runtime threads")]
+    TraceThreadCapacity { count: usize },
     #[error("node error recording requires an active Graph Node dispatch")]
     NodeDispatchContextMissing,
     #[error("required runtime capability `{type_name}` is not registered")]

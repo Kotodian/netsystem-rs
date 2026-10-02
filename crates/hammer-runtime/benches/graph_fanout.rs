@@ -40,6 +40,7 @@ fn register_sink(runtime: &DataPlaneMain, name: &'static str) -> RuntimeResult<N
             Some(NodeRegistration::next(name, 0)),
             &[],
             None,
+            false,
         ),
     )
 }
@@ -53,6 +54,7 @@ fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<No
             Some(NodeRegistration::next("fanout-owner", nexts.len())),
             nexts,
             None,
+            false,
         ),
     )
 }

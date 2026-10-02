@@ -20,7 +20,7 @@ use crate::node::{
     NodeEntry, NodeErrorCode, NodeErrorDescriptor, NodeFunctionRegistration, NodeMain, NodeRuntime,
 };
 use crate::runtime_simd::{native_simd_bytes, preferred_frame_batch_width};
-use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
+use crate::trace::TraceMain;
 
 mod buffer_pool;
 mod config;
@@ -48,7 +48,12 @@ pub struct DataPlaneMain {
     pub(crate) node_error_stats_entry_index: Cell<Option<DirectoryIndex>>,
     handoff: Option<DataPlaneHandoffWorker>,
     active_numa_node: u32,
-    trace: DataPlaneTrace,
+    pub(crate) trace_main: TraceMain,
+    pub(crate) handoff_trace_node: NodeId,
+    pub(crate) main_loop_start_ticks: u64,
+    pub(crate) seconds_per_cpu_tick: f64,
+    pub(crate) cpu_reference_ticks: u64,
+    pub(crate) unix_reference_seconds: f64,
     simd_bytes: usize,
     cpu_pinned: bool,
     pub(crate) enqueue_next: crate::graph::fanout::EnqueueNextFn,
@@ -128,7 +133,7 @@ impl fmt::Debug for DataPlaneMain {
             .field("current_node", &self.current_node.get())
             .field("handoff", &self.handoff)
             .field("active_numa_node", &self.active_numa_node)
-            .field("trace", &self.trace)
+            .field("trace_main", &self.trace_main)
             .field("simd_bytes", &self.simd_bytes)
             .field("loops_per_second", &self.loops_per_second)
             .field("main_loop_exit_now", &self.main_loop_exit_now)

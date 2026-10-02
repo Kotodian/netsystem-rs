@@ -1,6 +1,9 @@
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, InternalNode, Node, NodeErrorCode, add_packet_trace};
+use hammer_runtime::{
+    DataPlaneMain, InternalNode, Node, NodeErrorCode, TraceFormatter, unlikely,
+};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::interface::InterfaceSimpleCounter;
 use crate::net::{DpoProto, DpoType, NetMain};
@@ -43,6 +46,10 @@ impl Node for PuntNode {
         // is installed. Frame storage is recycled separately by dispatch.
         drop_node_process(runtime, node_runtime, frame, false)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_drop_trace)
+    }
 }
 
 impl DropNode {
@@ -77,9 +84,29 @@ pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     Ok(node)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, KnownLayout, FromBytes, IntoBytes, Immutable)]
 pub struct DropTrace {
-    pub dropped: usize,
+    pub error_index: u16,
+}
+
+fn format_drop_trace(bytes: &[u8]) -> String {
+    let (trace, _) = DropTrace::ref_from_prefix(bytes)
+        .expect("drop trace record has its registered layout");
+    format!("error index {}", trace.error_index)
+}
+
+#[inline(always)]
+fn trace_drop(runtime: &mut DataPlaneMain, node: &hammer_runtime::NodeRuntime, index: u32) {
+    if unlikely(runtime.buffer(index).trace_handle().is_some()) {
+        let error_index = runtime
+            .buffer(index)
+            .node_error_index()
+            .map_or(0, |error| error.get());
+        if let Some(trace) = runtime.add_trace::<DropTrace>(node, index) {
+            trace.error_index = error_index;
+        }
+    }
 }
 
 impl Node for DropNode {
@@ -91,17 +118,20 @@ impl Node for DropNode {
     ) -> usize {
         drop_node_process(runtime, node_runtime, frame, true)
     }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_drop_trace)
+    }
 }
 
 fn drop_node_process(
     runtime: &mut DataPlaneMain,
-    _: &mut hammer_runtime::node::NodeRuntime,
+    node: &mut hammer_runtime::node::NodeRuntime,
     frame: &mut Frame,
     count_interface_drop: bool,
 ) -> usize {
     let processed_vectors = frame.len();
     (|| {
-        let dropped = frame.len();
         let indices = frame.vector_args();
         let len = indices.len();
         let mut read = 0usize;
@@ -122,10 +152,10 @@ fn drop_node_process(
             let index1 = indices[read + 1];
             let index2 = indices[read + 2];
             let index3 = indices[read + 3];
-            let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-            let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
-            let _ = add_packet_trace!(runtime, index2, DropTrace { dropped });
-            let _ = add_packet_trace!(runtime, index3, DropTrace { dropped });
+            trace_drop(runtime, node, index0);
+            trace_drop(runtime, node, index1);
+            trace_drop(runtime, node, index2);
+            trace_drop(runtime, node, index3);
             read += 4;
         }
         if read + 2 <= len {
@@ -137,8 +167,8 @@ fn drop_node_process(
             }
             let index0 = indices[read];
             let index1 = indices[read + 1];
-            let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-            let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
+            trace_drop(runtime, node, index0);
+            trace_drop(runtime, node, index1);
             read += 2;
         }
         while read < len {
@@ -146,7 +176,7 @@ fn drop_node_process(
                 runtime.prefetch_header(indices[read + 1]);
             }
             let index0 = indices[read];
-            let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
+            trace_drop(runtime, node, index0);
             read += 1;
         }
         ()

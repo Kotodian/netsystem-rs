@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -53,23 +54,23 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
-        let (mut nodes, simd_bytes, _, trace_control) = main.worker_parts();
+        let (mut nodes, _) = main.worker_parts();
         nodes.install_node_counters(
             node_counter_rows
                 .row(thread_index)
                 .expect("every Data Worker owns a counter row"),
         );
         let worker_main = DataPlaneMain::new_worker(
+            main,
             nodes,
-            simd_bytes,
             Some(handoff.worker(DataWorkerId::new(worker_slot))),
-            trace_control,
             thread_index,
             descriptor.numa_node().unwrap_or(0),
         )?;
         worker_main.install_node_error_stats_entry(node_error_stats_entry);
-        worker_mains.push(Box::new(worker_main));
+        worker_mains.push(UnsafeCell::new(Box::new(worker_main)));
     }
+    threads.install_worker_mains(worker_mains);
 
     for worker_slot in 0..worker_count {
         threads
@@ -79,12 +80,12 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     }
     let barrier = barrier::install(worker_count, participant_count);
     barrier.arm();
-    for (worker_slot, worker_main) in worker_mains.into_iter().enumerate() {
-        let thread_index = worker_slot as u32 + 1;
+    for worker_slot in 0..worker_count {
+        let thread_index = worker_slot + 1;
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
-        if let Err(error) = descriptor.launch(Some(worker_main), Arc::clone(&init_functions)) {
+        if let Err(error) = descriptor.launch(Arc::clone(&init_functions)) {
             return Err(cancel_startup(&barrier, error));
         }
     }
@@ -92,7 +93,7 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("registered runtime thread descriptor exists");
-        if let Err(error) = descriptor.launch(None, Arc::clone(&init_functions)) {
+        if let Err(error) = descriptor.launch(Arc::clone(&init_functions)) {
             return Err(cancel_startup(&barrier, error));
         }
     }

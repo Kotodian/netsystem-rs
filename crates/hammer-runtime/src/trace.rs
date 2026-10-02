@@ -1,544 +1,157 @@
-use std::collections::{HashMap, VecDeque};
-use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+//! Per-main packet traces following VPP's trace pool and Node count model.
 
-use crate::config::Trace;
-use crate::error::{RuntimeError, RuntimeResult};
-use crossbeam_queue::SegQueue;
-use hammer_core::data_plane::NodeId;
+use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
+use hammer_infra::pool::Pool;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-#[hammer_component_macros::config_function(name = "runtime_trace_config", section = "trace")]
-fn configure_trace(trace: Trace, main: &mut crate::DataPlaneMain) -> RuntimeResult<()> {
-    trace.validate()?;
-    let control = Arc::new(TraceControlPlane::new(trace.record_capacity));
-    control.publish_options(&trace, |name| main.node_by_name(name))?;
-    main.set_trace_control(Some(control.handle()));
-    Ok(())
-}
+use crate::node::{
+    InternalNode, Node, NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity, NodeRuntime,
+};
+use crate::{DataPlaneMain, RuntimeResult};
+
+pub mod cli;
 
 pub type TraceFormatter = fn(&[u8]) -> String;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceInputPolicy {
-    pub node: NodeId,
-    pub count: u32,
+pub(crate) const TRACE_THREAD_SHIFT: u32 = 24;
+pub(crate) const TRACE_THREAD_LIMIT: u32 = 0xff;
+pub(crate) const TRACE_INDEX_LIMIT: u32 = 0x00ff_ffff;
+
+/// VPP `vlib_trace_header_t`; payload occupies `n_data` further headers.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, KnownLayout, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct TraceHeader {
+    pub(crate) time: u64,
+    pub(crate) node_index: u32,
+    pub(crate) n_data: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TracePolicy {
-    pub enabled: bool,
-    pub record_capacity: usize,
-    pub packet_capacity: usize,
-    pub inputs: Vec<TraceInputPolicy>,
+const _: () = {
+    assert!(core::mem::size_of::<TraceHeader>() == 16);
+    assert!(core::mem::align_of::<TraceHeader>() == 16);
+};
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TraceNode {
+    pub(crate) count: u32,
+    pub(crate) limit: u32,
 }
 
-impl TracePolicy {
-    pub fn disabled(record_capacity: usize, packet_capacity: usize) -> Self {
-        Self {
-            enabled: false,
-            record_capacity,
-            packet_capacity,
-            inputs: Vec::new(),
-        }
+#[derive(Debug, Clone, Copy, Default)]
+pub enum TraceTimestampFormat {
+    #[default]
+    Relative,
+    Unix,
+    Datetime,
+}
+
+impl core::fmt::Display for TraceTimestampFormat {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::Relative => "relative",
+            Self::Unix => "unix",
+            Self::Datetime => "datetime",
+        };
+        writeln!(formatter, "trace timestamp format: {name}")
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TraceRecord {
-    pub epoch: u64,
-    pub input_node: NodeId,
-    pub input_node_name: Option<&'static str>,
-    pub entries: Vec<TraceEntry>,
+#[derive(Debug, Default)]
+pub(crate) struct TraceMain {
+    pub(crate) trace_buffer_pool: Pool<Vec<TraceHeader>>,
+    pub(crate) nodes: Vec<TraceNode>,
+    pub(crate) trace_enable: bool,
+    pub(crate) verbose: bool,
+    pub(crate) timestamp_format: TraceTimestampFormat,
 }
 
-#[derive(Debug, Clone)]
-pub struct TraceEntry {
-    pub node: NodeId,
-    pub node_name: Option<&'static str>,
-    pub payload_bytes: Vec<u8>,
-    pub formatter: Option<TraceFormatter>,
-}
-
-impl TraceEntry {
-    #[inline]
-    pub fn format_payload(&self) -> String {
-        match self.formatter {
-            Some(formatter) => formatter(&self.payload_bytes),
-            None => format_raw_payload(&self.payload_bytes),
+impl TraceMain {
+    /// VPP `trace_update_capture_options`: zero resets a Node's quota but
+    /// does not delete existing packet records.
+    pub(crate) fn add_count(&mut self, node: NodeId, count: u32, verbose: bool) {
+        let index = node.slot() as usize;
+        if self.nodes.len() <= index {
+            self.nodes.resize(index + 1, TraceNode::default());
         }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct DataPlaneTrace {
-    control: Option<TraceControlHandle>,
-}
-
-#[derive(Debug)]
-struct PacketTraceState {
-    epoch: u64,
-    input_node: NodeId,
-    input_node_name: Option<&'static str>,
-    entries: Vec<TraceEntry>,
-}
-
-pub trait PacketTrace: serde::Serialize {}
-
-impl<T> PacketTrace for T where T: serde::Serialize {}
-
-#[macro_export]
-macro_rules! format_packet_trace {
-    ($trace:ty) => {
-        |bytes: &[u8]| {
-            format!(
-                "{} {}",
-                ::std::any::type_name::<$trace>(),
-                $crate::trace::format_raw_payload(bytes),
-            )
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! add_packet_trace {
-    ($runtime:expr, $index:expr, $trace:expr $(,)?) => {{
-        match $runtime.should_trace_packet($index) {
-            Ok(traced) if $crate::unlikely(traced) => $runtime.add_trace($index, $trace),
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }};
-}
-
-#[derive(Debug, Clone)]
-pub struct TraceControlPlane {
-    inner: Arc<TraceControlInner>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TraceControlHandle {
-    inner: Arc<TraceControlInner>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TraceRecordSink {
-    inner: Arc<TraceControlInner>,
-}
-
-#[derive(Debug)]
-struct TraceControlInner {
-    state: Mutex<TraceControlState>,
-    completed: SegQueue<TraceRecord>,
-    completed_len: AtomicUsize,
-    completed_capacity: AtomicUsize,
-    dropped_completed: AtomicUsize,
-    next_epoch: AtomicU64,
-    next_handle: AtomicU64,
-    marking_inputs: AtomicUsize,
-}
-
-#[derive(Debug)]
-struct TraceControlState {
-    epoch: u64,
-    policy: TracePolicy,
-    quotas: HashMap<u32, u32>,
-    active: HashMap<u32, PacketTraceState>,
-    ring: VecDeque<TraceRecord>,
-}
-
-impl TraceControlPlane {
-    pub fn new(record_capacity: usize) -> Self {
-        let record_capacity = record_capacity.max(1);
-        Self {
-            inner: Arc::new(TraceControlInner {
-                state: Mutex::new(TraceControlState {
-                    epoch: 0,
-                    policy: TracePolicy::disabled(record_capacity, 1),
-                    quotas: HashMap::new(),
-                    active: HashMap::new(),
-                    ring: VecDeque::with_capacity(record_capacity),
-                }),
-                completed: SegQueue::new(),
-                completed_len: AtomicUsize::new(0),
-                completed_capacity: AtomicUsize::new(record_capacity),
-                dropped_completed: AtomicUsize::new(0),
-                next_epoch: AtomicU64::new(1),
-                next_handle: AtomicU64::new(1),
-                marking_inputs: AtomicUsize::new(0),
-            }),
-        }
-    }
-
-    pub fn handle(&self) -> TraceControlHandle {
-        TraceControlHandle {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-
-    pub fn sink(&self) -> TraceRecordSink {
-        TraceRecordSink {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-
-    pub fn publish(&self, policy: TracePolicy) -> u64 {
-        let epoch = self.inner.next_epoch.fetch_add(1, Ordering::AcqRel);
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        state.epoch = epoch;
-        state.quotas = if policy.enabled {
-            policy
-                .inputs
-                .iter()
-                .map(|input| (input.node.slot(), input.count))
-                .collect()
+        let trace_node = &mut self.nodes[index];
+        if count == 0 {
+            trace_node.count = 0;
+            trace_node.limit = 0;
         } else {
-            HashMap::new()
-        };
-        let marking_inputs = if policy.enabled {
-            policy.inputs.len()
-        } else {
-            0
-        };
-        self.inner
-            .marking_inputs
-            .store(marking_inputs, Ordering::Release);
-        let record_capacity = policy.record_capacity.max(1);
-        self.inner
-            .completed_capacity
-            .store(record_capacity, Ordering::Release);
-        trim_completed_queue(&self.inner, record_capacity);
-        resize_bounded_queue(&mut state.ring, record_capacity);
-        if state.ring.capacity() != record_capacity {
-            let mut ring = VecDeque::with_capacity(record_capacity);
-            ring.extend(state.ring.drain(..));
-            state.ring = ring;
+            trace_node.limit = trace_node
+                .limit
+                .checked_add(count)
+                .expect("trace add prevalidated every main's quota");
         }
-        state.policy = policy;
-        epoch
+        self.verbose = verbose;
+        self.trace_enable = true;
     }
 
-    pub fn publish_options(
-        &self,
-        options: &Trace,
-        resolve_node: impl Fn(&str) -> Option<NodeId>,
-    ) -> RuntimeResult<u64> {
-        let mut inputs = Vec::with_capacity(options.inputs.len());
-        if options.enabled {
-            for input in &options.inputs {
-                let node = resolve_node(&input.node).ok_or_else(|| {
-                    RuntimeError::config_validation(format!(
-                        "trace.inputs node is not a declared packet node: {}",
-                        input.node
-                    ))
-                })?;
-                inputs.push(TraceInputPolicy {
-                    node,
-                    count: input.count,
-                });
-            }
-        }
-        Ok(self.publish(TracePolicy {
-            enabled: options.enabled,
-            record_capacity: options.record_capacity.max(1),
-            packet_capacity: options.packet_capacity.max(1),
-            inputs,
-        }))
-    }
-
-    pub fn drain_completed(&self) -> usize {
-        self.sink().drain_completed()
-    }
-
-    pub fn take_records(&self) -> Vec<TraceRecord> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        state.ring.drain(..).collect()
-    }
-
-    pub fn records(&self) -> Vec<TraceRecord> {
-        self.inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned")
-            .ring
-            .iter()
-            .cloned()
-            .collect()
-    }
-
-    pub fn dropped_completed(&self) -> usize {
-        self.inner.dropped_completed.load(Ordering::Acquire)
+    /// VPP `clear_trace_buffer`: called only after all mains disable tracing.
+    pub(crate) fn clear(&mut self) {
+        self.nodes.clear();
+        self.trace_buffer_pool.clear();
     }
 }
 
-impl DataPlaneTrace {
-    pub fn set_control(&mut self, control: Option<TraceControlHandle>) {
-        self.control = control;
-    }
+/// VPP `handoff_trace_t`; a new owner keeps the preceding thread/pool index.
+#[repr(C)]
+#[derive(Debug, KnownLayout, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct HandoffTrace {
+    pub(crate) prev_thread: u32,
+    pub(crate) prev_trace_index: u32,
+}
 
-    pub(crate) fn control(&self) -> Option<TraceControlHandle> {
-        self.control.clone()
-    }
+#[repr(u16)]
+#[derive(Clone, Copy)]
+enum HandoffTraceError {
+    UnexpectedDispatch,
+}
 
-    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
-        let control = self.control.clone()?;
-        control.try_mark(node, node_name)
-    }
-
-    pub fn may_mark(&self, node: NodeId) -> bool {
-        self.control
-            .as_ref()
-            .is_some_and(|control| control.may_mark(node))
-    }
-
-    pub fn add_entry(
-        &self,
-        handle: u32,
-        node: NodeId,
-        node_name: Option<&'static str>,
-        formatter: Option<TraceFormatter>,
-        payload_bytes: Vec<u8>,
-    ) {
-        let Some(control) = self.control.clone() else {
-            return;
-        };
-        control.add_entry(handle, node, node_name, formatter, payload_bytes);
-    }
-
-    pub fn finalize(&self, handle: u32) {
-        let Some(control) = self.control.clone() else {
-            return;
-        };
-        control.finalize(handle);
+impl NodeErrorCode for HandoffTraceError {
+    fn local_code(self) -> u16 {
+        self as u16
     }
 }
 
-impl TraceControlHandle {
-    pub fn may_mark(&self, node: NodeId) -> bool {
-        if self.inner.marking_inputs.load(Ordering::Acquire) == 0 {
-            return false;
-        }
-        let state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        state.policy.enabled
-            && state.active.len() < state.policy.packet_capacity.max(1)
-            && state.quotas.get(&node.slot()).copied().unwrap_or(0) > 0
-    }
+pub(crate) const HANDOFF_TRACE_ERRORS: [NodeErrorDescriptor; 1] = [NodeErrorDescriptor::new(
+    "unexpected-dispatch",
+    NodeErrorSeverity::Warn,
+    "Packets sent to the handoff trace node",
+)];
 
-    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
-        if self.inner.marking_inputs.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        if !state.policy.enabled {
-            return None;
-        }
-        if state.active.len() >= state.policy.packet_capacity.max(1) {
-            return None;
-        }
-        let epoch = state.epoch;
-        let quota = state.quotas.get(&node.slot()).copied()?;
-        if quota == 0 {
-            return None;
-        }
-        state.quotas.insert(node.slot(), quota - 1);
-        let handle = self.next_trace_handle(&state.active);
-        state.active.insert(
-            handle,
-            PacketTraceState {
-                epoch,
-                input_node: node,
-                input_node_name: node_name,
-                entries: Vec::new(),
-            },
-        );
-        Some(handle)
-    }
+pub(crate) struct HandoffTraceNode;
 
-    pub fn add_entry(
-        &self,
-        handle: u32,
-        node: NodeId,
-        node_name: Option<&'static str>,
-        formatter: Option<TraceFormatter>,
-        payload_bytes: Vec<u8>,
-    ) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        let Some(packet) = state.active.get_mut(&handle) else {
-            return;
-        };
-        packet.entries.push(TraceEntry {
-            node,
-            node_name,
-            payload_bytes,
-            formatter,
-        });
-    }
-
-    pub fn finalize(&self, handle: u32) {
-        let packet = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .expect("trace control lock poisoned");
-            if !state.active.contains_key(&handle) {
-                return;
-            }
-            state
-                .active
-                .remove(&handle)
-                .expect("active trace packet disappeared")
-        };
-        if packet.entries.is_empty() {
-            return;
-        }
-        self.push_completed_record(TraceRecord {
-            epoch: packet.epoch,
-            input_node: packet.input_node,
-            input_node_name: packet.input_node_name,
-            entries: packet.entries,
-        });
-    }
-
-    fn next_trace_handle(&self, active: &HashMap<u32, PacketTraceState>) -> u32 {
-        loop {
-            let value = self.inner.next_handle.fetch_add(1, Ordering::AcqRel);
-            let handle = (value as u32).max(1);
-            if !active.contains_key(&handle) {
-                return handle;
-            }
-        }
-    }
-
-    pub fn push_completed_record(&self, record: TraceRecord) {
-        loop {
-            let capacity = self.inner.completed_capacity.load(Ordering::Acquire).max(1);
-            let current = self.inner.completed_len.load(Ordering::Acquire);
-            if current >= capacity {
-                self.inner.dropped_completed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            if self
-                .inner
-                .completed_len
-                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.inner.completed.push(record);
-                return;
-            }
-        }
+impl InternalNode for HandoffTraceNode {
+    fn node_registration(&self) -> Option<NodeRegistration> {
+        Some(NodeRegistration::next("handoff-trace", 1))
     }
 }
 
-impl TraceRecordSink {
-    pub fn drain_completed(&self) -> usize {
-        let mut drained = 0usize;
-        while let Some(record) = self.inner.completed.pop() {
-            self.inner.completed_len.fetch_sub(1, Ordering::AcqRel);
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .expect("trace control lock poisoned");
-            push_ring(&mut state, record);
-            drained += 1;
-        }
-        drained
+impl Node for HandoffTraceNode {
+    fn process(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+        let count = frame.len();
+        runtime.buffer_free(frame.vector_args());
+        runtime
+            .record_current_node_error_count(HandoffTraceError::UnexpectedDispatch, count as u64)
+            .expect("handoff trace error column was registered");
+        count
     }
 
-    pub fn take_records(&self) -> Vec<TraceRecord> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        state.ring.drain(..).collect()
+    fn trace_supported(&self) -> bool {
+        true
     }
 
-    pub fn dropped_completed(&self) -> usize {
-        self.inner.dropped_completed.load(Ordering::Acquire)
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_handoff_trace)
     }
 }
 
-fn push_ring(state: &mut TraceControlState, record: TraceRecord) {
-    let capacity = state.policy.record_capacity.max(1);
-    while state.ring.len() >= capacity {
-        state.ring.pop_front();
-    }
-    state.ring.push_back(record);
-}
-
-fn resize_bounded_queue(queue: &mut VecDeque<TraceRecord>, capacity: usize) {
-    while queue.len() > capacity {
-        queue.pop_front();
-    }
-}
-
-fn trim_completed_queue(inner: &TraceControlInner, capacity: usize) {
-    while inner.completed_len.load(Ordering::Acquire) > capacity {
-        let Some(_) = inner.completed.pop() else {
-            return;
-        };
-        inner.completed_len.fetch_sub(1, Ordering::AcqRel);
-        inner.dropped_completed.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn format_trace_record(record: &TraceRecord) -> String {
-    let mut line = format!(
-        "packet trace epoch={} input={}",
-        record.epoch,
-        node_label(record.input_node, record.input_node_name)
-    );
-    for entry in &record.entries {
-        line.push_str(" | ");
-        line.push_str(&node_label(entry.node, entry.node_name));
-        line.push_str(": ");
-        line.push_str(&entry.format_payload());
-    }
-    line
-}
-
-impl std::fmt::Display for TraceRecord {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&format_trace_record(self))
-    }
-}
-
-fn node_label(node: NodeId, name: Option<&'static str>) -> String {
-    match name {
-        Some(name) => name.to_owned(),
-        None => format!("node#{}", node.slot()),
-    }
-}
-
-#[doc(hidden)]
-pub fn format_raw_payload(payload: &[u8]) -> String {
-    let mut output = String::with_capacity(2 + payload.len() * 2);
-    output.push_str("0x");
-    for byte in payload {
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
+fn format_handoff_trace(bytes: &[u8]) -> String {
+    let (trace, _) = HandoffTrace::ref_from_prefix(bytes)
+        .expect("handoff trace record has its registered layout");
+    format!(
+        "HANDED-OFF: from thread {} trace index {}",
+        trace.prev_thread, trace.prev_trace_index
+    )
 }

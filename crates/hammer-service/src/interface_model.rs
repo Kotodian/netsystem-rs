@@ -807,6 +807,7 @@ impl InterfaceMain {
                             Some(NodeRegistration::next(tx_name, 1)),
                             &[],
                             None,
+                            false,
                         )
                         .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                     )
@@ -820,6 +821,7 @@ impl InterfaceMain {
                             Some(NodeRegistration::next(output_name, 2)),
                             &[],
                             None,
+                            false,
                         ),
                     )
                     .expect("interface output node recycle must succeed");
@@ -835,6 +837,7 @@ impl InterfaceMain {
                             Some(NodeRegistration::next(tx_name, 1)),
                             &[],
                             None,
+                            false,
                         )
                         .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                     )
@@ -849,6 +852,7 @@ impl InterfaceMain {
                             Some(NodeRegistration::next(output_name, 2)),
                             &[],
                             None,
+                            false,
                         ),
                     )
                     .expect("interface output node registration must succeed");
@@ -1093,6 +1097,7 @@ impl InterfaceMain {
                         Some(NodeRegistration::next(output_name, 2)),
                         &[],
                         None,
+                        false,
                     ),
                 )
                 .expect("deleted interface output runtime must publish");
@@ -1105,6 +1110,7 @@ impl InterfaceMain {
                         Some(NodeRegistration::next(tx_name, 1)),
                         &[],
                         None,
+                        false,
                     )
                     .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                 )
