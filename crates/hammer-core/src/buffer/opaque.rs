@@ -206,7 +206,7 @@ pub(super) mod tests {
         }
         // Ownership: both indices remain allocated; no mutation overlaps this borrow.
         assert_eq!(buffers.buffer(&caches, copied).current()[0], 11);
-        buffers.free_buffers(&mut caches, &[index], true, |_| {});
+        buffers.free_buffers(&mut caches, &[index], true);
         let mut recycled = 0;
         assert_eq!(
             buffers.alloc_from_pool(&mut caches, core::slice::from_mut(&mut recycled), 0),
@@ -225,8 +225,8 @@ pub(super) mod tests {
                 [0xfedc_ba98_7654_3210; 7]
             );
         }
-        buffers.free_buffers(&mut caches, &[copied], true, |_| {});
-        buffers.free_buffers(&mut caches, &[recycled], true, |_| {});
+        buffers.free_buffers(&mut caches, &[copied], true);
+        buffers.free_buffers(&mut caches, &[recycled], true);
         Ok(())
     }
 }

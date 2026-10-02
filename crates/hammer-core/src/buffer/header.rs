@@ -134,13 +134,6 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn take_trace_handle(&mut self) -> Option<u32> {
-        let handle = self.trace_handle();
-        self.cacheline0.flags.remove(BufferFlags::TRACED);
-        handle
-    }
-
-    #[inline]
     pub fn set_node_error_index(&mut self, error: NodeErrorIndex) {
         self.cacheline0.error = Some(error);
     }
@@ -499,7 +492,7 @@ mod tests {
             assert_eq!(buffer.current_len(), length - 2);
             assert_eq!(&buffer.current()[..2], &[15, 16]);
         }
-        buffers.free_buffers(&mut caches, &[index], true, |_| {});
+        buffers.free_buffers(&mut caches, &[index], true);
         drop(caches);
         crate::buffer::opaque::tests::metadata_copy_and_pool_recycle_preserve_secondary_storage(
             buffers,

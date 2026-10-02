@@ -82,7 +82,7 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         }
     }
     assert!(buffers.copy_no_chain(&mut caches, source).is_none());
-    buffers.free_buffers(&mut caches, &retained, true, |_| {});
+    buffers.free_buffers(&mut caches, &retained, true);
     let cached_free = buffers.cached_free_buffers(&caches, 0);
     {
         // Ownership: the fixture owns this segment until the explicit free below.
@@ -93,15 +93,15 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         // retained tail itself after ending this mutable head borrow.
         assert!(!buffer.flags().contains(BufferFlags::TOTAL_LENGTH_VALID));
         assert_eq!(buffer.node_error_index(), NodeErrorIndex::new(31));
-        assert_eq!(buffer.take_trace_handle(), Some(29));
+        assert_eq!(buffer.trace_handle(), Some(29));
     }
     let tail = buffers.buffer(&caches, source).next_buffer_slot().unwrap();
     assert_eq!(buffers.buffer(&caches, tail).current(), &[0x31; 16]);
-    BufferMain::global().free_buffers(&mut caches, &[source], true, |_| {});
+    BufferMain::global().free_buffers(&mut caches, &[source], true);
     assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 2);
     // Ownership: releasing the source chain did not release the independent copy.
     assert_eq!(buffers.buffer(&caches, response).current()[0], 0x55);
-    BufferMain::global().free_buffers(&mut caches, &[response], true, |_| {});
+    BufferMain::global().free_buffers(&mut caches, &[response], true);
     assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 3);
     Ok(())
 }

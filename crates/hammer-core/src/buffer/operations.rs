@@ -365,17 +365,17 @@ pub(super) mod tests {
                     .contains(BufferFlags::TOTAL_LENGTH_VALID)
             );
         }
-        main.free_buffers(&mut caches, &heads[..1], true, |_| {});
+        main.free_buffers(&mut caches, &heads[..1], true);
         // Ownership: the clone still retains both tail segments.
         {
             assert_eq!(main.buffer(&caches, heads[0]).ref_count(), 1);
             assert_eq!(main.buffer(&caches, tail[0]).current(), &[5, 6, 7, 8, 9]);
         }
-        main.free_buffers(&mut caches, &heads[1..], true, |_| {});
+        main.free_buffers(&mut caches, &heads[1..], true);
         let mut recycled = [0];
         assert_eq!(main.alloc_from_pool(&mut caches, &mut recycled, 1), 1);
         assert_eq!(recycled, tail);
-        main.free_buffers(&mut caches, &recycled, false, |_| {});
+        main.free_buffers(&mut caches, &recycled, false);
         #[cfg(debug_assertions)]
         {
             // buffer.c::vlib_buffer_validate_alloc_free rejects a repeated
@@ -383,7 +383,7 @@ pub(super) mod tests {
             let cached_free = main.cached_free_buffers(&caches, 1);
             assert!(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    main.free_buffers(&mut caches, &recycled, false, |_| {});
+                    main.free_buffers(&mut caches, &recycled, false);
                 }))
                 .is_err()
             );
@@ -404,7 +404,6 @@ pub(super) mod tests {
             &mut caches,
             &retained[capacity - 1..capacity],
             false,
-            |_| {},
         );
         let data_size = main.pools[0].data_size;
         let data = vec![0x5a; data_size + 1];
@@ -423,7 +422,7 @@ pub(super) mod tests {
             );
             assert_eq!(main.buffer(&caches, head).next_buffer_slot(), None);
         }
-        main.free_buffers(&mut caches, &[head], true, |_| {});
-        main.free_buffers(&mut caches, &retained[..capacity - 1], false, |_| {});
+        main.free_buffers(&mut caches, &[head], true);
+        main.free_buffers(&mut caches, &retained[..capacity - 1], false);
     }
 }
