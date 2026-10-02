@@ -12,7 +12,6 @@
 #![allow(clippy::derivable_impls)]
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use hammer_component_macros::config_function;
 use hammer_infra::{PageSize, bitmap::Bitmap};
@@ -28,8 +27,6 @@ use crate::file::WorkerFilePollMode;
 pub(crate) const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_WORKER_COUNT: usize = 2;
 pub(crate) const MAX_BLOCKING_THREADS: usize = 4;
-// hammer-runtime/src/spawn.rs
-pub(crate) const WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
 const BUFFER_SLOT_BYTES: usize = 2_048;
 const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
 // hammer-core/src/data_plane/buffer.rs
@@ -42,7 +39,6 @@ const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
 
 static STACK_SIZE: OnceLock<usize> = OnceLock::new();
 static MAX_BLOCKING: OnceLock<usize> = OnceLock::new();
-static IDLE_SLICE: OnceLock<Duration> = OnceLock::new();
 static FILE_POLL: OnceLock<WorkerFilePollMode> = OnceLock::new();
 static BUFFER: OnceLock<WorkerBuffer> = OnceLock::new();
 static HANDOFF: OnceLock<WorkerHandoff> = OnceLock::new();
@@ -82,13 +78,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     let stack_size = take_value(&mut section, "stack_size", &[])?.unwrap_or(WORKER_STACK_SIZE);
     let max_blocking_threads =
         take_value(&mut section, "max_blocking_threads", &[])?.unwrap_or(MAX_BLOCKING_THREADS);
-    let idle_slice = take_value::<humantime_serde::Serde<Duration>>(
-        &mut section,
-        "idle_slice",
-        &["poll_interval", "poll_sleep"],
-    )?
-    .map(humantime_serde::Serde::into_inner)
-    .unwrap_or(WORKER_IDLE_SLICE);
     let file_poll = take_value(&mut section, "file_poll", &[])?.unwrap_or_default();
     let buffer: WorkerBuffer = take_value(&mut section, "buffer", &[])?.unwrap_or_default();
     let handoff: WorkerHandoff = take_value(&mut section, "handoff", &[])?.unwrap_or_default();
@@ -116,7 +105,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
 
     assert!(STACK_SIZE.set(stack_size).is_ok());
     assert!(MAX_BLOCKING.set(max_blocking_threads).is_ok());
-    assert!(IDLE_SLICE.set(idle_slice).is_ok());
     assert!(FILE_POLL.set(file_poll).is_ok());
     assert!(BUFFER.set(buffer).is_ok());
     assert!(HANDOFF.set(handoff).is_ok());
@@ -145,12 +133,6 @@ pub(crate) fn stack_size() -> usize {
 
 pub(crate) fn max_blocking_threads() -> usize {
     *MAX_BLOCKING
-        .get()
-        .expect("worker configuration is installed before thread setup")
-}
-
-pub(crate) fn idle_slice() -> Duration {
-    *IDLE_SLICE
         .get()
         .expect("worker configuration is installed before thread setup")
 }
@@ -381,9 +363,10 @@ where
             return Err(E::custom("cpu.corelist-workers contains an empty item"));
         }
         if let Some((first, last)) = range.split_once('-') {
-            let first = first.trim().parse::<usize>().map_err(|_| {
-                E::custom("cpu.corelist-workers contains an invalid range")
-            })?;
+            let first = first
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| E::custom("cpu.corelist-workers contains an invalid range"))?;
             let last = last
                 .trim()
                 .parse::<usize>()
@@ -395,9 +378,9 @@ where
                 bitmap.set(core);
             }
         } else {
-            let core = range.parse::<usize>().map_err(|_| {
-                E::custom("cpu.corelist-workers contains an invalid CPU number")
-            })?;
+            let core = range
+                .parse::<usize>()
+                .map_err(|_| E::custom("cpu.corelist-workers contains an invalid CPU number"))?;
             bitmap.set(core);
         }
     }

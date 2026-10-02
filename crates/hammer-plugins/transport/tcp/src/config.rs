@@ -104,8 +104,10 @@ impl TcpPluginConfig {
                 "plugin.tcp.time_wait must be non-zero",
             ));
         }
-        if self.close_wait.is_zero() || self.fin_wait1.is_zero()
-            || self.fin_wait2.is_zero() || self.last_ack.is_zero()
+        if self.close_wait.is_zero()
+            || self.fin_wait1.is_zero()
+            || self.fin_wait2.is_zero()
+            || self.last_ack.is_zero()
             || self.closing.is_zero()
         {
             return Err(RuntimeError::config_validation(
@@ -114,12 +116,22 @@ impl TcpPluginConfig {
         }
         let max_interval = crate::timers::TCP_TIMER_RESOLUTION
             * crate::timers::TCP_TIMER_WHEEL_MAX_INTERVAL_TICKS as u32;
-        if [self.time_wait, self.close_wait, self.fin_wait1, self.fin_wait2,
-            self.last_ack, self.closing, self.retransmit.initial,
-            self.retransmit.min, self.retransmit.max,
-            self.retransmit.allocation_retry, self.keepalive.idle,
-            self.keepalive.probe_interval]
-            .into_iter().any(|interval| interval > max_interval)
+        if [
+            self.time_wait,
+            self.close_wait,
+            self.fin_wait1,
+            self.fin_wait2,
+            self.last_ack,
+            self.closing,
+            self.retransmit.initial,
+            self.retransmit.min,
+            self.retransmit.max,
+            self.retransmit.allocation_retry,
+            self.keepalive.idle,
+            self.keepalive.probe_interval,
+        ]
+        .into_iter()
+        .any(|interval| interval > max_interval)
         {
             return Err(RuntimeError::config_validation(
                 "plugin.tcp timer interval exceeds the TCP wheel range",

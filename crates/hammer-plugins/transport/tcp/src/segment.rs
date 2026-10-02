@@ -146,7 +146,10 @@ impl TcpSegment {
             header.flags.insert(TcpSegmentFlags::PSH);
         }
         let header_len = size_of::<TcpHeader>() + options.len();
-        assert!(header_len <= 60, "cached TCP options fit the protocol header");
+        assert!(
+            header_len <= 60,
+            "cached TCP options fit the protocol header"
+        );
         header.write_to_buffer_cached(buffer.push_uninit(header_len as u8), options)?;
         {
             let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);

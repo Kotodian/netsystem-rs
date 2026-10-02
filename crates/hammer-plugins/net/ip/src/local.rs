@@ -426,7 +426,6 @@ impl LocalStage {
     fn is_head_of_feature_arc(self) -> bool {
         matches!(self, Self::Head | Self::Receive)
     }
-
 }
 
 #[inline(always)]
@@ -599,10 +598,13 @@ fn process_index(
     let header_offset = network.packet_cursor().network_header_offset();
     let cursor = network.packet_cursor();
     if cursor.packet_len() == 0 {
-        return Ok((match version {
-            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
-            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-        }, Some(IpLocalError::BadLength)));
+        return Ok((
+            match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            },
+            Some(IpLocalError::BadLength),
+        ));
     }
     let (protocol, source, destination) = match version {
         IpVersion::V4 => {
@@ -738,10 +740,13 @@ fn process_index(
             .set(NetworkFlags::L4_CHECKSUM_CORRECT, checksum_correct);
     }
     if checksum_required && !checksum_correct {
-        return Ok((match version {
-            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
-            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-        }, Some(IpLocalError::BadChecksum)));
+        return Ok((
+            match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            },
+            Some(IpLocalError::BadChecksum),
+        ));
     }
     let net = NetMain::global()?;
     let source_error = match (source, destination) {
@@ -794,10 +799,13 @@ fn process_index(
         _ => None,
     };
     if let Some(error) = source_error {
-        return Ok((match version {
-            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
-            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-        }, Some(error)));
+        return Ok((
+            match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            },
+            Some(error),
+        ));
     }
     refresh_basic_metadata(runtime, index, cursor, transport_len)?;
 

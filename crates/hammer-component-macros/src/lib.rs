@@ -2537,8 +2537,10 @@ fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStr
                         PathArguments::AngleBracketed(arguments) => arguments.args.first(),
                         _ => None,
                     })
-                    .is_some_and(|argument| matches!(argument,
-                        GenericArgument::Type(Type::Tuple(tuple)) if tuple.elems.is_empty())),
+                    .is_some_and(|argument| {
+                        matches!(argument,
+                        GenericArgument::Type(Type::Tuple(tuple)) if tuple.elems.is_empty())
+                    }),
                 _ => false,
             },
             ReturnType::Default => false,

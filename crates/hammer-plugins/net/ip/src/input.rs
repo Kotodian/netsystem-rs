@@ -62,8 +62,8 @@ pub struct IpInputTrace {
 }
 
 fn format_ip_input_trace(bytes: &[u8]) -> String {
-    let (trace, _) = IpInputTrace::ref_from_prefix(bytes)
-        .expect("IP input trace has its registered layout");
+    let (trace, _) =
+        IpInputTrace::ref_from_prefix(bytes).expect("IP input trace has its registered layout");
     let packet = &trace.packet_data;
     match packet[0] >> 4 {
         4 => format!(
@@ -75,8 +75,12 @@ fn format_ip_input_trace(bytes: &[u8]) -> String {
         ),
         6 => format!(
             "ip6 {} -> {} next-header {} payload-length {}",
-            std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("IP6 source has 16 bytes")),
-            std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("IP6 destination has 16 bytes")),
+            std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(&packet[8..24]).expect("IP6 source has 16 bytes")
+            ),
+            std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(&packet[24..40]).expect("IP6 destination has 16 bytes")
+            ),
             packet[6],
             u16::from_be_bytes([packet[4], packet[5]]),
         ),

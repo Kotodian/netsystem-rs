@@ -740,7 +740,11 @@ impl SvmFifoSegment {
     /// The caller must stop using the original FIFO for each producer or
     /// consumer role transferred to the duplicate. Both entries share one
     /// header and chunk chain but retain separate process-local OOO indexes.
-    pub unsafe fn duplicate_fifo(&mut self, slice: u32, fifo: u32) -> Result<u32, FifoSegmentError> {
+    pub unsafe fn duplicate_fifo(
+        &mut self,
+        slice: u32,
+        fifo: u32,
+    ) -> Result<u32, FifoSegmentError> {
         self.slice(slice)?;
         // The slice owner controls both the original and its private duplicate.
         let duplicate = unsafe {

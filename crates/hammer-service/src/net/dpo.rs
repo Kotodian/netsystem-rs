@@ -345,7 +345,7 @@ impl DpoMain {
     /// already be inside the process barrier, just like VPP's dpo registry
     /// mutation is serialized with worker graph access.
     fn require_registration_scope() -> Result<(), DpoError> {
-        let Some(barrier) = hammer_runtime::barrier::global() else {
+        let Some(barrier) = hammer_runtime::WorkerThread::main() else {
             return Ok(());
         };
         if barrier.worker_count() == 0 {
@@ -534,10 +534,10 @@ impl DpoMain {
             }
         }
         let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if needs_barrier
             && workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+            && !hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.is_pending())
         {
             return hammer_runtime::worker_thread_barrier_sync!(runtime, {
                 self.stack_from_node_inner(runtime, child_node, parent, &parent_nodes)
@@ -660,10 +660,10 @@ impl DpoMain {
             Ok(())
         };
         let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if !edges.is_empty()
             && workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+            && !hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.is_pending())
         {
             return hammer_runtime::worker_thread_barrier_sync!(runtime, { publish(runtime) });
         }

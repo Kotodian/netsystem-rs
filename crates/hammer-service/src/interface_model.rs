@@ -966,7 +966,9 @@ impl InterfaceMain {
             .hw_if_index
             .or(primary.hw_if_index)
             .expect("hardware software-interface has a hardware owner");
-        let hardware = state.hardware_interfaces.get(hw_if_index)
+        let hardware = state
+            .hardware_interfaces
+            .get(hw_if_index)
             .expect("software interface names an occupied hardware owner");
         let device_callback = state
             .device_classes
@@ -1552,7 +1554,9 @@ impl InterfaceMain {
             .hardware_interfaces
             .get(hw_if_index)
             .expect("TX queue belongs to a live interface");
-        let frames = hardware.tx_queue_indices.iter()
+        let frames = hardware
+            .tx_queue_indices
+            .iter()
             .filter_map(|&index| state.tx_queues.get(index))
             .filter(|queue| queue.is_assigned_to(worker))
             .map(TxFrame::from)
@@ -1648,7 +1652,8 @@ impl InterfaceMain {
         hammer_runtime::ensure_main_thread()
             .expect("interface MTU callback registration is main-thread-only");
         assert!(
-            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            !hammer_runtime::WorkerThread::main()
+                .is_some_and(|barrier| barrier.worker_count() != 0),
             "interface MTU callbacks register before Data Worker startup"
         );
         self.state_mut().mtu_callbacks.push(callback);

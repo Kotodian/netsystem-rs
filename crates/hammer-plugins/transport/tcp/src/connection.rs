@@ -1377,7 +1377,9 @@ impl TcpConnection {
     pub(crate) fn record_acked_bytes(&mut self, bytes: u32) -> bool {
         let enqueue = !self.deq_pending;
         self.deq_pending = true;
-        self.burst_acked = self.burst_acked.checked_add(bytes)
+        self.burst_acked = self
+            .burst_acked
+            .checked_add(bytes)
             .expect("TCP burst ACK cannot exceed retained flight");
         enqueue
     }
@@ -1402,14 +1404,18 @@ impl TcpConnection {
         index: u32,
         timers: &mut TimerWheel1t2w2048sl<u32>,
     ) -> RuntimeResult<()> {
-        if self.snd_una == self.snd_nxt
-            || (!self.fin_sent && !self.recovery.has_unacked_data())
-        {
+        if self.snd_una == self.snd_nxt || (!self.fin_sent && !self.recovery.has_unacked_data()) {
             timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
             return Ok(());
         }
         let interval = self.retransmit_timeout().retransmit_timeout();
-        timers::update(timers, index, &mut self.timers, TcpTimerKind::Retransmit, interval)
+        timers::update(
+            timers,
+            index,
+            &mut self.timers,
+            TcpTimerKind::Retransmit,
+            interval,
+        )
     }
 
     /// VPP tcp.c:1434-1443. Pacing rate is connection-local CC output.
@@ -1550,7 +1556,11 @@ impl TcpConnection {
             available = limit.saturating_sub(sent_limited);
         }
         if self.snd_wnd < self.send_mss {
-            return if self.snd_wnd <= available { self.snd_wnd } else { 0 };
+            return if self.snd_wnd <= available {
+                self.snd_wnd
+            } else {
+                0
+            };
         }
         if available < self.send_mss {
             return if available < cwnd { 0 } else { available };
@@ -1566,7 +1576,11 @@ impl TcpConnection {
         let available = unsent
             .min(self.snd_wnd.saturating_sub(outstanding))
             .min(self.send_mss);
-        (self.congestion.congestion_window().saturating_sub(outstanding) >= available)
+        (self
+            .congestion
+            .congestion_window()
+            .saturating_sub(outstanding)
+            >= available)
             .then_some(available)
             .unwrap_or(0)
     }
@@ -1589,8 +1603,8 @@ impl TcpConnection {
             self.base.pacer.bucket = 0;
         }
         if self.psh_pending {
-            let queued = u32::try_from(tx_fifo.max_dequeue())
-                .expect("TCP Session TX FIFO size fits u32");
+            let queued =
+                u32::try_from(tx_fifo.max_dequeue()).expect("TCP Session TX FIFO size fits u32");
             self.psh_sequence = self.snd_una.advance(queued.wrapping_sub(1));
         }
     }
@@ -1600,8 +1614,8 @@ impl TcpConnection {
         if self.psh_pending {
             return;
         }
-        let queued = u32::try_from(tx_fifo.max_dequeue())
-            .expect("TCP Session TX FIFO size fits u32");
+        let queued =
+            u32::try_from(tx_fifo.max_dequeue()).expect("TCP Session TX FIFO size fits u32");
         self.psh_pending = true;
         self.psh_sequence = self.snd_una.advance(queued.wrapping_sub(1));
     }
@@ -1641,8 +1655,7 @@ impl TcpConnection {
         let outstanding = self.snd_una.distance_to(self.snd_nxt);
         if max_dequeue >= cwnd
             || outstanding >= cwnd
-            || (cwnd.saturating_sub(outstanding) < self.send_mss
-                && max_dequeue > outstanding)
+            || (cwnd.saturating_sub(outstanding) < self.send_mss && max_dequeue > outstanding)
         {
             self.cwnd_limited_sequence = self.snd_nxt;
         }
@@ -1988,24 +2001,44 @@ impl TcpConnection {
                 self.rcv_nxt = self.rcv_nxt.advance(1);
                 self.fin_received = true;
                 self.state = TcpState::CloseWait;
-                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    crate::active_tcp_policy().close_wait)?;
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::WaitClose,
+                    crate::active_tcp_policy().close_wait,
+                )?;
             }
             TcpState::FinWait1 => {
                 self.rcv_nxt = self.rcv_nxt.advance(1);
                 self.fin_received = true;
                 if self.fin_pending {
-                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                        crate::active_tcp_policy().close_wait)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::WaitClose,
+                        crate::active_tcp_policy().close_wait,
+                    )?;
                 } else if self.fin_sent && self.snd_una == self.snd_nxt {
                     self.state = TcpState::TimeWait;
                     let time_wait = self.time_wait;
-                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                        time_wait)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::WaitClose,
+                        time_wait,
+                    )?;
                 } else {
                     self.state = TcpState::Closing;
-                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                        crate::active_tcp_policy().closing)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::WaitClose,
+                        crate::active_tcp_policy().closing,
+                    )?;
                 }
             }
             TcpState::FinWait2 => {
@@ -2013,8 +2046,13 @@ impl TcpConnection {
                 self.fin_received = true;
                 self.state = TcpState::TimeWait;
                 let time_wait = self.time_wait;
-                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    time_wait)?;
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::WaitClose,
+                    time_wait,
+                )?;
             }
             _ => return Ok(None),
         }
@@ -2085,8 +2123,13 @@ impl TcpConnection {
                         self.state = TcpState::Closed;
                     } else {
                         self.state = TcpState::FinWait2;
-                        timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                            crate::active_tcp_policy().fin_wait2)?;
+                        timers::update(
+                            timers,
+                            index,
+                            &mut self.timers,
+                            TcpTimerKind::WaitClose,
+                            crate::active_tcp_policy().fin_wait2,
+                        )?;
                     }
                 }
                 Ok(None)
@@ -2191,10 +2234,7 @@ impl TcpConnection {
                     .rcv_nxt
                     .advance(accepted.get().saturating_add(promoted));
             }
-            RxDelivery::OutOfOrder {
-                newest,
-                ..
-            } => {
+            RxDelivery::OutOfOrder { newest, .. } => {
                 if let Some((start, length)) = newest {
                     let left = self.rcv_nxt.advance(start);
                     let right = left.advance(length.get());
@@ -2237,8 +2277,14 @@ impl TcpConnection {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::FinWait1;
                 send_fin = true;
-                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    policy.fin_wait1).expect("validated FIN-WAIT-1 interval fits TCP wheel");
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::WaitClose,
+                    policy.fin_wait1,
+                )
+                .expect("validated FIN-WAIT-1 interval fits TCP wheel");
             }
             TcpState::Established => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
@@ -2247,8 +2293,14 @@ impl TcpConnection {
                 timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
                 self.fin_pending = tx_queued;
                 send_fin = !tx_queued;
-                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    policy.fin_wait1).expect("validated FIN-WAIT-1 interval fits TCP wheel");
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::WaitClose,
+                    policy.fin_wait1,
+                )
+                .expect("validated FIN-WAIT-1 interval fits TCP wheel");
             }
             TcpState::CloseWait => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
@@ -2258,23 +2310,40 @@ impl TcpConnection {
                 if !tx_queued {
                     self.state = TcpState::LastAck;
                     send_fin = true;
-                    timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                        policy.last_ack).expect("validated LAST-ACK interval fits TCP wheel");
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::WaitClose,
+                        policy.last_ack,
+                    )
+                    .expect("validated LAST-ACK interval fits TCP wheel");
                 }
             }
             TcpState::FinWait1 => {
-                timers::update(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    policy.fin_wait1).expect("validated FIN-WAIT-1 interval fits TCP wheel");
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::WaitClose,
+                    policy.fin_wait1,
+                )
+                .expect("validated FIN-WAIT-1 interval fits TCP wheel");
             }
             _ => {}
         }
         if !send_fin {
             return None;
         }
-        let local = self.local.expect("closing TCP connection has a local endpoint");
+        let local = self
+            .local
+            .expect("closing TCP connection has a local endpoint");
         let segment = self.control_segment(
-            local, self.remote, TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
-            None, TcpCapabilities::default(),
+            local,
+            self.remote,
+            TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            None,
+            TcpCapabilities::default(),
         );
         self.snd_nxt = self.snd_nxt.advance(1);
         self.fin_sent = true;
@@ -2302,9 +2371,9 @@ impl TcpConnection {
             }
             TcpTimerKind::Persist => self.on_persist_timer_expiry(),
             TcpTimerKind::KeepAlive => self.on_keepalive_timer_expiry(),
-            TcpTimerKind::WaitClose => TcpTimerOutcome::segment(
-                self.on_wait_close_timer_expiry(index, timers),
-            ),
+            TcpTimerKind::WaitClose => {
+                TcpTimerOutcome::segment(self.on_wait_close_timer_expiry(index, timers))
+            }
             TcpTimerKind::Pacing => TcpTimerOutcome::segment(self.on_pacing_timer_expiry()),
         };
 
@@ -2448,8 +2517,7 @@ impl TcpConnection {
             ));
         }
         match self.state {
-            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1
-                if !self.fin_sent => {
+            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 if !self.fin_sent => {
                 let now = Instant::now();
                 let Some(sample) = self.recovery.on_retransmission_timeout(
                     now,
@@ -2509,10 +2577,14 @@ impl TcpConnection {
         if self.ensure_state(TcpState::Established).is_err() {
             return Ok(TcpTimerOutcome::none());
         }
-        if self.recovery.tlp_timeout(
-            self.retransmit_timeout().smoothed_rtt(),
-            self.retransmit_timeout().retransmit_timeout(),
-        ).is_none() {
+        if self
+            .recovery
+            .tlp_timeout(
+                self.retransmit_timeout().smoothed_rtt(),
+                self.retransmit_timeout().retransmit_timeout(),
+            )
+            .is_none()
+        {
             return Ok(TcpTimerOutcome::none());
         }
         Ok(TcpTimerOutcome::acted(TcpTimerAction::TlpProbe, None))
@@ -2563,14 +2635,20 @@ impl TcpConnection {
         timers: &mut TimerWheel1t2w2048sl<u32>,
     ) -> Option<TcpSegment> {
         let state = self.state;
-        if !matches!(state, TcpState::CloseWait | TcpState::FinWait1
-            | TcpState::FinWait2 | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait)
-        {
+        if !matches!(
+            state,
+            TcpState::CloseWait
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait
+        ) {
             return None;
         }
         for id in 0..TCP_TIMER_KIND_COUNT as u32 {
-            let kind = TcpTimerKind::from_id(id)
-                .expect("TCP timer count covers every registered kind");
+            let kind =
+                TcpTimerKind::from_id(id).expect("TCP timer count covers every registered kind");
             timers::reset(timers, index, &mut self.timers, kind);
         }
         match state {
@@ -2580,28 +2658,45 @@ impl TcpConnection {
                 self.fin_pending = false;
                 self.fin_sent = true;
                 let local = self.local.expect("closing TCP has a local endpoint");
-                let segment = self.control_segment(local, self.remote,
+                let segment = self.control_segment(
+                    local,
+                    self.remote,
                     TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
-                    None, TcpCapabilities::default());
+                    None,
+                    TcpCapabilities::default(),
+                );
                 self.snd_nxt = self.snd_nxt.advance(1);
-                timers::set(timers, index, &mut self.timers, TcpTimerKind::WaitClose,
-                    crate::active_tcp_policy().last_ack)
-                    .expect("validated LAST-ACK interval fits TCP wheel");
+                timers::set(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::WaitClose,
+                    crate::active_tcp_policy().last_ack,
+                )
+                .expect("validated LAST-ACK interval fits TCP wheel");
                 Some(segment)
             }
             TcpState::FinWait1 if self.fin_pending => {
                 self.state = TcpState::Closed;
                 let local = self.local.expect("closing TCP has a local endpoint");
-                Some(self.control_segment(local, self.remote,
+                Some(self.control_segment(
+                    local,
+                    self.remote,
                     TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
-                    None, TcpCapabilities::default()))
+                    None,
+                    TcpCapabilities::default(),
+                ))
             }
             TcpState::FinWait2 => {
                 self.state = TcpState::Closed;
                 let local = self.local.expect("closing TCP has a local endpoint");
-                Some(self.control_segment(local, self.remote,
+                Some(self.control_segment(
+                    local,
+                    self.remote,
                     TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
-                    None, TcpCapabilities::default()))
+                    None,
+                    TcpCapabilities::default(),
+                ))
             }
             _ => {
                 self.state = TcpState::Closed;

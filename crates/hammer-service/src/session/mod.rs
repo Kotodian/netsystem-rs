@@ -18,24 +18,21 @@ pub mod node;
 pub mod segment_manager;
 pub mod table;
 
+pub use app::{AppWorker, ApplicationError, ApplicationListener, ApplicationMain};
 pub use app::{ApplicationConfig, ApplicationEventResult, ApplicationFlags, SessionCleanup};
-pub use app::{ApplicationError, ApplicationMain, ApplicationListener, AppWorker};
 pub use core::{
-    PoolReallocationState, RxDelivery, SESSION_INDEX_INVALID, AppSession, Session,
-    SessionConfig, SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement,
-    SessionEventEnqueue, SessionEventType, SessionFlags, SessionHandle, SessionMain,
-    SessionMigrationRequest, SessionMigrationState, SessionRxSegment, SessionState,
-    SessionTxContext, SessionTxDispatch, SessionTxOutcome, SessionWorker,
-    SessionWorkerFlags, SessionWorkerState,
-    enqueue_notify, program_transport_io_event, program_tx_io_event, send_control_event,
-    send_rpc_event, send_rpc_event_force,
+    AppSession, PoolReallocationState, RxDelivery, SESSION_INDEX_INVALID, Session, SessionConfig,
+    SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement, SessionEventEnqueue,
+    SessionEventType, SessionFlags, SessionHandle, SessionMain, SessionMigrationRequest,
+    SessionMigrationState, SessionRxSegment, SessionState, SessionTxContext, SessionTxDispatch,
+    SessionTxOutcome, SessionWorker, SessionWorkerFlags, SessionWorkerState, enqueue_notify,
+    program_transport_io_event, program_tx_io_event, send_control_event, send_rpc_event,
+    send_rpc_event_force,
 };
 pub use endpoint::{SessionEndpoint, SessionEndpointConfig, SessionEndpointFlags};
 pub use error::{SessionError, SessionQueueError};
 pub use lookup::{SessionLookup, SessionLookupResult};
-pub use node::{
-    SESSION_QUEUE_IO_BUDGET, SessionInputNode, SessionQueueNext, SessionQueueNode,
-};
+pub use node::{SESSION_QUEUE_IO_BUDGET, SessionInputNode, SessionQueueNext, SessionQueueNode};
 pub use segment_manager::{
     SegmentManager, SegmentManagerError, SegmentManagerFlags, SegmentManagerMain,
     SegmentManagerProperties,
@@ -46,11 +43,13 @@ pub use table::SessionTable;
 fn init_session() -> RuntimeResult<()> {
     let worker_count = hammer_runtime::config::worker::worker_count();
     let mut config = core::SessionConfig::default();
-    config.worker_count = u32::try_from(worker_count)
-        .expect("configured worker count fits u32");
+    config.worker_count = u32::try_from(worker_count).expect("configured worker count fits u32");
     let queue_length = config.configured_worker_mq_length.max(2_048);
     let rings = [
-        SvmMsgQRingConfig::new(queue_length, std::mem::size_of::<core::SessionEvent>() as u32),
+        SvmMsgQRingConfig::new(
+            queue_length,
+            std::mem::size_of::<core::SessionEvent>() as u32,
+        ),
         SvmMsgQRingConfig::new(queue_length >> 1, 256),
     ];
     let queue_config = SvmMsgQConfig {
@@ -65,7 +64,10 @@ fn init_session() -> RuntimeResult<()> {
             size.checked_mul(worker_count)
                 .ok_or(SvmMsgQError::LayoutOverflow)
         })
-        .and_then(|size| size.checked_add(1 << 20).ok_or(SvmMsgQError::LayoutOverflow))
+        .and_then(|size| {
+            size.checked_add(1 << 20)
+                .ok_or(SvmMsgQError::LayoutOverflow)
+        })
         .map_err(|source| SessionQueueError::SegmentCreate {
             source: FifoSegmentError::from(source),
         })?

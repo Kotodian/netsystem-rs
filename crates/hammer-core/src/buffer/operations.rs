@@ -400,11 +400,7 @@ pub(super) mod tests {
         let mut unavailable = [u32::MAX; 2];
         assert_eq!(main.alloc_from_pool(&mut caches, &mut unavailable, 0), 0);
         assert_eq!(unavailable, [u32::MAX; 2]);
-        main.free_buffers(
-            &mut caches,
-            &retained[capacity - 1..capacity],
-            false,
-        );
+        main.free_buffers(&mut caches, &retained[capacity - 1..capacity], false);
         let data_size = main.pools[0].data_size;
         let data = vec![0x5a; data_size + 1];
         let mut head = u32::MAX;

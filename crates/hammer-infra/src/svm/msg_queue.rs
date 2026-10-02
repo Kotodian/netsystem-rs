@@ -1011,10 +1011,7 @@ impl SvmMsgQ {
     /// The caller must exclusively own this dequeued descriptor, keep it
     /// allocated until the returned slice is no longer used, and prevent any
     /// writer from mutating the slot during the borrow.
-    pub unsafe fn message_bytes(
-        &self,
-        message: SvmMsgQDescriptor,
-    ) -> Result<&[u8], SvmMsgQError> {
+    pub unsafe fn message_bytes(&self, message: SvmMsgQDescriptor) -> Result<&[u8], SvmMsgQError> {
         let (ring_index, _) = self.validate_descriptor(message)?;
         let stored = self.ring(ring_index)?.elsize as usize;
         let source = unsafe { self.message_data(message)? };

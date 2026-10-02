@@ -203,9 +203,11 @@ impl FromStr for WaitArgs {
         let seconds = if argument.is_empty() {
             1.0
         } else {
-            argument.parse::<f64>().map_err(|_| CliError::InvalidArgument {
-                argument: argument.to_owned(),
-            })?
+            argument
+                .parse::<f64>()
+                .map_err(|_| CliError::InvalidArgument {
+                    argument: argument.to_owned(),
+                })?
         };
         if !seconds.is_finite()
             || seconds <= 0.0

@@ -6,8 +6,8 @@ use std::cell::UnsafeCell;
 use std::net::SocketAddr;
 
 use crate::TcpCapabilities;
-use hammer_service::session::SessionHandle;
 use hammer_runtime::{DataWorkerId, RuntimeResult};
+use hammer_service::session::SessionHandle;
 
 use super::lookup::TcpLookupId;
 

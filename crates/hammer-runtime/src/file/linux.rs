@@ -313,6 +313,7 @@ impl Poller {
         &mut self,
         ready: &mut [PollEvent; POLL_BATCH_SIZE],
     ) -> RuntimeResult<usize> {
+        self.clear_wake();
         let mut count = 0;
         let mut multishot_unsupported = false;
         while count < ready.len() {
@@ -372,6 +373,27 @@ impl Poller {
             submit(&self.ring)?;
         }
         Ok(count)
+    }
+
+    /// The io_uring CQ eventfd is a readiness hint, not the completion
+    /// consumer. The next `poll` drains the CQ and validates its tokens.
+    pub(super) fn wait(&self, timeout: Duration) -> RuntimeResult<()> {
+        let mut descriptor = libc::pollfd {
+            fd: self.wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: descriptor is writable and the eventfd remains owned by this Poller.
+        let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if result >= 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::Interrupted {
+            return Ok(());
+        }
+        Err(io_error("wait for worker File readiness", source))
     }
 
     fn cancel(&mut self, index: u32) -> RuntimeResult<()> {

@@ -47,8 +47,8 @@ struct Ip6LookupTrace {
 }
 
 pub(crate) fn format_ip4_lookup_trace(bytes: &[u8]) -> String {
-    let (trace, _) = Ip4LookupTrace::ref_from_prefix(bytes)
-        .expect("IP4 lookup trace has its registered layout");
+    let (trace, _) =
+        Ip4LookupTrace::ref_from_prefix(bytes).expect("IP4 lookup trace has its registered layout");
     let packet = &trace.packet_data;
     format!(
         "fib {} dpo-idx {} flow hash: 0x{:08x}\n  ip4 {} -> {}",
@@ -61,8 +61,8 @@ pub(crate) fn format_ip4_lookup_trace(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn format_ip6_lookup_trace(bytes: &[u8]) -> String {
-    let (trace, _) = Ip6LookupTrace::ref_from_prefix(bytes)
-        .expect("IP6 lookup trace has its registered layout");
+    let (trace, _) =
+        Ip6LookupTrace::ref_from_prefix(bytes).expect("IP6 lookup trace has its registered layout");
     let packet = &trace.packet_data;
     format!(
         "fib {} dpo-idx {} flow hash: 0x{:08x}\n  ip6 {} -> {}",
@@ -70,7 +70,9 @@ pub(crate) fn format_ip6_lookup_trace(bytes: &[u8]) -> String {
         trace.dpo_index,
         trace.flow_hash,
         Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("IP6 source has 16 bytes")),
-        Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("IP6 destination has 16 bytes")),
+        Ipv6Addr::from(
+            <[u8; 16]>::try_from(&packet[24..40]).expect("IP6 destination has 16 bytes")
+        ),
     )
 }
 
@@ -975,7 +977,12 @@ pub(crate) fn trace_lookup_frame(
 }
 
 #[inline(always)]
-fn trace_lookup_buffer(runtime: &mut DataPlaneMain, node: &NodeRuntime, index: u32, version: IpVersion) {
+fn trace_lookup_buffer(
+    runtime: &mut DataPlaneMain,
+    node: &NodeRuntime,
+    index: u32,
+    version: IpVersion,
+) {
     if unlikely(runtime.buffer(index).trace_handle().is_some()) {
         let (dpo_index, flow_hash, fib_index, packet_ptr, copy_len) = {
             let buffer = runtime.buffer(index);

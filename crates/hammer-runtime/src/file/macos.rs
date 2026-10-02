@@ -62,6 +62,11 @@ impl Poller {
         false
     }
 
+    pub(super) fn wait(&self, timeout: Duration) -> RuntimeResult<()> {
+        std::thread::park_timeout(timeout);
+        Ok(())
+    }
+
     pub(super) fn modify(&self, before: PollSpec, after: PollSpec) -> RuntimeResult<()> {
         self.update(Some(before), Some(after))
     }

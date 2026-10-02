@@ -1,7 +1,7 @@
 use rand::{SeedableRng, rngs::SmallRng};
 use std::cell::Cell;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMode};
@@ -13,6 +13,7 @@ use hammer_core::error::DataPlaneError;
 use hammer_infra::PageSize;
 use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 use hammer_infra::bitmap::Bitmap;
+use hammer_infra::timer_wheel::{TimerHandle, TimerStartError, TimerWheel1t3w1024slOv};
 use hammer_stats::DirectoryIndex;
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
@@ -58,6 +59,10 @@ pub struct DataPlaneMain {
     cpu_pinned: bool,
     pub(crate) enqueue_next: crate::graph::fanout::EnqueueNextFn,
     file_main: FileMode,
+    /// VPP `vlib_main_t::timing_wheel`, owned by this dispatch thread.
+    timing_wheel: TimerWheel1t3w1024slOv<NodeId>,
+    timing_wheel_last_advance: Instant,
+    expired_timers: Vec<NodeId>,
     /// Main loops completed in the current reporting interval
     /// (`loops_this_reporting_interval` in VPP's `vlib_main_t`).
     loops_this_reporting_interval: u64,
@@ -90,6 +95,68 @@ const _: () = {
 };
 
 impl DataPlaneMain {
+    pub(crate) const TIMER_TICK: Duration = Duration::from_micros(10);
+
+    /// VPP `vlib_tw_timer_start` for a scheduled Node. Timer payloads are
+    /// graph identities, never File or transport-specific state.
+    pub fn start_node_timer(
+        &mut self,
+        node: NodeId,
+        ticks: u64,
+    ) -> Result<TimerHandle, TimerStartError> {
+        self.nodes
+            .node_kind(node)
+            .expect("scheduled timer names a registered Node");
+        self.advance_node_timers();
+        self.timing_wheel.start(node, ticks)
+    }
+
+    #[inline]
+    pub fn stop_node_timer(&mut self, handle: TimerHandle) -> bool {
+        self.timing_wheel.stop(handle)
+    }
+
+    /// VPP `vlib_tw_timer_first_expires_in_ticks`: File poll reads this from
+    /// its DataPlane Main before choosing a sleep timeout.
+    pub(crate) fn timer_first_expires_in_ticks(&self) -> Option<u32> {
+        if self.timing_wheel.is_empty() {
+            return None;
+        }
+        let ticks = self
+            .timing_wheel
+            .first_expires_in_ticks()
+            .expect("the DataPlane timing wheel has a fast-slot bitmap");
+        let elapsed_ticks = self.timing_wheel_last_advance.elapsed().as_micros()
+            / Self::TIMER_TICK.as_micros();
+        Some(ticks.saturating_sub(elapsed_ticks.min(u128::from(u32::MAX)) as u32))
+    }
+
+    /// VPP `vlib_tw_timer_expire_timers` and `process_expired_timers`'s
+    /// scheduled-Node arm. Only this thread advances its wheel.
+    pub(crate) fn advance_node_timers(&mut self) {
+        let now = Instant::now();
+        if self.timing_wheel.is_empty() {
+            self.timing_wheel_last_advance = now;
+            return;
+        }
+        let ticks = (now - self.timing_wheel_last_advance).as_micros()
+            / Self::TIMER_TICK.as_micros();
+        let ticks = ticks.min(u128::from(u32::MAX)) as u32;
+        if ticks == 0 {
+            return;
+        }
+        self.timing_wheel.expire(ticks, &mut self.expired_timers);
+        self.timing_wheel_last_advance += Self::TIMER_TICK * ticks;
+        for node in self.expired_timers.drain(..) {
+            self.nodes
+                .schedule_node(node)
+                .expect("timer expiration names a registered Node");
+        }
+        if self.timing_wheel.is_empty() {
+            self.timing_wheel_last_advance = now;
+        }
+    }
+
     /// Installs the main-loop queue check before Process Nodes start.
     /// VPP: `vlib_set_queue_signal_callback`, vlib/main.h:462-466.
     pub fn set_queue_signal_callback(

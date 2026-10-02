@@ -92,8 +92,6 @@ pub use file::{
     FileReadinessMode, WorkerFilePollMode,
 };
 
-pub mod barrier;
-pub use barrier::WorkerBarrier;
 pub mod init;
 pub mod log;
 pub mod main_loop;
@@ -146,13 +144,13 @@ pub use worker_thread::WorkerThread;
 #[macro_export]
 macro_rules! worker_thread_barrier_sync {
     ($body:block) => {{
-        let __worker_barrier_guard = $crate::barrier::__main_sync_guard();
+        let __worker_barrier_guard = $crate::WorkerThread::__main_sync_guard();
         let __worker_barrier_result = $body;
         drop(__worker_barrier_guard);
         __worker_barrier_result
     }};
     ($main:expr, $body:block) => {{
-        let __worker_barrier_guard = $crate::barrier::__sync_guard($main);
+        let __worker_barrier_guard = $crate::WorkerThread::__sync_guard($main);
         let __worker_barrier_result = $body;
         drop(__worker_barrier_guard);
         __worker_barrier_result

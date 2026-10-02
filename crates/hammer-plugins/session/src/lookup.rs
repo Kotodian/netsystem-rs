@@ -1,7 +1,7 @@
+use hammer_core::session::SessionHandle;
 use hammer_infra::bihash::BihashIter;
 use hammer_infra::pool::Pool;
 use hammer_plugin_ip::{IpVersion, fib_table_lock, fib_table_unlock};
-use hammer_core::session::SessionHandle;
 use hammer_service::net::FibSource;
 use hammer_service::session::{SessionLookup, SessionLookupResult};
 use std::cell::UnsafeCell;

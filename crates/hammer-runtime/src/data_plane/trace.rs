@@ -20,7 +20,10 @@ impl DataPlaneMain {
     }
 
     pub(crate) fn start_main_loop_trace_clock(&mut self) {
-        assert_eq!(self.thread_index, 0, "thread zero sets trace display origin");
+        assert_eq!(
+            self.thread_index, 0,
+            "thread zero sets trace display origin"
+        );
         self.main_loop_start_ticks = hammer_infra::time::cpu_time_now();
     }
 
@@ -153,7 +156,9 @@ impl DataPlaneMain {
             .expect("checked occupied trace index");
         let words = core::mem::size_of::<T>().div_ceil(16);
         let start = trace.len();
-        let end = start.checked_add(1 + words).expect("trace length fits usize");
+        let end = start
+            .checked_add(1 + words)
+            .expect("trace length fits usize");
         trace.resize(
             end,
             TraceHeader {
@@ -168,8 +173,8 @@ impl DataPlaneMain {
             n_data: u32::try_from(words).expect("trace payload count fits u32"),
         };
         let bytes = trace[start + 1..end].as_mut_bytes();
-        let (payload, _) = T::mut_from_prefix(bytes)
-            .expect("zeroed trace payload has T's size and alignment");
+        let (payload, _) =
+            T::mut_from_prefix(bytes).expect("zeroed trace payload has T's size and alignment");
         Some(payload)
     }
 
@@ -237,7 +242,9 @@ impl DataPlaneMain {
             .current_node()
             .ok_or(RuntimeError::NodeDispatchContextMissing)?;
         let index = self.nodes.node_error_index(node, error.local_code())?;
-        if count != 0 && let Some(entry) = self.node_error_stats_entry_index.get() {
+        if count != 0
+            && let Some(entry) = self.node_error_stats_entry_index.get()
+        {
             StatsMain::global()?.segment.increment_simple_counter(
                 entry,
                 self.thread_index(),

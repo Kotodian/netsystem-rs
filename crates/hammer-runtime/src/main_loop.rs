@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -195,7 +196,10 @@ where
             )
         })?;
 
-        crate::worker_thread_barrier_sync!({});
+        crate::WorkerThread::main()
+            .expect("workers are installed before Process startup")
+            .initial_barrier_sync_and_release();
+
         main.borrow_mut()
             .start_processes(global.node_registrations.iter().copied())?;
         DataPlaneMain::run_main_until(main, future)?
@@ -227,47 +231,50 @@ where
             (Ok(()), Ok(())) => Ok(output),
         }
     };
-    match crate::barrier::global() {
-        Some(barrier) if !barrier.startup_cancelled() => barrier.final_sync(finish),
-        _ => finish(),
+    if let Some(thread) = crate::WorkerThread::main()
+        && !thread.startup_cancelled()
+    {
+        thread.sync(std::panic::Location::caller());
     }
+    finish()
 }
 
 /// VPP-style fixed-schedule data-plane main loop.
 ///
 /// Step order mirrors VPP `main.c:1442-1693`:
 /// 1. Barrier check (workers_at_barrier / wait_at_barrier)
-/// 2. Poll worker-local File readiness
-/// 3. Drain handoff and run ready nodes
+/// 2. Drain handoff, then poll worker-local File readiness when due
+/// 3. Run ready nodes
 /// 4. Schedule polling-state driver nodes (periodically)
 /// 5. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
-/// 6. Dispatch timer nodes (no timer wheel in data-plane yet)
-/// 7. Advance timers, increment the thread's main-loop counter and check exit
-pub fn data_plane_main_loop(worker: &crate::WorkerThread, idle_slice: Duration) -> i32 {
+/// 6. Expire the DataPlane Main timing wheel
+/// 7. Increment the thread's main-loop counter and check exit
+pub fn data_plane_main_loop(worker: &crate::WorkerThread) -> i32 {
     // SAFETY: this is the owning Worker, before the first barrier check.
     unsafe { crate::ThreadMain::global().worker_main_on_worker(worker) }
         .attach_worker_interrupt_thread();
     let file_poll = crate::config::worker::file_poll();
+    let barrier = crate::WorkerThread::main().expect("worker barrier installs before dispatch");
+    let files = crate::file::FILE_MAIN
+        .get()
+        .expect("FileMain initializes before Data Worker dispatch");
+    let mut file_poll_skip_loops = 0u32;
+    let mut last_barrier_release = Instant::now();
 
     loop {
         // The preceding iteration's mutable main borrow has ended before
         // this VPP worker-barrier acknowledgement.
-        let barrier = crate::barrier::global();
-        let refork_required = if let Some(barrier) = &barrier
-            && barrier.is_pending()
-        {
-            barrier.check_for_refork()
-        } else {
-            false
-        };
+        let barrier_waited = barrier.is_pending();
+        let refork_required = barrier.check();
+        if barrier_waited {
+            last_barrier_release = Instant::now();
+        }
         // SAFETY: the barrier check has returned and only this Worker borrows
         // its main until the end of this loop iteration.
         let main = unsafe { crate::ThreadMain::global().worker_main_on_worker(worker) };
         if refork_required {
-            let barrier = barrier.expect("refork requires an installed barrier");
             barrier.refork(&mut main.nodes);
-            if let Err(error) = main.select_node_functions() {
-                tracing::error!(worker = main.thread_index(), %error, "Node Function selection failed");
+            if main.select_node_functions().is_err() {
                 return 1;
             }
         }
@@ -280,48 +287,92 @@ pub fn data_plane_main_loop(worker: &crate::WorkerThread, idle_slice: Duration) 
         // this iteration measures from it or from the previous dispatch's end.
         main.last_time_stamp = hammer_infra::time::cpu_time_now();
 
-        // Step 2: Poll worker-local File readiness before graph dispatch.
-        match main.poll_file_readiness() {
-            Ok(dispatched) => progress |= dispatched != 0,
-            Err(error) => {
-                tracing::error!(worker = main.thread_index(), %error, "File poll failed");
-                return 1;
+        match main.schedule_remote_interrupts() {
+            Ok(scheduled) => progress |= scheduled != 0,
+            Err(_) => return 1,
+        }
+        match main.schedule_worker_node_interrupts() {
+            Ok(scheduled) => progress |= scheduled != 0,
+            Err(_) => return 1,
+        }
+
+        // VPP `vlib_file_poll`: skip File checks for a bounded number of
+        // busy dispatch rounds; otherwise only an idle adaptive worker waits.
+        if file_poll_skip_loops != 0 {
+            file_poll_skip_loops -= 1;
+        } else {
+            let busy = worker.last_vectors_per_main_loop().load(Ordering::Relaxed) >= 2
+                || main.nodes.has_polling_input_nodes()
+                || last_barrier_release.elapsed() < Duration::from_millis(500);
+            if busy {
+                file_poll_skip_loops = 1024;
+            } else {
+                let may_wait = matches!(file_poll, crate::file::WorkerFilePollMode::Adaptive)
+                    && !progress
+                    && !barrier.is_pending()
+                    && !worker.has_node_interrupts()
+                    && !main.nodes.has_pending_work();
+                match main.poll_file_readiness() {
+                    Ok(dispatched) => progress |= dispatched != 0,
+                    Err(_) => return 1,
+                }
+                if may_wait && !progress {
+                    // File poll clears the CQ eventfd. Recheck handoff after
+                    // that clear so a concurrent notification cannot be lost
+                    // before the worker enters its bounded wait.
+                    match main.schedule_remote_interrupts() {
+                        Ok(scheduled) => progress |= scheduled != 0,
+                        Err(_) => return 1,
+                    }
+                    match main.schedule_worker_node_interrupts() {
+                        Ok(scheduled) => progress |= scheduled != 0,
+                        Err(_) => return 1,
+                }
+                if may_wait
+                    && !progress
+                    && !barrier.is_pending()
+                    && !worker.has_node_interrupts()
+                    && !main.nodes.has_pending_work()
+                {
+                    let pending = files.has_pending_for_worker(main.thread_index());
+                    match pending {
+                        Ok(false) => {
+                            if files.wait_for_worker(main).is_err() {
+                                return 1;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => return 1,
+                    }
+                }
             }
         }
-        if let Ok(scheduled) = main.schedule_remote_interrupts() {
-            progress |= scheduled != 0;
+        if main.schedule_polling_pre_input_nodes().is_err() {
+            return 1;
         }
-        if let Ok(scheduled) = main.schedule_worker_node_interrupts() {
-            progress |= scheduled != 0;
+        if main.schedule_interrupt_pre_input_nodes().is_err() {
+            return 1;
         }
-        if let Ok(scheduled) = main.schedule_polling_pre_input_nodes() {
-            progress |= scheduled != 0;
+        if main.schedule_polling_driver_nodes().is_err() {
+            return 1;
         }
-        if let Ok(scheduled) = main.schedule_interrupt_pre_input_nodes() {
-            progress |= scheduled != 0;
-        }
-        if let Ok(scheduled) = main.schedule_polling_driver_nodes() {
-            progress |= scheduled != 0;
-        }
-        if let Ok(scheduled) = main.schedule_interrupt_driver_nodes() {
-            progress |= scheduled != 0;
+        if main.schedule_interrupt_driver_nodes().is_err() {
+            return 1;
         }
 
         // Step 3: Drain handoff queues and run ready nodes.
         let _ = main.run_ready_nodes();
 
-        if !progress && matches!(file_poll, crate::file::WorkerFilePollMode::Adaptive) {
-            std::thread::park_timeout(idle_slice);
-        }
-
         // Step 4: Run any newly-scheduled frames (pre-input + input)
         let _ = main.run_ready_nodes();
 
-        // Step 5: Dispatch timer nodes (no data-plane timer wheel yet)
-
-        // Step 6: Advance timers — deferred (no data-plane timer wheel yet).
-        // VPP dispatches timer-wheel-expired sched nodes here.
+        // Step 5: Expire per-thread Node timers. Their scheduled frames run
+        // at the next graph dispatch point, as in VPP's timing-wheel pass.
+        main.advance_node_timers();
         // Increment loop count.
+        worker
+            .last_vectors_per_main_loop()
+            .store(main.max_internal_frame_vectors(), Ordering::Relaxed);
         main.increment_main_loop_count();
 
         // Step 7: Exit check

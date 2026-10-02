@@ -22,9 +22,12 @@ impl DataPlaneMain {
 
     pub fn new_main(threads: &crate::ThreadMain) -> RuntimeResult<Self> {
         let thread_count = usize::try_from(threads.worker_count())
-            .expect("configured worker count fits usize") + 1;
+            .expect("configured worker count fits usize")
+            + 1;
         if thread_count > crate::trace::TRACE_THREAD_LIMIT as usize {
-            return Err(RuntimeError::TraceThreadCapacity { count: thread_count });
+            return Err(RuntimeError::TraceThreadCapacity {
+                count: thread_count,
+            });
         }
         let buffer = crate::config::worker::buffer();
         let physmem = crate::config::physmem::physmem();
@@ -149,6 +152,9 @@ impl DataPlaneMain {
             cpu_pinned: false,
             enqueue_next: crate::graph::fanout::enqueue_next_base,
             file_main,
+            timing_wheel: hammer_infra::timer_wheel::TimerWheel1t3w1024slOv::new(0),
+            timing_wheel_last_advance: Instant::now(),
+            expired_timers: Vec::new(),
             loops_this_reporting_interval: 0,
             loop_interval_start: None,
             loop_interval_end: Instant::now(),

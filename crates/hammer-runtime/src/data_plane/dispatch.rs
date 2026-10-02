@@ -58,10 +58,9 @@ impl DataPlaneMain {
                 processes.push(entry.process);
             }
         }
-        let handoff_trace_node = self.nodes.try_register_internal_with_next_names(
-            crate::trace::HandoffTraceNode,
-            &["drop"],
-        )?;
+        let handoff_trace_node = self
+            .nodes
+            .try_register_internal_with_next_names(crate::trace::HandoffTraceNode, &["drop"])?;
         nodes.push((handoff_trace_node, &crate::trace::HANDOFF_TRACE_ERRORS));
         processes.push(<crate::trace::HandoffTraceNode as crate::Node>::process);
         self.nodes.validate_node_error_batch(&nodes)?;

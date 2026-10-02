@@ -9,6 +9,7 @@
 //! published once by the collector process
 //! (`collector.c:40-93,154-176`). The mechanism crate knows none of them.
 
+use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -85,12 +86,18 @@ impl NodeCounters {
 /// Every thread's row: VPP's "thread → `node_main.nodes`" table, which the
 /// collector process walks each round.
 ///
-/// The rows are allocated once with the graph's frozen node capacity before
-/// any Worker is launched and live for the process, so the table only hands out
-/// `'static` rows; it never grows after installation.
+/// Each row is worker-owned. Thread zero extends all rows only while the
+/// Worker barrier is held, before publishing a larger graph for refork.
 pub(crate) struct NodeCounterRows {
-    rows: &'static [Box<[NodeCounters]>],
+    rows: Box<[UnsafeCell<Vec<NodeCounters>>]>,
+    names: UnsafeCell<Vec<Option<&'static str>>>,
+    published: UnsafeCell<Vec<(Option<&'static str>, [Option<DirectoryIndex>; 4])>>,
 }
+
+// SAFETY: each Data Worker accesses only its own row. Thread zero grows rows
+// only after every Worker acknowledged the barrier; the stats Process reads
+// names and published links only on thread zero.
+unsafe impl Sync for NodeCounterRows {}
 
 /// The published rows table.
 ///
@@ -101,19 +108,26 @@ pub(crate) struct NodeCounterRows {
 static NODE_COUNTER_ROWS: OnceLock<NodeCounterRows> = OnceLock::new();
 
 impl NodeCounterRows {
-    /// Allocates one row per thread at the frozen node capacity and publishes
-    /// the table, the same fact `DataPlaneHandoff::with_node_capacity` freezes.
-    pub(crate) fn install(thread_count: u32, node_capacity: usize) -> &'static Self {
+    /// Allocates one row per thread before launch and publishes the table.
+    pub(crate) fn install(thread_count: u32, nodes: &crate::NodeMain) -> &'static Self {
+        let node_capacity = nodes.node_count();
         let mut rows = Vec::with_capacity(thread_count as usize);
         for _ in 0..thread_count {
             rows.push(
-                (0..node_capacity)
-                    .map(|_| NodeCounters::new())
-                    .collect::<Box<[NodeCounters]>>(),
+                UnsafeCell::new((0..node_capacity).map(|_| NodeCounters::new()).collect()),
             );
         }
+        let names = (0..node_capacity)
+            .map(|slot| {
+                nodes
+                    .node_name(NodeId::new(slot as u32))
+                    .expect("installed node slot has a name entry")
+            })
+            .collect();
         let installed = NODE_COUNTER_ROWS.set(Self {
-            rows: Box::leak(rows.into_boxed_slice()),
+            rows: rows.into_boxed_slice(),
+            names: UnsafeCell::new(names),
+            published: UnsafeCell::new(Vec::new()),
         });
         assert!(
             installed.is_ok(),
@@ -133,9 +147,25 @@ impl NodeCounterRows {
 
     /// The row of `thread_index`; indices outside thread zero and the Data
     /// Workers have no node graph and therefore no row.
-    pub(crate) fn row(&self, thread_index: u32) -> Option<&'static [NodeCounters]> {
-        let rows: &'static [Box<[NodeCounters]>] = self.rows;
-        rows.get(thread_index as usize).map(|row| &row[..])
+    pub(crate) fn row(&self, thread_index: u32) -> Option<&[NodeCounters]> {
+        self.rows
+            .get(thread_index as usize)
+            .map(|row| unsafe { (&*row.get()).as_slice() })
+    }
+
+    /// Main-thread graph publication precedes worker refork. No worker holds
+    /// a counter reference while these Vecs may move their elements.
+    pub(crate) fn refresh_graph(&self, names: &[Option<&'static str>]) {
+        crate::ensure_main_thread_with_barrier()
+            .expect("node counter growth requires the Worker barrier");
+        for row in &self.rows {
+            // SAFETY: the barrier stopped every row owner before this write.
+            let counters = unsafe { &mut *row.get() };
+            counters.resize_with(names.len(), NodeCounters::new);
+        }
+        // SAFETY: only thread zero owns names and the collector Process cannot
+        // run while this synchronous barrier scope is active.
+        unsafe { *self.names.get() = names.to_vec() };
     }
 }
 
@@ -253,27 +283,21 @@ fn register_node_stats(stats_main: &mut StatsMain) -> RuntimeResult<()> {
     Ok(())
 }
 
-/// Publishes the graph facts (node count, node names) into `/sys/node/*` and
-/// creates the `/nodes/<name>/<counter>` aliases.
-///
-/// VPP builds the entries in the collector process and validates the shape,
-/// writes the name vector and adds the aliases on the first name diff of a
-/// round (`collector.c:40-93`). Hammer freezes node identity before the Workers
-/// launch, so this runs once in main-loop-enter, after the graph is
-/// materialized and before the first round, on thread zero. It changes only
-/// directory structure, so it needs no `WorkerBarrier`.
-///
-/// **Precondition:** a future "add or remove Data Workers" or "renumber nodes
-/// at runtime" surface must republish this; the frozen node identity is what
-/// makes one publication sufficient today.
-#[hammer_component_macros::main_loop_enter_function]
-fn install_node_stats(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+/// VPP `update_node_counters`: validate the new shape and publish changed
+/// names in two passes, removing old links before adding any new ones.
+pub(crate) fn publish_node_stats() -> RuntimeResult<()> {
     let stats_main = StatsMain::global()?;
     if !stats_main.segment.node_counters_enabled() {
         return Ok(());
     }
+    crate::ensure_main_thread()?;
     let node_stats = NodeStats::global();
-    let columns = u32::try_from(main.nodes.node_count()).expect("node slots are u32-indexed");
+    let counter_rows = NodeCounterRows::global();
+    // SAFETY: both vectors have a single thread-zero owner. Workers read only
+    // their counters and cannot update this metadata.
+    let names = unsafe { &*counter_rows.names.get() };
+    let published = unsafe { &mut *counter_rows.published.get() };
+    let columns = u32::try_from(names.len()).expect("node slots are u32-indexed");
     if columns == 0 {
         return Ok(());
     }
@@ -285,20 +309,44 @@ fn install_node_stats(main: &mut DataPlaneMain) -> RuntimeResult<()> {
             .segment
             .validate(counter.entry_index(node_stats), rows - 1, columns - 1)?;
     }
-    for slot in 0..columns {
-        let Some(name) = main.nodes.node_name(NodeId::new(slot))? else {
+    published.resize(columns as usize, (None, [None; 4]));
+    for (slot, current) in published.iter_mut().enumerate() {
+        if current.0 == names[slot] || current.0.is_none() {
             continue;
-        };
-        stats_main
-            .segment
-            .set_name(node_stats.names.index, slot, name)?;
-        for counter in NodeCounter::ALL {
-            stats_main.segment.add_symlink(
-                counter.entry_index(node_stats),
-                slot,
-                &format!("/nodes/{name}/{}", counter.name()),
-            )?;
         }
+        let links = current.1.iter().flatten().copied().collect::<Vec<_>>();
+        stats_main.segment.remove_name_symlinks(
+            node_stats.names.index,
+            slot as u32,
+            &links,
+        )?;
+        *current = (None, [None; 4]);
+    }
+    for (slot, current) in published.iter_mut().enumerate() {
+        let Some(name) = names[slot] else { continue };
+        if current.0 == Some(name) {
+            continue;
+        }
+        let paths: [String; 4] =
+            std::array::from_fn(|index| format!("/nodes/{name}/{}", NodeCounter::ALL[index].name()));
+        let links: [(&str, DirectoryIndex); 4] = std::array::from_fn(|index| {
+            (paths[index].as_str(), NodeCounter::ALL[index].entry_index(node_stats))
+        });
+        let indices = stats_main.segment.add_name_symlinks(
+            node_stats.names.index,
+            slot as u32,
+            name,
+            &links,
+        )?;
+        *current = (
+            Some(name),
+            indices
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("one symlink per node counter"),
+        );
     }
     Ok(())
 }

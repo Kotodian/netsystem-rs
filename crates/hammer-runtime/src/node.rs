@@ -466,10 +466,9 @@ impl NodeEntry {
 
 pub struct NodeMain {
     /// This thread's per-node counters: VPP's `vlib_node_runtime_t` counter
-    /// fields in that thread's `node_main.nodes`. Installed once before the
-    /// Worker is launched and never replaced, so the graph holds a bare slice
-    /// rather than a handle to storage it does not own.
-    node_counters: &'static [crate::node_stats::NodeCounters],
+    /// fields in that thread's `node_main.nodes`. The owner grows the row
+    /// under the Worker barrier when the graph acquires new nodes.
+    node_counters: Option<(&'static crate::node_stats::NodeCounterRows, u32)>,
     inner: RefCell<NodeRuntimeInner>,
     pending_frames: RefCell<Vec<PendingFrame>>,
     scheduled_nodes: RefCell<Vec<NodeId>>,
@@ -659,6 +658,10 @@ struct PendingFrame {
 }
 
 impl NodeRuntimeInner {
+    pub(crate) fn node_names(&self) -> &[Option<&'static str>] {
+        &self.node_names
+    }
+
     fn inherit_worker_state(&mut self, current: &Self) {
         assert!(
             self.nodes.len() >= current.nodes.len(),
@@ -1180,7 +1183,7 @@ impl NodeRuntimeInner {
 impl Default for NodeMain {
     fn default() -> Self {
         Self {
-            node_counters: &[],
+            node_counters: None,
             inner: RefCell::new(NodeRuntimeInner {
                 nodes: Vec::new(),
                 node_states: Vec::new(),
@@ -1239,7 +1242,7 @@ impl From<NodeRuntimeInner> for NodeMain {
         let (next_frames, next_frame_indices) = Self::next_frames_for_graph(&inner);
         let enqueue_owners = vec![None; inner.nodes.len()];
         Self {
-            node_counters: &[],
+            node_counters: None,
             inner: RefCell::new(inner),
             pending_frames: RefCell::new(Vec::with_capacity(32)),
             scheduled_nodes: RefCell::new(Vec::new()),
@@ -1609,9 +1612,9 @@ impl NodeMain {
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
         let workers_running =
-            crate::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            crate::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if workers_running {
-            crate::barrier::__assert_held();
+            crate::WorkerThread::__assert_held();
         }
         let Some(NodeRegistration::Next { name, next_count }) = descriptor.registration else {
             return Err(RuntimeError::NamedNextRegistrationKindInvalid);
@@ -1654,7 +1657,7 @@ impl NodeMain {
         drop(inner);
 
         if let Some(barrier) =
-            crate::barrier::global().filter(|barrier| barrier.worker_count() != 0)
+            crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0)
         {
             barrier.request_node_refork(self.inner.borrow().clone());
         }
@@ -1666,6 +1669,10 @@ impl NodeMain {
         kind: NodeKind,
         descriptor: NodeDescriptor<'_>,
     ) -> RuntimeResult<NodeId> {
+        let barrier = crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0);
+        if barrier.is_some() {
+            crate::WorkerThread::__assert_held();
+        }
         let node = self.register_function_declared(
             kind,
             descriptor.process,
@@ -1677,6 +1684,9 @@ impl NodeMain {
         )?;
         self.inner.borrow_mut().nodes[node.slot() as usize].frame_args_size =
             descriptor.frame_args_size;
+        if let Some(barrier) = barrier {
+            barrier.request_node_refork(self.inner.borrow().clone());
+        }
         Ok(node)
     }
 
@@ -1824,14 +1834,15 @@ impl NodeMain {
 
     /// Installs this thread's counter row.
     ///
-    /// Called once before the Worker is launched: the row belongs to
-    /// [`crate::node_stats::NodeCounterRows`] and lives for the process, so the
-    /// graph only records the borrow. Refork changes graph facts, not rows.
+    /// Called once before the Worker is launched. Refork changes graph facts,
+    /// while the same thread-indexed row retains its existing counter values.
     pub(crate) fn install_node_counters(
         &mut self,
-        row: &'static [crate::node_stats::NodeCounters],
+        rows: &'static crate::node_stats::NodeCounterRows,
+        thread_index: u32,
     ) {
-        self.node_counters = row;
+        assert!(rows.row(thread_index).is_some(), "thread owns a node counter row");
+        self.node_counters = Some((rows, thread_index));
     }
 
     /// The counters of `node` in this thread's row, or `None` while the graph
@@ -1844,7 +1855,25 @@ impl NodeMain {
     /// accumulates no node counters; that is an ordinary absence, not a bug.
     #[inline(always)]
     pub(crate) fn node_counters(&self, node: NodeId) -> Option<&crate::node_stats::NodeCounters> {
-        self.node_counters.get(node.slot() as usize)
+        let (rows, thread_index) = self.node_counters?;
+        rows.row(thread_index)?.get(node.slot() as usize)
+    }
+
+    /// VPP `input_node_counts_by_state[VLIB_NODE_STATE_POLLING]`: polling
+    /// input work keeps File polling nonblocking.
+    pub(crate) fn has_polling_input_nodes(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.nodes.iter().enumerate().any(|(slot, node)| {
+            matches!(node.kind, NodeKind::Driver | NodeKind::PreInput)
+                && inner.node_states[slot] == NodeState::Polling
+        })
+    }
+
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !self.pending_frames.borrow().is_empty()
+            || !self.scheduled_nodes.borrow().is_empty()
+            || self.readiness.pending.get()
+            || self.inner.borrow().interrupt_pending.iter().any(|pending| *pending)
     }
 
     #[inline]
@@ -2071,9 +2100,9 @@ impl NodeMain {
 
     pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
-        let barrier = crate::barrier::global().filter(|barrier| barrier.worker_count() != 0);
+        let barrier = crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0);
         if barrier.is_some() {
-            crate::barrier::__assert_held();
+            crate::WorkerThread::__assert_held();
         }
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
@@ -2101,7 +2130,7 @@ impl NodeMain {
     ) -> RuntimeResult<Vec<u16>> {
         self.ensure_topology_owner()?;
         let workers_running =
-            crate::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            crate::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if workers_running {
             let inner = self.inner.borrow();
             for &(node, next) in edges {
@@ -2114,7 +2143,7 @@ impl NodeMain {
                     .any(|target| *target == Some(next))
             });
             if missing_edge {
-                crate::barrier::__assert_held();
+                crate::WorkerThread::__assert_held();
             }
         }
         let mut inner = self.inner.borrow_mut();
@@ -2122,7 +2151,7 @@ impl NodeMain {
         drop(inner);
         if changed
             && let Some(barrier) =
-                crate::barrier::global().filter(|barrier| barrier.worker_count() != 0)
+                crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0)
         {
             barrier.request_node_refork(self.inner.borrow().clone());
         }
@@ -2223,19 +2252,12 @@ mod tests {
 
     #[test]
     fn duplicate_architecture_candidate_is_a_runtime_error() {
-        let candidate = NodeFunctionRegistration::new(
-            "packet-input",
-            NodeVariant::Base,
-            process,
-            (0, 4, 0),
-        );
-        let error = preferred_node_function(
-            "packet-input",
-            false,
-            [&candidate, &candidate].into_iter(),
-        )
-        .err()
-        .expect("duplicate variant is rejected");
+        let candidate =
+            NodeFunctionRegistration::new("packet-input", NodeVariant::Base, process, (0, 4, 0));
+        let error =
+            preferred_node_function("packet-input", false, [&candidate, &candidate].into_iter())
+                .err()
+                .expect("duplicate variant is rejected");
         assert!(matches!(
             error,
             RuntimeError::DuplicateNodeFunction {

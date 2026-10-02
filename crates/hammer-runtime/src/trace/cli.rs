@@ -300,11 +300,9 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, C
     let threads = ThreadMain::global();
     let mains = std::iter::once((0, "main", &*main)).chain(threads.data_workers().map(|worker| {
         // SAFETY: the non-MP-safe CLI holds WorkerBarrier until formatting ends.
-        (
-            worker.thread_index(),
-            worker.name(),
-            unsafe { threads.worker_main_at_barrier(worker) as &DataPlaneMain },
-        )
+        (worker.thread_index(), worker.name(), unsafe {
+            threads.worker_main_at_barrier(worker) as &DataPlaneMain
+        })
     }));
     for (thread_index, name, owner) in mains {
         writeln!(

@@ -1401,7 +1401,11 @@ impl Fifo {
             let lookup = &*self.ooo_enq_lookup.get();
             let mut chunk_off = lookup
                 .get(&remaining_offset)
-                .or_else(|| lookup.predecessor(&remaining_offset).map(|(_, value)| value))
+                .or_else(|| {
+                    lookup
+                        .predecessor(&remaining_offset)
+                        .map(|(_, value)| value)
+                })
                 .map_or(0, |value| u64::from(*value));
             if chunk_off != 0 {
                 let chunk = &*self.base.add(chunk_off as usize).cast::<Chunk>();
@@ -1834,7 +1838,9 @@ impl Fifo {
         }
 
         let target = if previous != OOO_SEGMENT_INVALID_INDEX {
-            let segment = segments.get(previous).expect("OOO predecessor remains live");
+            let segment = segments
+                .get(previous)
+                .expect("OOO predecessor remains live");
             if f_pos_leq(start, segment.start.wrapping_add(segment.length)) {
                 Some(previous)
             } else {
@@ -1874,16 +1880,24 @@ impl Fifo {
             if previous == OOO_SEGMENT_INVALID_INDEX {
                 *head = index;
             } else {
-                segments.get_mut(previous).expect("OOO predecessor remains live").next = index;
+                segments
+                    .get_mut(previous)
+                    .expect("OOO predecessor remains live")
+                    .next = index;
             }
             if current != OOO_SEGMENT_INVALID_INDEX {
-                segments.get_mut(current).expect("OOO successor remains live").prev = index;
+                segments
+                    .get_mut(current)
+                    .expect("OOO successor remains live")
+                    .prev = index;
             }
             index
         };
 
         loop {
-            let segment = *segments.get(index).expect("merged OOO segment remains live");
+            let segment = *segments
+                .get(index)
+                .expect("merged OOO segment remains live");
             let next = segment.next;
             if next == OOO_SEGMENT_INVALID_INDEX {
                 break;
@@ -1895,17 +1909,26 @@ impl Fifo {
             }
             let following_end = following.start.wrapping_add(following.length);
             let after = following.next;
-            let merged = segments.get_mut(index).expect("merged OOO segment remains live");
+            let merged = segments
+                .get_mut(index)
+                .expect("merged OOO segment remains live");
             if f_pos_gt(following_end, segment_end) {
                 merged.length = following_end.wrapping_sub(merged.start);
             }
             merged.next = after;
             if after != OOO_SEGMENT_INVALID_INDEX {
-                segments.get_mut(after).expect("OOO successor remains live").prev = index;
+                segments
+                    .get_mut(after)
+                    .expect("OOO successor remains live")
+                    .prev = index;
             }
-            segments.remove(next).expect("merged OOO successor remains live");
+            segments
+                .remove(next)
+                .expect("merged OOO successor remains live");
         }
-        let segment = segments.get(index).expect("merged OOO segment remains live");
+        let segment = segments
+            .get(index)
+            .expect("merged OOO segment remains live");
         *newest = index;
         Some((segment.start.wrapping_sub(tail), segment.length))
     }
@@ -1929,13 +1952,17 @@ impl Fifo {
             let old_head = *head;
             *head = segment.next;
             if *head != OOO_SEGMENT_INVALID_INDEX {
-                segments.get_mut(*head).expect("OOO successor remains live").prev =
-                    OOO_SEGMENT_INVALID_INDEX;
+                segments
+                    .get_mut(*head)
+                    .expect("OOO successor remains live")
+                    .prev = OOO_SEGMENT_INVALID_INDEX;
             }
             if *newest == old_head {
                 *newest = OOO_SEGMENT_INVALID_INDEX;
             }
-            segments.remove(old_head).expect("collected OOO segment remains live");
+            segments
+                .remove(old_head)
+                .expect("collected OOO segment remains live");
         }
         tail.wrapping_sub(base)
     }

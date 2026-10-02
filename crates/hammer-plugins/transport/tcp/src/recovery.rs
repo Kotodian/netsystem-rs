@@ -327,11 +327,14 @@ impl TcpRecoveryState {
         if latest_rtt.is_some() {
             self.tlp_rtt_fresh = true;
         }
-        if self.tlp_probe_end.is_some_and(|end| ack.acknowledgment >= end) {
+        if self
+            .tlp_probe_end
+            .is_some_and(|end| ack.acknowledgment >= end)
+        {
             self.tlp_probe_end = None;
         }
-        self.tlp_timer_armed = self.has_unacked_data()
-            && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
+        self.tlp_timer_armed =
+            self.has_unacked_data() && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
         latest_rtt
     }
 
@@ -365,9 +368,7 @@ impl TcpRecoveryState {
             };
             largest_acked = largest_acked.max(segment.packet_number);
             any_acked = true;
-            latest_rtt = self
-                .deliver_sample(ack, segment, congestion)
-                .or(latest_rtt);
+            latest_rtt = self.deliver_sample(ack, segment, congestion).or(latest_rtt);
             if partial {
                 break;
             }
@@ -416,9 +417,7 @@ impl TcpRecoveryState {
                 };
                 largest_acked = largest_acked.max(segment.packet_number);
                 any_acked = true;
-                latest_rtt = self
-                    .deliver_sample(ack, segment, congestion)
-                    .or(latest_rtt);
+                latest_rtt = self.deliver_sample(ack, segment, congestion).or(latest_rtt);
             }
         }
         if any_acked {
@@ -447,11 +446,14 @@ impl TcpRecoveryState {
         if latest_rtt.is_some() {
             self.tlp_rtt_fresh = true;
         }
-        if self.tlp_probe_end.is_some_and(|end| ack.acknowledgment >= end) {
+        if self
+            .tlp_probe_end
+            .is_some_and(|end| ack.acknowledgment >= end)
+        {
             self.tlp_probe_end = None;
         }
-        self.tlp_timer_armed = self.has_unacked_data()
-            && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
+        self.tlp_timer_armed =
+            self.has_unacked_data() && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
         latest_rtt
     }
 
@@ -495,7 +497,10 @@ impl TcpRecoveryState {
         }
         if recovery_started {
             self.recovery_active = true;
-            self.scoreboard.high_rxt = self.scoreboard.holes.first()
+            self.scoreboard.high_rxt = self
+                .scoreboard
+                .holes
+                .first()
                 .map(|(start, _)| (*start).max(self.ack_floor))
                 .unwrap_or(self.ack_floor);
             self.no_sack_first_pending = true;
@@ -576,9 +581,11 @@ impl TcpRecoveryState {
             allowed.saturating_sub(prr_out)
         } else {
             let conserved = self.recovery_delivered.saturating_sub(prr_out);
-            let delivered_since_send = self.recovery_delivered
+            let delivered_since_send = self
+                .recovery_delivered
                 .saturating_sub(self.recovery_prev_delivered);
-            let limit = conserved.max(delivered_since_send)
+            let limit = conserved
+                .max(delivered_since_send)
                 .saturating_add(max_datagram_size);
             self.recovery_window
                 .saturating_sub(bytes_in_flight)
@@ -631,14 +638,16 @@ impl TcpRecoveryState {
     pub(crate) fn commit_retransmit(&mut self, sequence: TcpSeq, sent_at: Instant) {
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
-            let sample = self.sent_sample(index)
+            let sample = self
+                .sent_sample(index)
                 .expect("retransmit sample remains in the connection pool");
             cursor = sample.next;
             if sample.sequence != sequence {
                 continue;
             }
             let deadline = sample.rack_deadline;
-            let current = self.sent_sample_mut(index)
+            let current = self
+                .sent_sample_mut(index)
                 .expect("retransmit sample remains in the connection pool");
             current.retransmitted = true;
             current.tx_lost = false;
@@ -666,11 +675,13 @@ impl TcpRecoveryState {
         if let Some((start, retransmit_end)) = retransmitted {
             let mut cursor = self.sample_head;
             while let Some(index) = cursor {
-                let sample = self.sent_sample(index)
+                let sample = self
+                    .sent_sample(index)
                     .expect("TLP sample remains allocated during probe publication");
                 cursor = sample.next;
                 if sample.overlaps(start, retransmit_end) {
-                    let current = self.sent_sample_mut(index)
+                    let current = self
+                        .sent_sample_mut(index)
                         .expect("TLP sample remains allocated during probe publication");
                     current.retransmitted = true;
                     current.rack_deadline = None;
@@ -706,14 +717,18 @@ impl TcpRecoveryState {
             },
             true,
         );
-        let current = self.sent_sample_mut(head)
+        let current = self
+            .sent_sample_mut(head)
             .expect("RTO retains the oldest outstanding sample");
         current.tx_lost = true;
         current.lost = true;
         self.refresh_lost_bytes();
         if !self.recovery_active {
             self.recovery_active = true;
-            self.scoreboard.high_rxt = self.scoreboard.holes.first()
+            self.scoreboard.high_rxt = self
+                .scoreboard
+                .holes
+                .first()
                 .map(|(start, _)| (*start).max(self.ack_floor))
                 .unwrap_or(self.ack_floor);
             self.recovery_prev_window = recovery_prev_window.max(1);
@@ -748,15 +763,13 @@ impl TcpRecoveryState {
         reordering_window: Duration,
         max_datagram_size: u32,
     ) {
-        let (Some(reference_sent_at), Some(rtt)) =
-            (self.rack_reference_sent_at, self.rack_rtt)
+        let (Some(reference_sent_at), Some(rtt)) = (self.rack_reference_sent_at, self.rack_rtt)
         else {
             return;
         };
         let reordering_window = if !self.rack_reordered
             && (self.recovery_active
-                || self.sacked_bytes()
-                    >= self.scoreboard.reorder.saturating_mul(max_datagram_size))
+                || self.sacked_bytes() >= self.scoreboard.reorder.saturating_mul(max_datagram_size))
         {
             Duration::ZERO
         } else {
@@ -819,8 +832,7 @@ impl TcpRecoveryState {
             };
             largest_acked = largest_acked.max(segment.packet_number);
             any_acked = true;
-            latest_rtt = self.deliver_sample(ack, segment, congestion)
-                .or(latest_rtt);
+            latest_rtt = self.deliver_sample(ack, segment, congestion).or(latest_rtt);
             if done {
                 break;
             }
@@ -1074,7 +1086,10 @@ impl TcpRecoveryState {
                 Some((hole_start, hole_end)) => {
                     let _ = self.scoreboard.holes.insert(
                         hole_start,
-                        TcpScoreboardHole { end: hole_end, lost: false },
+                        TcpScoreboardHole {
+                            end: hole_end,
+                            lost: false,
+                        },
                     );
                     pending_hole = Some((start, end));
                 }
@@ -1177,7 +1192,10 @@ impl TcpRecoveryState {
 
         // VPP tcp_sack.c:131-139 starts with the SACKed run after the
         // highest unsacked hole; omitting it leaves that hole never lost.
-        let trailing_sacked = self.scoreboard.holes.last()
+        let trailing_sacked = self
+            .scoreboard
+            .holes
+            .last()
             .map(|(_, hole)| hole.end.distance_to(self.scoreboard.high_sacked))
             .unwrap_or(0);
         let mut sacked_ahead = trailing_sacked;

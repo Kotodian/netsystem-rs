@@ -241,7 +241,7 @@ impl FileMain {
             if !crate::thread_main::is_current_worker(worker) {
                 crate::ensure_main_thread()
                     .expect("only the main thread changes another worker's File poller");
-                crate::barrier::__assert_held();
+                crate::WorkerThread::__assert_held();
             }
         }
         let poller =
@@ -305,6 +305,20 @@ impl FileMain {
     pub(crate) fn clear_io_wake_for_worker(&self, thread_index: u32) -> RuntimeResult<()> {
         self.poller_mut(thread_index)?.clear_wake();
         Ok(())
+    }
+
+    pub(crate) fn has_pending_for_worker(&self, thread_index: u32) -> RuntimeResult<bool> {
+        Ok(self.poller_mut(thread_index)?.has_pending())
+    }
+
+    /// VPP `vlib_file_poll`: cap the wait by this main's next timer expiry.
+    pub(crate) fn wait_for_worker(&self, main: &crate::DataPlaneMain) -> RuntimeResult<()> {
+        let timeout = main
+            .timer_first_expires_in_ticks()
+            .map(|ticks| crate::DataPlaneMain::TIMER_TICK * ticks)
+            .unwrap_or(Duration::from_millis(10))
+            .min(Duration::from_millis(10));
+        self.poller_mut(main.thread_index())?.wait(timeout)
     }
 
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
@@ -714,71 +728,75 @@ impl FileMain {
         thread_index: u32,
         graph: &mut NodeMain,
     ) -> RuntimeResult<usize> {
-        self.release_pending(thread_index);
-        let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
-        let count = self.poller_mut(thread_index)?.poll(&mut events)?;
         let mut dispatched = 0;
-        for event in &events[..count] {
-            if !self.poller_mut(thread_index)?.is_current(event) {
-                continue;
-            }
-            match event.target {
-                Some(PollTarget::File(index)) => {
-                    let Some(file) = self.file_ptr(index) else {
-                        continue;
-                    };
-                    let before = unsafe { PollSpec::new(index, &*file) };
-                    let remove = unsafe {
-                        if event.readiness.contains(Readiness::ERROR)
-                            && (*file).functions().error.is_none()
-                        {
-                            true
-                        } else {
-                            dispatched += dispatch_file(&mut *file, graph, event.readiness)?;
-                            false
-                        }
-                    };
-                    if remove {
-                        self.delete(index)?;
-                        continue;
-                    }
-                    // A callback already borrows its File exclusively. It
-                    // changes that value's write flag directly; reconcile the
-                    // poller only after the callback borrow has ended.
-                    let Some(after) = self.poll_spec(index) else {
-                        continue;
-                    };
-                    if !self.poller_mut(thread_index)?.is_current(event) {
-                        continue;
-                    }
-                    if event.rearm {
-                        self.poller_mut(thread_index)?.rearm(after)?;
-                    } else if before.write != after.write {
-                        self.poller_mut(thread_index)?.modify(before, after)?;
-                    }
+        loop {
+            let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
+            let count = self.poller_mut(thread_index)?.poll(&mut events)?;
+            for event in &events[..count] {
+                if !self.poller_mut(thread_index)?.is_current(event) {
+                    continue;
                 }
-                Some(PollTarget::Deadline(index)) => {
-                    let Some(deadline) = self.deadline_ptr(index) else {
-                        continue;
-                    };
-                    self.poller_mut(thread_index)?.consume_deadline(index)?;
-                    let deadline = unsafe { &mut *deadline };
-                    deadline.expiry_events += 1;
-                    let function = deadline.function;
-                    function(graph, deadline)?;
-                    dispatched += 1;
-                    if event.rearm {
-                        if self.deadline_ptr(index).is_some()
+                match event.target {
+                    Some(PollTarget::File(index)) => {
+                        let Some(file) = self.file_ptr(index) else {
+                            continue;
+                        };
+                        let before = unsafe { PollSpec::new(index, &*file) };
+                        let remove = unsafe {
+                            if event.readiness.contains(Readiness::ERROR)
+                                && (*file).functions().error.is_none()
+                            {
+                                true
+                            } else {
+                                dispatched += dispatch_file(&mut *file, graph, event.readiness)?;
+                                false
+                            }
+                        };
+                        if remove {
+                            self.delete(index)?;
+                            continue;
+                        }
+                        // A callback already borrows its File exclusively. It
+                        // changes that value's write flag directly; reconcile the
+                        // poller only after the callback borrow has ended.
+                        let Some(after) = self.poll_spec(index) else {
+                            continue;
+                        };
+                        if !self.poller_mut(thread_index)?.is_current(event) {
+                            continue;
+                        }
+                        if event.rearm {
+                            self.poller_mut(thread_index)?.rearm(after)?;
+                        } else if before.write != after.write {
+                            self.poller_mut(thread_index)?.modify(before, after)?;
+                        }
+                    }
+                    Some(PollTarget::Deadline(index)) => {
+                        let Some(deadline) = self.deadline_ptr(index) else {
+                            continue;
+                        };
+                        self.poller_mut(thread_index)?.consume_deadline(index)?;
+                        let deadline = unsafe { &mut *deadline };
+                        deadline.expiry_events += 1;
+                        let function = deadline.function;
+                        function(graph, deadline)?;
+                        dispatched += 1;
+                        if event.rearm
+                            && self.deadline_ptr(index).is_some()
                             && self.poller_mut(thread_index)?.is_current(event)
                         {
                             self.poller_mut(thread_index)?.rearm_deadline(index)?;
                         }
                     }
+                    None => {}
                 }
-                None => {}
+            }
+            if count != POLL_BATCH_SIZE {
+                break;
             }
         }
         self.poller_mut(thread_index)?.flush()?;
+        self.release_pending(thread_index);
         Ok(dispatched)
     }
 }

@@ -265,8 +265,8 @@ fn tcp_listen_index<const IS_IP4: bool>(
             let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
             TcpError::NoListener
         })?;
-    let route = *hammer_core::buffer_opaque!(runtime.buffer(index) => crate::TcpSecondaryOpaque)
-        .route();
+    let route =
+        *hammer_core::buffer_opaque!(runtime.buffer(index) => crate::TcpSecondaryOpaque).route();
     let listener_connection_index = if route.origin == crate::TcpRouteOrigin::Listener as u8 {
         assert_eq!(
             route.connection_index, listener.lookup_id,

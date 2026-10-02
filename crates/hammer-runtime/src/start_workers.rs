@@ -5,17 +5,13 @@ use crate::error::{RuntimeError, RuntimeResult};
 use hammer_stats::StatsMain;
 
 use crate::thread_main::WorkerThreadCount;
-use crate::{DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, barrier};
+use crate::{DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, WorkerThread};
 
 #[hammer_component_macros::main_loop_enter_function]
 fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     let threads = ThreadMain::global();
     let global = GlobalMain::global();
     let worker_count = threads.worker_count();
-    let participant_count = threads
-        .thread_count()
-        .checked_sub(1)
-        .expect("configured ThreadMain includes thread zero");
     // The worker-count gauge belongs to this domain and is written once, like
     // VPP's thread startup publishing `n_vlib_mains - 1`.
     StatsMain::global()?.segment.set_gauge(
@@ -35,13 +31,9 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     // One counter row per thread, at the same frozen node capacity the handoff
     // uses; thread zero's row goes into this graph and each Worker's row into
     // that Worker's graph clone before launch.
-    let node_counter_rows =
-        crate::node_stats::NodeCounterRows::install(worker_count + 1, main.nodes().node_count());
-    main.nodes.install_node_counters(
-        node_counter_rows
-            .row(0)
-            .expect("thread zero owns a counter row"),
-    );
+    let node_counter_rows = crate::node_stats::NodeCounterRows::install(worker_count + 1, main.nodes());
+    main.nodes.install_node_counters(node_counter_rows, 0);
+    crate::node_stats::publish_node_stats()?;
     // Every Worker runtime receives its per-thread error fact at this freeze
     // point, like VPP's worker clone refresh
     // (`third_party/vpp/src/vlib/threads.c:766-778`): the entry thread zero's
@@ -55,11 +47,7 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
         let (mut nodes, _) = main.worker_parts();
-        nodes.install_node_counters(
-            node_counter_rows
-                .row(thread_index)
-                .expect("every Data Worker owns a counter row"),
-        );
+        nodes.install_node_counters(node_counter_rows, thread_index);
         let worker_main = DataPlaneMain::new_worker(
             main,
             nodes,
@@ -73,12 +61,22 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     threads.install_worker_mains(worker_mains);
 
     for worker_slot in 0..worker_count {
-        threads
+        let worker = threads
             .thread_by_index(worker_slot + 1)
-            .expect("configured Data Worker descriptor exists")
-            .install_node_interrupts(main.nodes().node_count());
+            .expect("configured Data Worker descriptor exists");
+        worker.install_node_interrupts(main.nodes().node_count());
+        #[cfg(target_os = "linux")]
+        worker.install_file_wake(
+            crate::file::FILE_MAIN
+                .get()
+                .expect("FileMain initializes before Worker launch")
+                .io_wake_fd_for_worker(worker_slot + 1)?,
+        );
     }
-    let barrier = barrier::install(worker_count, participant_count);
+    let barrier = threads
+        .thread_by_index(0)
+        .expect("thread zero owns worker barrier");
+    barrier.initialize_barrier();
     barrier.arm();
     for worker_slot in 0..worker_count {
         let thread_index = worker_slot + 1;
@@ -101,7 +99,7 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     crate::worker_thread_barrier_sync!(main, { crate::init::run_num_workers_change(global, main) })
 }
 
-fn cancel_startup(barrier: &barrier::WorkerBarrier, startup_error: RuntimeError) -> RuntimeError {
+fn cancel_startup(barrier: &WorkerThread, startup_error: RuntimeError) -> RuntimeError {
     barrier.cancel_startup();
     barrier.release_startup();
     startup_error

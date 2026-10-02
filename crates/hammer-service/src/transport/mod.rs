@@ -231,7 +231,12 @@ pub trait Transport<T> {
     fn is_tx_paced(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> bool;
     fn tx_pacer_burst(&self, runtime: &DataPlaneMain, target: TransportTxTarget) -> u32;
     fn tx_pacer_update_bytes(&self, runtime: &DataPlaneMain, target: TransportTxTarget, bytes: u32);
-    fn tx_pacer_reset_bucket(&self, runtime: &DataPlaneMain, target: TransportTxTarget, bucket: u32);
+    fn tx_pacer_reset_bucket(
+        &self,
+        runtime: &DataPlaneMain,
+        target: TransportTxTarget,
+        bucket: u32,
+    );
     fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection>;
     fn listener(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn half_open(&self, connection_index: u32) -> Option<&Self::Connection>;

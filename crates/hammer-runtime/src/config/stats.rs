@@ -158,6 +158,7 @@ fn stat_segment_collector_process(
             .set_timestamp(sys.boottime.index, boottime);
 
         loop {
+            crate::node_stats::publish_node_stats()?;
             stats_main.collect();
             let update_interval = stats_main.segment.update_interval();
             tokio::time::sleep(update_interval).await;

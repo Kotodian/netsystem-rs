@@ -95,6 +95,8 @@ pub type TimerWheel1w32FastHint<T> = TimerWheel<T, 1, 32, true, false, true>;
 pub type TimerWheel1t2w32sl<T> = TimerWheel<T, 2, 32, false, false, true>;
 pub type TimerWheel2t1w2048sl<T> = TimerWheel<T, 1, 2048, false, false, true>;
 pub type TimerWheel1t2w2048sl<T> = TimerWheel<T, 2, 2048, false, false, true>;
+/// VPP `tw_timer_1t_3w_1024sl_ov.h`: process and scheduled-node timers.
+pub type TimerWheel1t3w1024slOv<T> = TimerWheel<T, 3, 1024, true, true, true>;
 
 impl<
     T,

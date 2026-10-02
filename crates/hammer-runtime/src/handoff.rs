@@ -301,6 +301,11 @@ impl DataPlaneHandoffWorker {
                 .expect("ready handoff worker has a thread handle")
                 .unpark();
         }
+        if let Some(threads) = crate::thread_main::THREAD_MAIN.get()
+            && let Some(descriptor) = threads.thread_by_index(worker.thread_index())
+        {
+            descriptor.wake_for_barrier();
+        }
     }
 
     #[inline]

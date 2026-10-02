@@ -1177,7 +1177,8 @@ impl Node for TunInputNode {
                         let length = buffer.current_len() + buffer.total_len_not_including_first();
                         // RX consumed this fixed virtio header with advance;
                         // its bytes still precede the current packet window.
-                        let header = unsafe { buffer.current().as_ptr().sub(vhost::NET_HEADER_LEN) };
+                        let header =
+                            unsafe { buffer.current().as_ptr().sub(vhost::NET_HEADER_LEN) };
                         let trace = runtime
                             .add_trace::<TunInputTrace>(node, index)
                             .expect("new TUN trace has a local pool slot");

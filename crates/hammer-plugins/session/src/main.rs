@@ -551,7 +551,8 @@ impl IpSessionMain {
         // VPP session.c:1064-1121 removes the Session lookup before posting
         // application transport cleanup; a reused tuple must not erase a new
         // Session's handle.
-        self.lookup.remove_connection_if_current(connection, session.into());
+        self.lookup
+            .remove_connection_if_current(connection, session.into());
         sessions.transport_delete_request(runtime, session, connection_index)
     }
 }

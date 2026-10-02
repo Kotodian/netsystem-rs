@@ -1,17 +1,16 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicU64;
-use std::time::Duration;
 use std::{sync::OnceLock, thread::ThreadId};
 
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
 
+use crate::DataWorkerId;
 use crate::config::worker::WorkerScheduler;
 #[cfg(target_os = "linux")]
 use crate::config::{CpuConfig, WorkerNuma};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::worker_thread::WorkerThread;
-use crate::DataWorkerId;
 
 static MAIN_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
 pub(crate) static THREAD_MAIN: OnceLock<ThreadMain> = OnceLock::new();
@@ -43,7 +42,7 @@ pub fn ensure_main_thread() -> RuntimeResult<()> {
 
 pub fn ensure_main_thread_with_barrier() -> RuntimeResult<()> {
     ensure_main_thread()?;
-    if crate::barrier::global()
+    if crate::WorkerThread::main()
         .as_ref()
         .is_some_and(|barrier| barrier.worker_count() != 0 && !barrier.is_pending())
     {
@@ -124,7 +123,6 @@ impl ThreadMain {
                 worker_count,
                 crate::config::worker::stack_size(),
                 crate::config::worker::max_blocking_threads(),
-                crate::config::worker::idle_slice(),
                 cpu,
                 &scheduler,
                 crate::config::worker::numa(),
@@ -136,7 +134,6 @@ impl ThreadMain {
                 worker_count,
                 crate::config::worker::stack_size(),
                 crate::config::worker::max_blocking_threads(),
-                crate::config::worker::idle_slice(),
                 &scheduler,
             )
         }
@@ -149,7 +146,6 @@ impl ThreadMain {
         worker_count: u32,
         stack_size: usize,
         max_blocking_threads: usize,
-        idle_slice: Duration,
         cpu: &CpuConfig,
         scheduler: &WorkerScheduler,
         numa: &WorkerNuma,
@@ -171,7 +167,6 @@ impl ThreadMain {
             main_cpu.and_then(|cpu| u32::try_from(cpu).ok()),
             main_cpu.map(crate::numa::node_for_cpu).transpose()?,
             0,
-            Duration::ZERO,
             scheduler.clone(),
             false,
             None,
@@ -200,7 +195,6 @@ impl ThreadMain {
                 ),
                 Some(numa_node),
                 stack_size,
-                idle_slice,
                 scheduler.clone(),
                 numa.enabled,
                 None,
@@ -220,7 +214,6 @@ impl ThreadMain {
         worker_count: u32,
         stack_size: usize,
         max_blocking_threads: usize,
-        idle_slice: Duration,
         scheduler: &WorkerScheduler,
     ) -> RuntimeResult<()> {
         assert!(
@@ -236,7 +229,6 @@ impl ThreadMain {
             None,
             Some(0),
             0,
-            Duration::ZERO,
             scheduler.clone(),
             false,
             None,
@@ -254,7 +246,6 @@ impl ThreadMain {
                 None,
                 Some(0),
                 stack_size,
-                idle_slice,
                 scheduler.clone(),
                 false,
                 None,
@@ -328,9 +319,9 @@ impl ThreadMain {
         let mut cores = Bitmap::new();
         for worker in 0..count {
             let cpu_index_zero_available = available.clear(0);
-            let cpu_index = available.first_set().or_else(|| {
-                (!cpu.relative && cpu_index_zero_available).then_some(0)
-            });
+            let cpu_index = available
+                .first_set()
+                .or_else(|| (!cpu.relative && cpu_index_zero_available).then_some(0));
             let cpu_index = cpu_index.ok_or(RuntimeError::WorkerCpuExhausted { worker })?;
             available.clear(cpu_index);
             if cpu_index_zero_available && cpu_index != 0 {
@@ -385,10 +376,7 @@ impl ThreadMain {
             .take(self.worker_count as usize)
     }
 
-    pub(crate) fn install_worker_mains(
-        &self,
-        mains: Vec<UnsafeCell<Box<crate::DataPlaneMain>>>,
-    ) {
+    pub(crate) fn install_worker_mains(&self, mains: Vec<UnsafeCell<Box<crate::DataPlaneMain>>>) {
         crate::ensure_main_thread().expect("Data Worker mains install on thread zero");
         assert_eq!(mains.len(), self.worker_count as usize);
         for (slot, main) in mains.iter().enumerate() {
@@ -409,7 +397,10 @@ impl ThreadMain {
         &self,
         worker: &WorkerThread,
     ) -> &mut crate::DataPlaneMain {
-        assert!(worker.is_current(), "only the owning Worker borrows its main");
+        assert!(
+            worker.is_current(),
+            "only the owning Worker borrows its main"
+        );
         assert!(!worker.no_data_structure_clone());
         let index = worker.thread_index() as usize - 1;
         let mains = unsafe { &*self.worker_mains.get() };
@@ -426,8 +417,7 @@ impl ThreadMain {
         &self,
         worker: &WorkerThread,
     ) -> &mut crate::DataPlaneMain {
-        crate::ensure_main_thread().expect("trace CLI runs on thread zero");
-        assert!(crate::barrier::global().is_some_and(|barrier| barrier.is_pending()));
+        crate::WorkerThread::__assert_held();
         assert!(!worker.no_data_structure_clone());
         let index = worker.thread_index() as usize - 1;
         let mains = unsafe { &*self.worker_mains.get() };
@@ -489,7 +479,6 @@ impl ThreadMain {
                 None,
                 None,
                 stack_size,
-                Duration::ZERO,
                 WorkerScheduler::default(),
                 false,
                 Some(entry),

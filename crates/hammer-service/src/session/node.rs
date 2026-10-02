@@ -1,9 +1,9 @@
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration, NodeState};
+use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, DriverNode, File, Node, NodeMain, NodeRuntime, RuntimeError,
     RuntimeResult,
 };
-use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 
 use crate::session::{SessionQueueError, app, core};
 
@@ -57,10 +57,12 @@ impl Node for SessionInputNode {
         let session_worker = unsafe { session_main.worker_mut(runtime) }
             .expect("session-input runs only on a configured Data Worker");
         let pending = match app::ApplicationMain::global() {
-            Some(application_main) => match application_main.flush_worker_events(runtime, session_worker) {
-                Ok(pending) => pending,
-                Err(_) => true,
-            },
+            Some(application_main) => {
+                match application_main.flush_worker_events(runtime, session_worker) {
+                    Ok(pending) => pending,
+                    Err(_) => true,
+                }
+            }
             None => false,
         };
         if pending {
@@ -122,7 +124,10 @@ pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
 
 /// VPP: session_node.c:2177-2188. The File stores the owner thread index in
 /// private_data; polling_thread_index selects the same Sync File poller.
-pub(crate) fn session_queue_timer_ready(graph: &mut NodeMain, file: &mut File) -> RuntimeResult<()> {
+pub(crate) fn session_queue_timer_ready(
+    graph: &mut NodeMain,
+    file: &mut File,
+) -> RuntimeResult<()> {
     let thread_index = u32::try_from(file.private_data())
         .expect("Session worker thread index fits File private data");
     assert_eq!(

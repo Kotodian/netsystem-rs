@@ -3,9 +3,7 @@ use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion, Ipv4Header, Ipv6Header};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
-};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter};
 
 use hammer_service::data_plane::set_index_node_error;
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
@@ -112,8 +110,8 @@ fn format_icmp_trace(bytes: &[u8]) -> String {
     let packet = &trace.packet_data;
     match packet[0] >> 4 {
         4 => {
-            let (header, _) = Ipv4Header::ref_from_prefix(packet)
-                .expect("ICMP4 trace has an IPv4 header prefix");
+            let (header, _) =
+                Ipv4Header::ref_from_prefix(packet).expect("ICMP4 trace has an IPv4 header prefix");
             let offset = header.header_len();
             format!(
                 "icmp4 {} -> {} type {} code {}",
@@ -124,8 +122,8 @@ fn format_icmp_trace(bytes: &[u8]) -> String {
             )
         }
         6 => {
-            let (header, _) = Ipv6Header::ref_from_prefix(packet)
-                .expect("ICMP6 trace has an IPv6 header prefix");
+            let (header, _) =
+                Ipv6Header::ref_from_prefix(packet).expect("ICMP6 trace has an IPv6 header prefix");
             format!(
                 "icmp6 {} -> {} type {} code {}",
                 header.source(),

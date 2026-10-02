@@ -273,7 +273,8 @@ impl FeatureMain {
     fn init_config_mains(&self, nodes: &NodeMain) -> Result<(), FeatureError> {
         hammer_runtime::ensure_main_thread().expect("Feature Arc init belongs to the main thread");
         assert!(
-            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            !hammer_runtime::WorkerThread::main()
+                .is_some_and(|barrier| barrier.worker_count() != 0),
             "Feature Arc init precedes Data Worker startup"
         );
         assert!(
@@ -419,7 +420,8 @@ impl FeatureMain {
         hammer_runtime::ensure_main_thread()
             .expect("Feature update callback registration is main-thread-only");
         assert!(
-            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            !hammer_runtime::WorkerThread::main()
+                .is_some_and(|barrier| barrier.worker_count() != 0),
             "Feature callbacks register before Data Worker startup"
         );
         // SAFETY: callback registration is serialized before worker startup.
@@ -642,7 +644,7 @@ impl FeatureMain {
         )
         .expect("Feature configuration word count fits its heap offset");
 
-        if hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0) {
+        if hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0) {
             hammer_runtime::worker_thread_barrier_sync!(main, {
                 self.publish_config(
                     main.nodes(),
@@ -991,7 +993,8 @@ impl FeatureMain {
         hammer_runtime::ensure_main_thread()
             .expect("Feature declarations belong to the main thread");
         assert!(
-            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            !hammer_runtime::WorkerThread::main()
+                .is_some_and(|barrier| barrier.worker_count() != 0),
             "Feature declarations precede Data Worker startup"
         );
         assert!(

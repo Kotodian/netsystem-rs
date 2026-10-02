@@ -153,12 +153,8 @@ pub struct ApplicationConfig {
     pub add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     pub del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     pub accepted: fn(&mut Session) -> Result<(), ApplicationError>,
-    pub connected: fn(
-        u32,
-        u64,
-        Option<&mut Session>,
-        Option<SessionError>,
-    ) -> Result<(), ApplicationError>,
+    pub connected:
+        fn(u32, u64, Option<&mut Session>, Option<SessionError>) -> Result<(), ApplicationError>,
     pub disconnected: fn(&mut Session),
     pub reset: fn(&mut Session),
     pub transport_closed: Option<fn(&mut Session)>,
@@ -205,12 +201,8 @@ pub struct Application<'app> {
     add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
     accepted: fn(&mut Session) -> Result<(), ApplicationError>,
-    connected: fn(
-        u32,
-        u64,
-        Option<&mut Session>,
-        Option<SessionError>,
-    ) -> Result<(), ApplicationError>,
+    connected:
+        fn(u32, u64, Option<&mut Session>, Option<SessionError>) -> Result<(), ApplicationError>,
     disconnected: fn(&mut Session),
     reset: fn(&mut Session),
     transport_closed: Option<fn(&mut Session)>,
@@ -650,17 +642,19 @@ impl<'segment> AppWorker<'segment> {
                                 let session = session_worker
                                     .session_mut(handle.session_index)
                                     .expect("accepted Session remains allocated after callback");
-                                let app_closed = session.app_closed() || matches!(
-                                    state,
-                                    SessionState::AppClosed
-                                        | SessionState::Closed
-                                        | SessionState::TransportDeleted
-                                ) || matches!(
-                                    session.load_state(),
-                                    SessionState::AppClosed
-                                        | SessionState::Closed
-                                        | SessionState::TransportDeleted
-                                );
+                                let app_closed = session.app_closed()
+                                    || matches!(
+                                        state,
+                                        SessionState::AppClosed
+                                            | SessionState::Closed
+                                            | SessionState::TransportDeleted
+                                    )
+                                    || matches!(
+                                        session.load_state(),
+                                        SessionState::AppClosed
+                                            | SessionState::Closed
+                                            | SessionState::TransportDeleted
+                                    );
                                 if !app_closed {
                                     session.store_state(state);
                                 }

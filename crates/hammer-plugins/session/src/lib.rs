@@ -8,9 +8,9 @@ mod api;
 mod config;
 mod endpoint;
 mod lookup;
+mod namespace;
 #[path = "main.rs"]
 mod session_main;
-mod namespace;
 mod table;
 mod transport;
 
@@ -23,8 +23,8 @@ pub use endpoint::{
     IpTransportConnectionId, IpTransportEndpoint, IpTransportEndpointConfig,
 };
 pub use lookup::{IpSessionFamily, IpSessionLookup, IpSessionLookupKey, SessionTableIterator};
-pub use session_main::IpSessionMain;
 pub use namespace::{IpNamespaceBinding, IpNamespaceMain, namespaces};
+pub use session_main::IpSessionMain;
 pub use transport::{
     AppSessionTransport, IpTransportConfig, IpTransportConnection, IpTransportMain,
     LocalEndpointCleanupState,

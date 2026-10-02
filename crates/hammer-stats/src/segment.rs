@@ -37,11 +37,8 @@ const VECTOR_HEADER_BYTES: usize = 8;
 const NAME_VECTOR_USER_HEADER: usize = 4;
 
 pub struct StatsSegment {
-    /// The directory *structure* lock, the Rust form of VPP's
-    /// `stat_segment_lockp` (`stats.c:11-52`): it protects the name table and
-    /// the free-slot chain only. Value writes and the stats round never take it
-    /// (`D10`).
-    stat_segment_lock: SpinLock<DirectoryStructure>,
+    /// VPP `stat_segment_lockp` protects the directory fields (`stats.h:65-72`).
+    stat_segment_lock: SpinLock<DirectoryState>,
     update_interval: Duration,
     memory_size: usize,
     node_counters_enabled: bool,
@@ -50,24 +47,28 @@ pub struct StatsSegment {
     memfd: OwnedFd,
 }
 
-/// The directory state that only structure changes touch.
-///
-/// VPP keeps the same two facts next to the shared segment
-/// (`directory_vector_by_name`/`dir_vector_first_free_elt`); Hammer keeps them
-/// process-private behind [`StatsSegment::stat_segment_lock`].
-struct DirectoryStructure {
-    vector_by_name: HashMap<NameBytes, DirectoryIndex>,
-    first_free_elt: Option<DirectoryIndex>,
+struct DirectoryState {
+    directory_vector_by_name: HashMap<NameBytes, DirectoryIndex>,
+    dir_vector_first_free_elt: Option<DirectoryIndex>,
 }
 
 // SAFETY: the mapped addresses owned by a segment outlive every borrower (the
 // segment is owned by the process-level `StatsMain` and has no destruction
-// path), directory structure changes are serialized by `stat_segment_lock`, and
-// value writes are relaxed stores to published cells.
+// path), directory state is guarded by `stat_segment_lock`, and value writes
+// are relaxed stores to published cells.
 unsafe impl Send for StatsSegment {}
 unsafe impl Sync for StatsSegment {}
 
 impl StatsSegment {
+    /// Holds the stats directory lock and its reader-visible transaction
+    /// across a graph refork, as `vlib_worker_thread_barrier_release` does.
+    /// The caller must not invoke another directory mutation while held.
+    pub fn lock_refork(&self) -> impl Sized + '_ {
+        let stat_segment_lock = self.stat_segment_lock.lock();
+        let transaction = DirectoryWrite::begin(self);
+        (transaction, stat_segment_lock)
+    }
+
     pub(crate) fn create(
         name: &str,
         size: usize,
@@ -135,9 +136,9 @@ impl StatsSegment {
             }
         };
         let mut segment = Self {
-            stat_segment_lock: SpinLock::new(DirectoryStructure {
-                vector_by_name: HashMap::new(),
-                first_free_elt: None,
+            stat_segment_lock: SpinLock::new(DirectoryState {
+                directory_vector_by_name: HashMap::new(),
+                dir_vector_first_free_elt: None,
             }),
             update_interval,
             memory_size,
@@ -199,14 +200,15 @@ impl StatsSegment {
 
     pub fn find(&self, name: &str, expected: DirectoryType) -> StatsResult<DirectoryIndex> {
         let name_bytes = NameBytes::try_from(name)?;
-        let index = *self
-            .stat_segment_lock
-            .lock()
-            .vector_by_name
+        let directory = self.stat_segment_lock.lock();
+        let index = directory
+            .directory_vector_by_name
             .get(&name_bytes)
+            .copied()
             .ok_or_else(|| StatsError::MetricNotFound {
                 name: name.to_owned(),
             })?;
+        drop(directory);
         let actual = self.entry(index)?.directory_type()?;
         if actual != expected {
             return Err(StatsError::MetricTypeMismatch { expected, actual });
@@ -483,7 +485,9 @@ impl StatsSegment {
         // Reused interface columns contain VPP's "deleted" name. The new
         // publication replaces that string after the old symlinks are gone.
         for (offset, name) in link_names.iter().enumerate() {
-            if directory.vector_by_name.contains_key(name) || link_names[..offset].contains(name) {
+            if directory.directory_vector_by_name.contains_key(name)
+                || link_names[..offset].contains(name)
+            {
                 return Err(StatsError::DuplicateName {
                     name: links[offset].0.to_owned(),
                 });
@@ -497,7 +501,7 @@ impl StatsSegment {
             }
         }
 
-        let mut free = directory.first_free_elt;
+        let mut free = directory.dir_vector_first_free_elt;
         let mut appended = 0usize;
         let mut indices = Vec::with_capacity(links.len());
         for _ in links {
@@ -592,9 +596,9 @@ impl StatsSegment {
                 .store(next_directory, Ordering::Release);
         }
         drop(transaction);
-        directory.first_free_elt = free;
+        directory.dir_vector_first_free_elt = free;
         for (name, &index) in link_names.into_iter().zip(&indices) {
-            directory.vector_by_name.insert(name, index);
+            directory.directory_vector_by_name.insert(name, index);
         }
         drop(directory);
         if !old_name.is_null() {
@@ -680,7 +684,7 @@ impl StatsSegment {
         let next_names = replacement_names.as_ptr().cast::<*mut u8>();
         let next_directory = replacement_directory.as_ptr().cast::<DirectoryEntry>();
         let old_name = unsafe { *name_outer.add(position) };
-        let mut free = directory.first_free_elt;
+        let mut free = directory.dir_vector_first_free_elt;
         unsafe {
             ptr::copy_nonoverlapping(name_outer, next_names, name_length);
             ptr::write(next_names.add(position), deleted.as_ptr());
@@ -714,9 +718,9 @@ impl StatsSegment {
                 .store(next_directory, Ordering::Release);
         }
         drop(transaction);
-        directory.first_free_elt = free;
+        directory.dir_vector_first_free_elt = free;
         for name in link_names {
-            directory.vector_by_name.remove(&name);
+            directory.directory_vector_by_name.remove(&name);
         }
         drop(directory);
         if !old_name.is_null() {
@@ -744,7 +748,7 @@ impl StatsSegment {
         };
         let name_bytes = NameBytes::try_from(name)?;
         let mut directory = self.stat_segment_lock.lock();
-        if directory.vector_by_name.contains_key(&name_bytes) {
+        if directory.directory_vector_by_name.contains_key(&name_bytes) {
             return Err(StatsError::DuplicateName {
                 name: name.to_owned(),
             });
@@ -754,8 +758,9 @@ impl StatsSegment {
         // symlink slot.
         unsafe { (*self.entry_pointer(index)).set_name(name_bytes) };
         drop(transaction);
-        directory.vector_by_name.remove(&previous_name);
-        directory.vector_by_name.insert(name_bytes, index);
+        directory.directory_vector_by_name.remove(&previous_name);
+        directory.directory_vector_by_name.insert(name_bytes, index);
+        drop(directory);
         Ok(())
     }
 
@@ -1040,8 +1045,7 @@ impl StatsSegment {
             (kind, entry.name_bytes()?, payload)
         };
         let mut directory = self.stat_segment_lock.lock();
-        let next_free = directory
-            .first_free_elt
+        let next_free = directory.dir_vector_first_free_elt
             .map_or(STAT_SEGMENT_INDEX_INVALID, DirectoryIndex::raw);
         let transaction = DirectoryWrite::begin(self);
         // The slot becomes empty before its payload is released: a reader that
@@ -1055,8 +1059,8 @@ impl StatsSegment {
             ),
         );
         drop(transaction);
-        directory.vector_by_name.remove(&name);
-        directory.first_free_elt = Some(index);
+        directory.directory_vector_by_name.remove(&name);
+        directory.dir_vector_first_free_elt = Some(index);
         drop(directory);
         self.release_payload(kind, payload)
     }
@@ -1160,20 +1164,20 @@ impl StatsSegment {
     ) -> StatsResult<DirectoryIndex> {
         let name_bytes = NameBytes::try_from(name)?;
         let mut directory = self.stat_segment_lock.lock();
-        if directory.vector_by_name.contains_key(&name_bytes) {
+        if directory.directory_vector_by_name.contains_key(&name_bytes) {
             return Err(StatsError::DuplicateName {
                 name: name.to_owned(),
             });
         }
         let entry = DirectoryEntry::new(TypeCode::from(directory_type), name_bytes, data);
-        let reused = match directory.first_free_elt {
+        let reused = match directory.dir_vector_first_free_elt {
             Some(index) => Some((index, self.entry(index)?.directory_index()?)),
             None => None,
         };
         let transaction = DirectoryWrite::begin(self);
         let index = match reused {
             Some((index, next)) => {
-                directory.first_free_elt =
+                directory.dir_vector_first_free_elt =
                     (next.raw() != STAT_SEGMENT_INDEX_INVALID).then_some(next);
                 index
             }
@@ -1185,7 +1189,8 @@ impl StatsSegment {
         };
         self.store_entry(index, entry);
         drop(transaction);
-        directory.vector_by_name.insert(name_bytes, index);
+        directory.directory_vector_by_name.insert(name_bytes, index);
+        drop(directory);
         Ok(index)
     }
 
@@ -1257,7 +1262,7 @@ impl StatsSegment {
 
     /// The published slot of one directory entry, for structural writes.
     ///
-    /// Structure writers hold [`StatsSegment::stat_segment_lock`] and have
+    /// Directory writers hold [`StatsSegment::stat_segment_lock`] and have
     /// checked `index` against the published directory.
     fn entry_pointer(&self, index: DirectoryIndex) -> *mut DirectoryEntry {
         // SAFETY: the caller checked the index against the published directory.
@@ -1313,10 +1318,8 @@ impl StatsSegment {
 /// This is the Rust form of the `vlib_stats_segment_lock` /
 /// `vlib_stats_segment_unlock` pair (`third_party/vpp/src/vlib/stats/stats.c:11,32`):
 /// the writer marks the shared directory as changing until the value drops,
-/// and dropping it publishes the completed epoch. The writer already holds the
-/// exclusive `&mut StatsSegment` of the `SpinLock` in `StatsMain`, so this
-/// value adds no mutual exclusion of its own; it is the reader-visible half of
-/// that same scope and cannot be closed twice or forgotten.
+/// then publishes the completed epoch. The existing `stat_segment_lock`
+/// serializes directory writers; this value adds no mutual exclusion.
 struct DirectoryWrite {
     header: NonNull<SharedHeader>,
 }

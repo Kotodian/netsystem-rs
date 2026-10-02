@@ -1,8 +1,6 @@
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{
-    DataPlaneMain, InternalNode, Node, NodeErrorCode, TraceFormatter, unlikely,
-};
+use hammer_runtime::{DataPlaneMain, InternalNode, Node, NodeErrorCode, TraceFormatter, unlikely};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::interface::InterfaceSimpleCounter;
@@ -91,8 +89,8 @@ pub struct DropTrace {
 }
 
 fn format_drop_trace(bytes: &[u8]) -> String {
-    let (trace, _) = DropTrace::ref_from_prefix(bytes)
-        .expect("drop trace record has its registered layout");
+    let (trace, _) =
+        DropTrace::ref_from_prefix(bytes).expect("drop trace record has its registered layout");
     format!("error index {}", trace.error_index)
 }
 

@@ -650,7 +650,7 @@ impl NetMain {
             self.validate_bucket_identity(*bucket)?;
         }
         let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
 
         // VPP synchronizes load_balance_alloc_i when pool or counter backing
         // storage grows because its packet path dereferences an already-valid
@@ -658,7 +658,7 @@ impl NetMain {
         // also reads pool length and occupancy, so every insertion must stop
         // readers even when the backing allocation stays in place.
         if workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+            && !hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.is_pending())
         {
             hammer_runtime::worker_thread_barrier_sync!(runtime, {
                 self.create_load_balance_inner(runtime, proto, load_balance)
@@ -739,9 +739,9 @@ impl NetMain {
         }
 
         let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+            && !hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.is_pending())
         {
             hammer_runtime::worker_thread_barrier_sync!(runtime, {
                 self.update_load_balance_inner(runtime, dpo, paths)
@@ -881,9 +881,9 @@ impl NetMain {
             self.validate_bucket_identity(*bucket)?;
         }
         let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+            && !hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.is_pending())
         {
             hammer_runtime::worker_thread_barrier_sync!(runtime, {
                 self.create_replicate_inner(runtime, proto, replicate)
@@ -964,9 +964,9 @@ impl NetMain {
             }
         }
         let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+            hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.worker_count() != 0);
         if workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+            && !hammer_runtime::WorkerThread::main().is_some_and(|barrier| barrier.is_pending())
         {
             hammer_runtime::worker_thread_barrier_sync!(runtime, {
                 self.update_replicate_inner(runtime, dpo, buckets)

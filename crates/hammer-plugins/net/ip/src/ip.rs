@@ -100,6 +100,6 @@ pub use local::{
 };
 pub use reassembly::{
     Ip4ReassemblyNext, Ip4ReassemblyNode, Ip6ReassemblyNext, Ip6ReassemblyNode,
-    IpReassemblyDirectory, IpReassemblyHandoff,
-    pack_fragment_owner_value, unpack_fragment_owner_value,
+    IpReassemblyDirectory, IpReassemblyHandoff, pack_fragment_owner_value,
+    unpack_fragment_owner_value,
 };

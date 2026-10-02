@@ -186,7 +186,8 @@ impl EthernetMain {
         hammer_runtime::ensure_main_thread()
             .expect("EtherType registration belongs to the main thread");
         assert!(
-            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            !hammer_runtime::WorkerThread::main()
+                .is_some_and(|barrier| barrier.worker_count() != 0),
             "EtherType registration precedes Data Worker startup"
         );
         let input = nodes
