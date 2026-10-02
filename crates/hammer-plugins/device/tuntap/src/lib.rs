@@ -20,7 +20,8 @@ use hammer_runtime::{DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeErro
 use hammer_service::data_plane::DropNode;
 use hammer_service::feature::FeatureMain;
 use hammer_service::interface::{
-    HwClassFlags, HwInterfaceFlags, InterfaceMtu, SwInterfaceFlags, TxFrame,
+    HwClassFlags, HwInterfaceFlags, InterfaceCombinedCounter, InterfaceMtu, InterfaceSimpleCounter,
+    SwInterfaceFlags, TxFrame,
 };
 use hammer_service::interface_model::DriverScheduleMode;
 use hammer_service::net::NetMain;
@@ -986,6 +987,20 @@ fn tun_ip_nexts(nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY], count: usize, 
 impl Node for TunInputNode {
     fn process(runtime: &mut DataPlaneMain, node: &mut NodeRuntime, frame: &mut Frame) -> usize {
         let main = TunMain::global().interface();
+        let interfaces = NetMain::global()
+            .expect("network Main exists during TUN RX")
+            .interface_main();
+        assert!(
+            frame.is_empty(),
+            "tun-input starts with an empty driver Frame"
+        );
+        if !interfaces
+            .software_interface(main.sw_if_index)
+            .expect("TUN interface remains live")
+            .is_admin_up()
+        {
+            return 0;
+        }
         let worker_index = runtime.thread_index() as usize;
         let worker_count = main.workers.len() - 1;
         let worker = &main.workers[worker_index];
@@ -993,15 +1008,8 @@ impl Node for TunInputNode {
         let mut packets = 0;
         let mut alloc_error = 0;
         let mut full_queue = 0;
-        let interfaces = NetMain::global()
-            .expect("network Main exists during TUN RX")
-            .interface_main();
         let worker_id = DataWorkerId::try_from(runtime.thread_index())
             .expect("tun-input runs only on a Data Worker");
-        assert!(
-            frame.is_empty(),
-            "tun-input starts with an empty driver Frame"
-        );
         for poll in interfaces.rx_queue_poll_vector(worker_id, main.input_node) {
             assert_eq!(
                 poll.device_instance, 0,
@@ -1022,6 +1030,7 @@ impl Node for TunInputNode {
             }
             let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
             let mut count = 0;
+            let mut rx_bytes = 0u64;
             let (buffers, _) = frame.next_args_mut::<u32, ()>(0);
             while queue.has_used() && count < DEFAULT_BUFFER_FRAME_CAPACITY {
                 let used = queue.ring.used_element(queue.last_used);
@@ -1101,19 +1110,23 @@ impl Node for TunInputNode {
                 buffers[count] = head;
                 nexts[count] =
                     u16::from(runtime.buffer(head).current().first().copied().unwrap_or(0));
+                rx_bytes += total as u64;
                 count += 1;
+            }
+            if count != 0 {
+                interfaces
+                    .combined_counter(InterfaceCombinedCounter::Rx)
+                    .increment(
+                        runtime.thread_index(),
+                        main.sw_if_index,
+                        count as u64,
+                        rx_bytes,
+                    );
             }
             tun_ip_nexts(&mut nexts, count, main.next);
             frame.set_vector_count(count);
-            let is_up = interfaces
-                .software_interface(main.sw_if_index)
-                .expect("TUN interface remains live")
-                .is_admin_up();
             let features = FeatureMain::global().expect("Feature Main exists during TUN RX");
             for (index, next) in frame.vector_args().iter().copied().zip(&mut nexts[..count]) {
-                if !is_up {
-                    *next = main.next.drop;
-                }
                 *next =
                     features.start_device_input(main.sw_if_index, runtime.buffer_mut(index), *next);
             }
@@ -1448,6 +1461,14 @@ fn tun_intfc_tx(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Fr
     if no_slots != 0 {
         drops[TunTxError::NoFreeSlots as usize] = no_slots as u64;
         runtime.buffer_free(&packets[consumed..]);
+    }
+    let dropped = drops.iter().sum::<u64>();
+    if dropped != 0 {
+        NetMain::global()
+            .expect("network Main exists during TUN TX")
+            .interface_main()
+            .simple_counter(InterfaceSimpleCounter::Drop)
+            .increment(runtime.thread_index(), main.sw_if_index, dropped);
     }
     for (error, count) in [
         TunTxError::NoFreeSlots,
