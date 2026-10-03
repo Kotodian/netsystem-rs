@@ -38,6 +38,11 @@ hammer_runtime::__declare_registration_image!(
         cli::errors::__CLI_COMMAND_CLEAR_ERRORS,
         cli::memory::__CLI_COMMAND_MEMORY,
         cli::buffer::__CLI_COMMAND_BUFFER,
+        cli::trace::__CLI_COMMAND_TRACE_ADD,
+        cli::trace::__CLI_COMMAND_SHOW_TRACE,
+        cli::trace::__CLI_COMMAND_CLEAR_TRACE,
+        cli::trace::__CLI_COMMAND_SET_TRACE_TIMESTAMP_FORMAT,
+        cli::trace::__CLI_COMMAND_SHOW_TRACE_TIMESTAMP_FORMAT,
     ];
 );
 

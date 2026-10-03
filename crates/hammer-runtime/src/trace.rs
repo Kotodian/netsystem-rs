@@ -9,8 +9,6 @@ use crate::node::{
 };
 use crate::{DataPlaneMain, RuntimeResult};
 
-pub mod cli;
-
 pub type TraceFormatter = fn(&[u8]) -> String;
 
 pub(crate) const TRACE_THREAD_SHIFT: u32 = 24;
@@ -20,8 +18,8 @@ pub(crate) const TRACE_INDEX_LIMIT: u32 = 0x00ff_ffff;
 /// VPP `vlib_trace_header_t`; payload occupies `n_data` further headers.
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, KnownLayout, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct TraceHeader {
-    pub(crate) time: u64,
+pub struct TraceHeader {
+    pub time: u64,
     pub(crate) node_index: u32,
     pub(crate) n_data: u32,
 }
@@ -32,9 +30,9 @@ const _: () = {
 };
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TraceNode {
+pub struct TraceNode {
     pub(crate) count: u32,
-    pub(crate) limit: u32,
+    pub limit: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -57,18 +55,18 @@ impl core::fmt::Display for TraceTimestampFormat {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct TraceMain {
-    pub(crate) trace_buffer_pool: Pool<Vec<TraceHeader>>,
-    pub(crate) nodes: Vec<TraceNode>,
-    pub(crate) trace_enable: bool,
+pub struct TraceMain {
+    pub trace_buffer_pool: Pool<Vec<TraceHeader>>,
+    pub nodes: Vec<TraceNode>,
+    pub trace_enable: bool,
     pub(crate) verbose: bool,
-    pub(crate) timestamp_format: TraceTimestampFormat,
+    pub timestamp_format: TraceTimestampFormat,
 }
 
 impl TraceMain {
     /// VPP `trace_update_capture_options`: zero resets a Node's quota but
     /// does not delete existing packet records.
-    pub(crate) fn add_count(&mut self, node: NodeId, count: u32, verbose: bool) {
+    pub fn add_count(&mut self, node: NodeId, count: u32, verbose: bool) {
         let index = node.slot() as usize;
         if self.nodes.len() <= index {
             self.nodes.resize(index + 1, TraceNode::default());
@@ -88,7 +86,7 @@ impl TraceMain {
     }
 
     /// VPP `clear_trace_buffer`: called only after all mains disable tracing.
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.nodes.clear();
         self.trace_buffer_pool.clear();
     }

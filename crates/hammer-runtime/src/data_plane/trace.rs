@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -5,10 +6,125 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use super::*;
 use crate::trace::{
     HandoffTrace, TRACE_INDEX_LIMIT, TRACE_THREAD_LIMIT, TRACE_THREAD_SHIFT, TraceHeader,
+    TraceTimestampFormat,
 };
 use hammer_stats::StatsMain;
 
 impl DataPlaneMain {
+    /// Borrows this main's trace state; workers borrow only their own main.
+    #[inline]
+    pub fn trace_main(&self) -> &crate::trace::TraceMain {
+        &self.trace_main
+    }
+
+    #[inline]
+    pub fn trace_main_mut(&mut self) -> &mut crate::trace::TraceMain {
+        &mut self.trace_main
+    }
+
+    /// VPP `format_vlib_trace`; the vector stores aligned headers and payloads.
+    pub fn format_trace_buffer(
+        &self,
+        trace: &[TraceHeader],
+        timestamp_format: TraceTimestampFormat,
+        output: &mut String,
+    ) {
+        let mut offset = 0;
+        let mut previous_node = None;
+        while offset < trace.len() {
+            let header = trace[offset];
+            let end = offset
+                .checked_add(1)
+                .and_then(|start| start.checked_add(header.n_data as usize))
+                .expect("trace header length fits its vector");
+            assert!(end <= trace.len(), "trace header stays within its vector");
+            let node = NodeId::new(header.node_index);
+            let name = self
+                .nodes
+                .node_name(node)
+                .expect("trace Node remains registered")
+                .expect("trace Node has a name");
+            if previous_node != Some(node) {
+                match timestamp_format {
+                    TraceTimestampFormat::Relative => {
+                        let seconds = header
+                            .time
+                            .checked_sub(self.main_loop_start_ticks)
+                            .expect("trace follows main-loop start")
+                            as f64
+                            * self.seconds_per_cpu_tick;
+                        let whole = seconds.trunc() as u64;
+                        let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
+                        writeln!(
+                            output,
+                            "\n{:02}:{:02}:{:02}:{:06}: {}",
+                            whole / 3_600,
+                            (whole / 60) % 60,
+                            whole % 60,
+                            microseconds,
+                            name
+                        )
+                        .expect("write to String");
+                    }
+                    TraceTimestampFormat::Unix | TraceTimestampFormat::Datetime => {
+                        let seconds = self.unix_reference_seconds
+                            + header
+                                .time
+                                .checked_sub(self.cpu_reference_ticks)
+                                .expect("trace follows clock reference")
+                                as f64
+                                * self.seconds_per_cpu_tick;
+                        if matches!(timestamp_format, TraceTimestampFormat::Unix) {
+                            writeln!(output, "\n{seconds:.6}: {name}").expect("write to String");
+                        } else {
+                            let seconds_whole = seconds.trunc() as libc::time_t;
+                            let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
+                            let mut calendar = std::mem::MaybeUninit::<libc::tm>::uninit();
+                            // SAFETY: localtime_r initializes calendar on success.
+                            let calendar = unsafe {
+                                assert!(
+                                    !libc::localtime_r(&seconds_whole, calendar.as_mut_ptr())
+                                        .is_null(),
+                                    "trace timestamp is representable"
+                                );
+                                calendar.assume_init()
+                            };
+                            writeln!(
+                                output,
+                                "\n{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}: {}",
+                                calendar.tm_year + 1900,
+                                calendar.tm_mon + 1,
+                                calendar.tm_mday,
+                                calendar.tm_hour,
+                                calendar.tm_min,
+                                calendar.tm_sec,
+                                microseconds,
+                                name
+                            )
+                            .expect("write to String");
+                        }
+                    }
+                }
+            }
+            previous_node = Some(node);
+
+            let payload = trace[offset + 1..end].as_bytes();
+            if let Some(formatter) = self
+                .nodes
+                .node_trace_formatter(node)
+                .expect("trace Node remains registered")
+            {
+                writeln!(output, "  {}", formatter(payload)).expect("write to String");
+            } else {
+                output.push_str("  ");
+                for byte in payload {
+                    write!(output, "{byte:02x}").expect("write to String");
+                }
+                output.push('\n');
+            }
+            offset = end;
+        }
+    }
     pub(crate) fn initialize_trace_clock(&mut self) {
         self.seconds_per_cpu_tick = 1.0 / hammer_infra::time::cpu_clock_frequency();
         self.unix_reference_seconds = SystemTime::now()

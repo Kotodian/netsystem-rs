@@ -2,3 +2,4 @@ pub(super) mod buffer;
 pub(super) mod errors;
 pub(super) mod memory;
 pub(super) mod runtime;
+pub(super) mod trace;

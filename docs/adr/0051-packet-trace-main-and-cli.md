@@ -664,8 +664,10 @@ impl ThreadMain {
 
 Worker main-loop 每轮先结束上一轮的 `&mut DataPlaneMain`，再检查
 barrier；检查后通过 `worker_main_on_worker` 重新借用，完成现有 File、
-Node、timer 固定调度步骤。`worker_main_at_barrier` 仅供 runtime CLI
-的同步非 MP-safe handler 使用，不导出到插件。无 DataPlaneMain 的线程
+Node、timer 固定调度步骤。`worker_main_at_barrier` 是通用的 stopped-worker 借用接口；调用者必须
+在 barrier 内结束借用。CLI handler 和注册项位于 `hammer/cli/trace.rs`，
+由 daemon registration image 注册五个命令。runtime 保留 TraceMain、
+TraceHeader、TraceNode 与记录格式化机制。无 DataPlaneMain 的线程
 不在 `data_workers()` 中。
 
 CLI 命令为 `trace add <node> <count> [verbose]`、
@@ -694,11 +696,12 @@ Node 存在且 `trace_supported`，再对所有 main 做溢出检查，最后
 现有注册契约的私有适配入口；它只是宏展开细节，不是 trace API、
 CLI 命令或需要设计命名的新函数。适配入口同步解析 Args、在
 `CliMain::dispatch` 给出的 `&mut DataPlaneMain` 上完整执行 handler、
-对有输出的 `R` 调用 `Display`，对 `()` 生成零字节输出，然后仅把
-最终 `String` 放进 ready task。无需为无输出命令定义假的字符串结果、
+把有输出的拥有型 `R` 移进已有 Future，在 barrier 和 main 借用结束后
+调用 `Display`；`()` 在 Future 中生成零字节输出。无需为无输出命令定义假的字符串结果、
 空输出包装类型或另一个 CLI 回调。所有 trace 命令 `mp_safe=false`，
-所以解析后的 main/Worker 访问和格式化都在 barrier 内完成；ready
-task 不持有 main、pool 引用或 barrier guard。此同步 main-aware
+所以 handler 内的 main/Worker 访问都在 barrier 内完成；返回的
+Future 不持有 main、pool 引用或 barrier guard。`show trace` 为避免复制
+记录仍在 handler 内借用 pool 并生成 String；宏随后只输出该拥有型文本。此同步 main-aware
 形式是 ADR-0049 “handler 只接收 Args”规则针对必须访问主线程
 `DataPlaneMain` 的窄修订，不改变命令目录、输出路径或 Future 调度。
 VPP 对应命令没有设置 `is_mp_safe`，`vlib/cli.c:593-614` 在调用其
@@ -706,243 +709,219 @@ VPP 对应命令没有设置 `is_mp_safe`，`vlib/cli.c:593-614` 在调用其
 包进这个临界区。
 
 ```rust
-// hammer-runtime::trace CLI; VPP: vlib/trace.c:273-355,408-466,570-582,
-// 740-800; vlib/cli.c:593-614. Each Args::from_str consumes the entire
-// command suffix and rejects unknown or duplicate words.
+// hammer/cli/trace.rs; VPP: vlib/trace.c:273-355,408-466,570-582,740-800.
+//! Main-thread packet trace CLI. Every command is non-MP-safe, so the
+//! synchronous handler completes while the existing WorkerBarrier is held.
+
+use std::fmt::Write;
+use std::str::FromStr;
+
+use hammer_core::data_plane::NodeId;
+use hammer_runtime::cli::CliError;
+use hammer_runtime::trace::{TraceHeader, TraceTimestampFormat};
+use hammer_runtime::{DataPlaneMain, ThreadMain};
+
 struct TraceAddArgs {
     node: String,
     count: u32,
     verbose: bool,
 }
+
 impl FromStr for TraceAddArgs {
     type Err = CliError;
+
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut words = input.split_whitespace();
-        let node = words.next().ok_or_else(|| CliError::InvalidArgument {
-            argument: input.to_owned(),
-        })?.to_owned();
-        let count = words.next().ok_or_else(|| CliError::InvalidArgument {
-            argument: input.to_owned(),
-        })?.parse().map_err(|_| CliError::InvalidArgument {
-            argument: input.to_owned(),
-        })?;
+        let node = words
+            .next()
+            .ok_or_else(|| CliError::InvalidArgument {
+                argument: input.to_owned(),
+            })?
+            .to_owned();
+        let count = words
+            .next()
+            .ok_or_else(|| CliError::InvalidArgument {
+                argument: input.to_owned(),
+            })?
+            .parse()
+            .map_err(|_| CliError::InvalidArgument {
+                argument: input.to_owned(),
+            })?;
         let verbose = match words.next() {
             None => false,
             Some("verbose") => true,
-            Some(_) => return Err(CliError::InvalidArgument {
-                argument: input.to_owned(),
-            }),
+            Some(_) => {
+                return Err(CliError::InvalidArgument {
+                    argument: input.to_owned(),
+                });
+            }
         };
         if words.next().is_some() {
-            return Err(CliError::InvalidArgument { argument: input.to_owned() });
+            return Err(CliError::InvalidArgument {
+                argument: input.to_owned(),
+            });
         }
-        Ok(Self { node, count, verbose })
+        Ok(Self {
+            node,
+            count,
+            verbose,
+        })
     }
 }
 
-struct ShowTraceArgs { max: u32 }
+struct ShowTraceArgs {
+    max: u32,
+}
+
 impl FromStr for ShowTraceArgs {
     type Err = CliError;
+
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut words = input.split_whitespace();
-        let Some(word) = words.next() else { return Ok(Self { max: 50 }); };
+        let Some(word) = words.next() else {
+            return Ok(Self { max: 50 });
+        };
         if word != "max" {
-            return Err(CliError::InvalidArgument { argument: input.to_owned() });
+            return Err(CliError::InvalidArgument {
+                argument: input.to_owned(),
+            });
         }
-        let max = words.next().ok_or_else(|| CliError::InvalidArgument {
-            argument: input.to_owned(),
-        })?.parse().map_err(|_| CliError::InvalidArgument {
-            argument: input.to_owned(),
-        })?;
+        let max = words
+            .next()
+            .ok_or_else(|| CliError::InvalidArgument {
+                argument: input.to_owned(),
+            })?
+            .parse()
+            .map_err(|_| CliError::InvalidArgument {
+                argument: input.to_owned(),
+            })?;
         if words.next().is_some() {
-            return Err(CliError::InvalidArgument { argument: input.to_owned() });
+            return Err(CliError::InvalidArgument {
+                argument: input.to_owned(),
+            });
         }
         Ok(Self { max })
     }
 }
 
 struct ClearTraceArgs;
+
 impl FromStr for ClearTraceArgs {
     type Err = CliError;
+
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         if !input.trim().is_empty() {
-            return Err(CliError::InvalidArgument { argument: input.to_owned() });
+            return Err(CliError::InvalidArgument {
+                argument: input.to_owned(),
+            });
         }
         Ok(Self)
     }
 }
 
-struct TraceTimestampArgs { format: TraceTimestampFormat }
+struct TraceTimestampArgs {
+    format: TraceTimestampFormat,
+}
+
 impl FromStr for TraceTimestampArgs {
     type Err = CliError;
+
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let format = match input.trim() {
             "relative" => TraceTimestampFormat::Relative,
             "unix" => TraceTimestampFormat::Unix,
             "datetime" => TraceTimestampFormat::Datetime,
-            _ => return Err(CliError::InvalidArgument {
-                argument: input.to_owned(),
-            }),
+            _ => {
+                return Err(CliError::InvalidArgument {
+                    argument: input.to_owned(),
+                });
+            }
         };
         Ok(Self { format })
     }
 }
 
 struct ShowTraceTimestampArgs;
+
 impl FromStr for ShowTraceTimestampArgs {
     type Err = CliError;
+
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         if !input.trim().is_empty() {
-            return Err(CliError::InvalidArgument { argument: input.to_owned() });
+            return Err(CliError::InvalidArgument {
+                argument: input.to_owned(),
+            });
         }
         Ok(Self)
     }
 }
 
-#[cli_command(path = "trace add", args = TraceAddArgs, mp_safe = false)]
-fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs)
-    -> Result<(), CliError>
-{
-    let node = main.node_by_name(&args.node).ok_or_else(||
-        CliError::TraceNodeMissing { name: args.node.clone() }
-    )?;
-    if !main.nodes.node_trace_supported(node)
+/// VPP `cli_add_trace_buffer` and `trace_update_capture_options`.
+#[hammer_component_macros::cli_command(path = "trace add", args = TraceAddArgs, mp_safe = false)]
+fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs) -> Result<(), CliError> {
+    let node = main
+        .node_by_name(&args.node)
+        .ok_or_else(|| CliError::TraceNodeMissing {
+            name: args.node.clone(),
+        })?;
+    if !main
+        .nodes()
+        .node_trace_supported(node)
         .expect("named Node is registered")
     {
         return Err(CliError::TraceUnsupported { node: args.node });
     }
 
-    // VPP trace_update_capture_options first visits every main. The Rust
-    // overflow preflight makes that same publication failure-atomic.
-    let workers = ThreadMain::global();
-    for owner in std::iter::once(&*main).chain(workers.data_workers().map(|worker| {
-        // SAFETY: this non-MP-safe CLI is inside WorkerBarrier; the Worker
-        // ended its previous DataPlaneMain borrow before acknowledging it.
-        unsafe { worker.main_at_barrier() as &DataPlaneMain }
+    let threads = ThreadMain::global();
+    for owner in std::iter::once(&*main).chain(threads.data_workers().map(|worker| {
+        // SAFETY: the non-MP-safe CLI holds WorkerBarrier, and the Worker
+        // released its own main borrow before acknowledging the barrier.
+        unsafe { threads.worker_main_at_barrier(worker) as &DataPlaneMain }
     })) {
-        let limit = owner.trace_main.nodes.get(node.slot() as usize)
+        let limit = owner
+            .trace_main()
+            .nodes
+            .get(node.slot() as usize)
             .map_or(0, |trace_node| trace_node.limit);
         if args.count != 0 && limit.checked_add(args.count).is_none() {
             return Err(CliError::TraceLimitOverflow { node: args.node });
         }
     }
 
-    main.trace_main.add_count(node, args.count, args.verbose);
-    for worker in workers.data_workers() {
-        // SAFETY: the same barrier is still held and each Worker main is
-        // borrowed for only this call, never concurrently with its Worker.
-        unsafe { worker.main_at_barrier() }
-            .trace_main.add_count(node, args.count, args.verbose);
+    main.trace_main_mut()
+        .add_count(node, args.count, args.verbose);
+    for worker in threads.data_workers() {
+        // SAFETY: the same barrier remains held through the complete update.
+        unsafe { threads.worker_main_at_barrier(worker) }
+            .trace_main_mut()
+            .add_count(node, args.count, args.verbose);
     }
     Ok(())
 }
 
-// VPP: vlib/trace.c:118-169; vppinfra/std-formats.c:152-212;
-// vppinfra/unix-formats.c:259-344. This is the Rust format_vlib_trace.
-fn format_trace_buffer(
-    owner: &DataPlaneMain,
-    trace: &[TraceHeader],
-    timestamp_format: TraceTimestampFormat,
-    output: &mut String,
-) {
-    use std::fmt::Write;
-    use zerocopy::IntoBytes;
-
-    let mut offset = 0;
-    let mut previous_node = None;
-    while offset < trace.len() {
-        let header = trace[offset];
-        let end = offset.checked_add(1)
-            .and_then(|start| start.checked_add(header.n_data as usize))
-            .expect("trace header length fits its vector");
-        assert!(end <= trace.len(), "trace header stays within its vector");
-        let node = NodeId::new(header.node_index);
-        let name = owner.nodes.node_name(node)
-            .expect("trace Node remains registered")
-            .expect("trace Node has a name");
-        if previous_node != Some(node) {
-            match timestamp_format {
-                TraceTimestampFormat::Relative => {
-                    let seconds = header.time.checked_sub(owner.main_loop_start_ticks)
-                        .expect("trace follows main-loop start") as f64
-                        * owner.seconds_per_cpu_tick;
-                    let whole = seconds.trunc() as u64;
-                    let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
-                    writeln!(output, "\n{:02}:{:02}:{:02}:{:06}: {}",
-                        whole / 3_600, (whole / 60) % 60, whole % 60,
-                        microseconds, name).expect("write to String");
-                }
-                TraceTimestampFormat::Unix | TraceTimestampFormat::Datetime => {
-                    let seconds = owner.unix_reference_seconds
-                        + header.time.checked_sub(owner.cpu_reference_ticks)
-                            .expect("trace follows clock reference") as f64
-                            * owner.seconds_per_cpu_tick;
-                    if matches!(timestamp_format, TraceTimestampFormat::Unix) {
-                        writeln!(output, "\n{seconds:.6}: {name}")
-                            .expect("write to String");
-                    } else {
-                        let seconds_whole = seconds.trunc() as libc::time_t;
-                        let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
-                        let mut calendar = std::mem::MaybeUninit::<libc::tm>::uninit();
-                        // SAFETY: seconds_whole and calendar are valid C objects;
-                        // localtime_r writes the latter before assume_init.
-                        let calendar = unsafe {
-                            assert!(!libc::localtime_r(
-                                &seconds_whole, calendar.as_mut_ptr()
-                            ).is_null(), "trace timestamp is representable");
-                            calendar.assume_init()
-                        };
-                        writeln!(output,
-                            "\n{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}: {}",
-                            calendar.tm_year + 1900, calendar.tm_mon + 1,
-                            calendar.tm_mday, calendar.tm_hour, calendar.tm_min,
-                            calendar.tm_sec, microseconds, name,
-                        ).expect("write to String");
-                    }
-                }
-            }
-        }
-        previous_node = Some(node);
-
-        let payload = trace[offset + 1..end].as_bytes();
-        if let Some(formatter) = owner.nodes.node_trace_formatter(node)
-            .expect("trace Node remains registered")
-        {
-            writeln!(output, "  {}", formatter(payload)).expect("write to String");
-        } else {
-            output.push_str("  ");
-            for byte in payload {
-                write!(output, "{byte:02x}").expect("write to String");
-            }
-            output.push('\n');
-        }
-        offset = end;
-    }
-}
-
-#[cli_command(path = "show trace", args = ShowTraceArgs, mp_safe = false)]
-fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs)
-    -> Result<String, CliError>
-{
-    use std::fmt::Write;
-
+/// VPP `cli_show_trace_buffer`: per-main sorting and a per-main display cap.
+#[hammer_component_macros::cli_command(path = "show trace", args = ShowTraceArgs, mp_safe = false)]
+fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, CliError> {
     let mut output = String::new();
-    let timestamp_format = main.trace_main.timestamp_format;
-    let workers = ThreadMain::global();
-    let mains = std::iter::once((0, "main", &*main))
-        .chain(workers.data_workers().map(|worker| {
-            // SAFETY: this non-MP-safe CLI holds WorkerBarrier for the
-            // complete collection, sorting and formatting operation.
-            (worker.thread_index(), worker.name(),
-             unsafe { worker.main_at_barrier() as &DataPlaneMain })
-        }));
+    let timestamp_format = main.trace_main().timestamp_format;
+    let threads = ThreadMain::global();
+    let mains = std::iter::once((0, "main", &*main)).chain(threads.data_workers().map(|worker| {
+        // SAFETY: the non-MP-safe CLI holds WorkerBarrier until formatting ends.
+        (worker.thread_index(), worker.name(), unsafe {
+            threads.worker_main_at_barrier(worker) as &DataPlaneMain
+        })
+    }));
     for (thread_index, name, owner) in mains {
-        writeln!(output,
+        writeln!(
+            output,
             "------------------- Start of thread {thread_index} {name} -------------------"
-        ).expect("write to String");
+        )
+        .expect("write to String");
 
-        // Borrow only record slices. No trace payload is copied for sorting.
-        let mut traces: Vec<&[TraceHeader]> = owner.trace_main.trace_buffer_pool
+        // Only record slices are sorted; payload bytes stay in the owner pool.
+        let mut traces: Vec<&[TraceHeader]> = owner
+            .trace_main()
+            .trace_buffer_pool
             .iter()
             .filter_map(|(_, record)| (!record.is_empty()).then_some(record.as_slice()))
             .collect();
@@ -953,50 +932,186 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs)
         traces.sort_unstable_by_key(|record| record[0].time);
         for (index, record) in traces.iter().take(args.max as usize).enumerate() {
             writeln!(output, "Packet {}", index + 1).expect("write to String");
-            format_trace_buffer(owner, record, timestamp_format, &mut output);
+            owner.format_trace_buffer(record, timestamp_format, &mut output);
             output.push_str("\n\n");
         }
         if traces.len() > args.max as usize {
-            writeln!(output, "Limiting display to {} packets. To display more specify max.",
-                args.max).expect("write to String");
+            writeln!(
+                output,
+                "Limiting display to {} packets. To display more specify max.",
+                args.max
+            )
+            .expect("write to String");
         }
     }
     Ok(output)
 }
 
-#[cli_command(path = "clear trace", args = ClearTraceArgs, mp_safe = false)]
-fn clear_trace(main: &mut DataPlaneMain, _: ClearTraceArgs)
-    -> Result<(), CliError>
-{
-    let workers = ThreadMain::global();
-    main.trace_main.trace_enable = false;
-    for worker in workers.data_workers() {
-        // SAFETY: the non-MP-safe CLI holds WorkerBarrier throughout both
-        // passes; no Worker can create a new trace between them.
-        unsafe { worker.main_at_barrier() }.trace_main.trace_enable = false;
+/// VPP `clear_trace_buffer`: disable every main before clearing any pool.
+#[hammer_component_macros::cli_command(path = "clear trace", args = ClearTraceArgs, mp_safe = false)]
+fn clear_trace(main: &mut DataPlaneMain, _: ClearTraceArgs) -> Result<(), CliError> {
+    let threads = ThreadMain::global();
+    main.trace_main_mut().trace_enable = false;
+    for worker in threads.data_workers() {
+        // SAFETY: the non-MP-safe CLI holds WorkerBarrier for both passes.
+        unsafe { threads.worker_main_at_barrier(worker) }
+            .trace_main_mut()
+            .trace_enable = false;
     }
-    main.trace_main.clear();
-    for worker in workers.data_workers() {
-        unsafe { worker.main_at_barrier() }.trace_main.clear();
+    main.trace_main_mut().clear();
+    for worker in threads.data_workers() {
+        unsafe { threads.worker_main_at_barrier(worker) }
+            .trace_main_mut()
+            .clear();
     }
     Ok(())
 }
 
-#[cli_command(path = "set trace timestamp-format", args = TraceTimestampArgs,
-              mp_safe = false)]
-fn set_trace_timestamp_format(main: &mut DataPlaneMain, args: TraceTimestampArgs)
-    -> Result<(), CliError>
-{
-    main.trace_main.timestamp_format = args.format;
+#[hammer_component_macros::cli_command(
+    path = "set trace timestamp-format",
+    args = TraceTimestampArgs,
+    mp_safe = false,
+)]
+fn set_trace_timestamp_format(
+    main: &mut DataPlaneMain,
+    args: TraceTimestampArgs,
+) -> Result<(), CliError> {
+    main.trace_main_mut().timestamp_format = args.format;
     Ok(())
 }
 
-#[cli_command(path = "show trace timestamp-format", args = ShowTraceTimestampArgs,
-              mp_safe = false)]
-fn show_trace_timestamp_format(main: &mut DataPlaneMain, _: ShowTraceTimestampArgs)
-    -> Result<TraceTimestampFormat, CliError>
-{
-    Ok(main.trace_main.timestamp_format)
+#[hammer_component_macros::cli_command(
+    path = "show trace timestamp-format",
+    args = ShowTraceTimestampArgs,
+    mp_safe = false,
+)]
+fn show_trace_timestamp_format(
+    main: &mut DataPlaneMain,
+    _: ShowTraceTimestampArgs,
+) -> Result<TraceTimestampFormat, CliError> {
+    Ok(main.trace_main().timestamp_format)
+}
+```
+
+记录 formatter 移回 runtime 的 DataPlaneMain 方法，沿用该 main 已有的
+时钟基准、Node formatter 和 TraceHeader；CLI 只调用方法。
+
+```rust
+impl DataPlaneMain {
+    /// Borrows this main's trace state; workers borrow only their own main.
+    #[inline]
+    pub fn trace_main(&self) -> &crate::trace::TraceMain {
+        &self.trace_main
+    }
+
+    #[inline]
+    pub fn trace_main_mut(&mut self) -> &mut crate::trace::TraceMain {
+        &mut self.trace_main
+    }
+
+    /// VPP `format_vlib_trace`; the vector stores aligned headers and payloads.
+    pub fn format_trace_buffer(
+        &self,
+        trace: &[TraceHeader],
+        timestamp_format: TraceTimestampFormat,
+        output: &mut String,
+    ) {
+        let mut offset = 0;
+        let mut previous_node = None;
+        while offset < trace.len() {
+            let header = trace[offset];
+            let end = offset
+                .checked_add(1)
+                .and_then(|start| start.checked_add(header.n_data as usize))
+                .expect("trace header length fits its vector");
+            assert!(end <= trace.len(), "trace header stays within its vector");
+            let node = NodeId::new(header.node_index);
+            let name = self
+                .nodes
+                .node_name(node)
+                .expect("trace Node remains registered")
+                .expect("trace Node has a name");
+            if previous_node != Some(node) {
+                match timestamp_format {
+                    TraceTimestampFormat::Relative => {
+                        let seconds = header
+                            .time
+                            .checked_sub(self.main_loop_start_ticks)
+                            .expect("trace follows main-loop start")
+                            as f64
+                            * self.seconds_per_cpu_tick;
+                        let whole = seconds.trunc() as u64;
+                        let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
+                        writeln!(
+                            output,
+                            "\n{:02}:{:02}:{:02}:{:06}: {}",
+                            whole / 3_600,
+                            (whole / 60) % 60,
+                            whole % 60,
+                            microseconds,
+                            name
+                        )
+                        .expect("write to String");
+                    }
+                    TraceTimestampFormat::Unix | TraceTimestampFormat::Datetime => {
+                        let seconds = self.unix_reference_seconds
+                            + header
+                                .time
+                                .checked_sub(self.cpu_reference_ticks)
+                                .expect("trace follows clock reference")
+                                as f64
+                                * self.seconds_per_cpu_tick;
+                        if matches!(timestamp_format, TraceTimestampFormat::Unix) {
+                            writeln!(output, "\n{seconds:.6}: {name}").expect("write to String");
+                        } else {
+                            let seconds_whole = seconds.trunc() as libc::time_t;
+                            let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
+                            let mut calendar = std::mem::MaybeUninit::<libc::tm>::uninit();
+                            // SAFETY: localtime_r initializes calendar on success.
+                            let calendar = unsafe {
+                                assert!(
+                                    !libc::localtime_r(&seconds_whole, calendar.as_mut_ptr())
+                                        .is_null(),
+                                    "trace timestamp is representable"
+                                );
+                                calendar.assume_init()
+                            };
+                            writeln!(
+                                output,
+                                "\n{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}: {}",
+                                calendar.tm_year + 1900,
+                                calendar.tm_mon + 1,
+                                calendar.tm_mday,
+                                calendar.tm_hour,
+                                calendar.tm_min,
+                                calendar.tm_sec,
+                                microseconds,
+                                name
+                            )
+                            .expect("write to String");
+                        }
+                    }
+                }
+            }
+            previous_node = Some(node);
+
+            let payload = trace[offset + 1..end].as_bytes();
+            if let Some(formatter) = self
+                .nodes
+                .node_trace_formatter(node)
+                .expect("trace Node remains registered")
+            {
+                writeln!(output, "  {}", formatter(payload)).expect("write to String");
+            } else {
+                output.push_str("  ");
+                for byte in payload {
+                    write!(output, "{byte:02x}").expect("write to String");
+                }
+                output.push('\n');
+            }
+            offset = end;
+        }
+    }
 }
 ```
 
@@ -1364,7 +1479,7 @@ lookup 后把真实 listener connection index 及来源写入 Buffer opaque；
 | `NodeRuntime::node_index`、Node 的 `trace_supported` | 现有 NodeRuntime 没有自身身份，formatter 存在性也不等于源追踪能力 | NodeMain 注册时一次赋值，所有注册路径携带；不添加第二种 Node 身份。 |
 | WorkerThread 稳定保存 main、短借用循环与 barrier 内只借用 trace | 现有线程闭包 move `Box<DataPlaneMain>`，主线程无法实现 VPP `foreach_vlib_main` | 不增加 trace worker 表，不公开裸指针；仅受控内部 `UnsafeCell`，有明确借用交接。 |
 | `hammer-infra::time` CPU counter 频率校准与具体 CLI/runtime 错误变体 | 现有 `cpu_time_now` 返回 ticks，不能正确展示秒；现有错误不能区分不支持的 Node 与句法错误 | 频率能力通用且仅在初始化/展示用；错误限于可恢复 CLI/启动边界，不进入 packet 热路径。 |
-| `#[cli_command]` 的同步 `fn(&mut DataPlaneMain, Args)` 形式 | 现有 async-only 宏在 barrier 释放后才 poll handler，不能安全访问每个 main 的 trace pool；现有 `R: Display` 不能表达 VPP add/clear/set 的无输出成功 | 仍生成现有 `CliCommandRegistration` 和 `CliCommandFn`；有输出的 `R: Display`，无输出的 `R = ()` 生成零字节文本；解析、执行和格式化在 `dispatch` 的 barrier 内，ready task 只持有 String；ADR-0049 的 async Args-only 形式不变。 |
+| `#[cli_command]` 的同步 `fn(&mut DataPlaneMain, Args)` 形式 | 现有 async-only 宏在 barrier 释放后才 poll handler，不能安全访问每个 main 的 trace pool；现有 `R: Display` 不能表达 VPP add/clear/set 的无输出成功 | 仍生成现有 `CliCommandRegistration` 和 `CliCommandFn`；有输出的 `R: Display`，无输出的 `R = ()` 生成零字节文本；解析、执行在 `dispatch` 的 barrier 内；拥有型结果在 Future 中 Display；show trace 在 handler 内借记录格式化成 String；ADR-0049 的 async Args-only 形式不变。 |
 
 以上是 ADR 的设计提案，不是暗中扩大已批准的生产 API；实施前按仓库
 规则逐项确认。CLI 命令只经现有宏注册到 `CliCommandRegistration`。
@@ -1377,7 +1492,7 @@ lookup 后把真实 listener connection index 及来源写入 Buffer opaque；
 | 创建/额度 | 配置有 quota，但 `try_mark_trace` 没有生产 caller | 只有源 Node 按 V2/V3 取 count、标记成功才扣；中间/终端 Node 不调用 `trace_buffer`，V9。 |
 | 记录/释放 | bincode + Buffer free finalize | 源和中间/终端 Node 各自借用 `&mut T` 直接追加本 Node 记录；仅 clear 释放，V3/V4/V7/V9。 |
 | 传播 | 无跨 Worker trace 记录 | 保留 Next Frame bit，目标线程重建 trace 并标源 handle；V5/V6。 |
-| CLI | async handler 会在 barrier 之后执行 | 仍用 ADR-0049 的命令宏/注册目录；同步 main-aware 形式由宏私有适配，`dispatch` 在 barrier 内完成 Args 解析、trace 操作和 Display 格式化；ready task 只持有 String；V7/V8/H3。 |
+| CLI | async handler 会在 barrier 之后执行 | 仍用 ADR-0049 的命令宏/注册目录；同步 main-aware 形式由宏私有适配，`dispatch` 在 barrier 内完成 Args 解析和 trace 操作；show trace 在 handler 内借记录格式化成 String，宏在 Future 中 Display；V7/V8/H3。 |
 
 | 测试（实施后执行） | 必须观察到的行为 |
 | --- | --- |

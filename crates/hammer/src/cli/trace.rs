@@ -5,12 +5,9 @@ use std::fmt::Write;
 use std::str::FromStr;
 
 use hammer_core::data_plane::NodeId;
-use zerocopy::IntoBytes;
-
-use crate::cli::CliError;
-use crate::{DataPlaneMain, ThreadMain};
-
-use super::{TraceHeader, TraceTimestampFormat};
+use hammer_runtime::cli::CliError;
+use hammer_runtime::trace::{TraceHeader, TraceTimestampFormat};
+use hammer_runtime::{DataPlaneMain, ThreadMain};
 
 struct TraceAddArgs {
     node: String,
@@ -156,7 +153,7 @@ fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs) -> Result<(), CliErro
             name: args.node.clone(),
         })?;
     if !main
-        .nodes
+        .nodes()
         .node_trace_supported(node)
         .expect("named Node is registered")
     {
@@ -170,7 +167,7 @@ fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs) -> Result<(), CliErro
         unsafe { threads.worker_main_at_barrier(worker) as &DataPlaneMain }
     })) {
         let limit = owner
-            .trace_main
+            .trace_main()
             .nodes
             .get(node.slot() as usize)
             .map_or(0, |trace_node| trace_node.limit);
@@ -179,124 +176,22 @@ fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs) -> Result<(), CliErro
         }
     }
 
-    main.trace_main.add_count(node, args.count, args.verbose);
+    main.trace_main_mut()
+        .add_count(node, args.count, args.verbose);
     for worker in threads.data_workers() {
         // SAFETY: the same barrier remains held through the complete update.
         unsafe { threads.worker_main_at_barrier(worker) }
-            .trace_main
+            .trace_main_mut()
             .add_count(node, args.count, args.verbose);
     }
     Ok(())
-}
-
-/// VPP `format_vlib_trace`; the vector stores aligned headers and payloads.
-fn format_trace_buffer(
-    owner: &DataPlaneMain,
-    trace: &[TraceHeader],
-    timestamp_format: TraceTimestampFormat,
-    output: &mut String,
-) {
-    let mut offset = 0;
-    let mut previous_node = None;
-    while offset < trace.len() {
-        let header = trace[offset];
-        let end = offset
-            .checked_add(1)
-            .and_then(|start| start.checked_add(header.n_data as usize))
-            .expect("trace header length fits its vector");
-        assert!(end <= trace.len(), "trace header stays within its vector");
-        let node = NodeId::new(header.node_index);
-        let name = owner
-            .nodes
-            .node_name(node)
-            .expect("trace Node remains registered")
-            .expect("trace Node has a name");
-        if previous_node != Some(node) {
-            match timestamp_format {
-                TraceTimestampFormat::Relative => {
-                    let seconds = header
-                        .time
-                        .checked_sub(owner.main_loop_start_ticks)
-                        .expect("trace follows main-loop start")
-                        as f64
-                        * owner.seconds_per_cpu_tick;
-                    let whole = seconds.trunc() as u64;
-                    let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
-                    writeln!(
-                        output,
-                        "\n{:02}:{:02}:{:02}:{:06}: {}",
-                        whole / 3_600,
-                        (whole / 60) % 60,
-                        whole % 60,
-                        microseconds,
-                        name
-                    )
-                    .expect("write to String");
-                }
-                TraceTimestampFormat::Unix | TraceTimestampFormat::Datetime => {
-                    let seconds = owner.unix_reference_seconds
-                        + header
-                            .time
-                            .checked_sub(owner.cpu_reference_ticks)
-                            .expect("trace follows clock reference")
-                            as f64
-                            * owner.seconds_per_cpu_tick;
-                    if matches!(timestamp_format, TraceTimestampFormat::Unix) {
-                        writeln!(output, "\n{seconds:.6}: {name}").expect("write to String");
-                    } else {
-                        let seconds_whole = seconds.trunc() as libc::time_t;
-                        let microseconds = (seconds.fract() * 1_000_000.0).trunc() as u32;
-                        let mut calendar = std::mem::MaybeUninit::<libc::tm>::uninit();
-                        // SAFETY: localtime_r initializes calendar on success.
-                        let calendar = unsafe {
-                            assert!(
-                                !libc::localtime_r(&seconds_whole, calendar.as_mut_ptr()).is_null(),
-                                "trace timestamp is representable"
-                            );
-                            calendar.assume_init()
-                        };
-                        writeln!(
-                            output,
-                            "\n{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}: {}",
-                            calendar.tm_year + 1900,
-                            calendar.tm_mon + 1,
-                            calendar.tm_mday,
-                            calendar.tm_hour,
-                            calendar.tm_min,
-                            calendar.tm_sec,
-                            microseconds,
-                            name
-                        )
-                        .expect("write to String");
-                    }
-                }
-            }
-        }
-        previous_node = Some(node);
-
-        let payload = trace[offset + 1..end].as_bytes();
-        if let Some(formatter) = owner
-            .nodes
-            .node_trace_formatter(node)
-            .expect("trace Node remains registered")
-        {
-            writeln!(output, "  {}", formatter(payload)).expect("write to String");
-        } else {
-            output.push_str("  ");
-            for byte in payload {
-                write!(output, "{byte:02x}").expect("write to String");
-            }
-            output.push('\n');
-        }
-        offset = end;
-    }
 }
 
 /// VPP `cli_show_trace_buffer`: per-main sorting and a per-main display cap.
 #[hammer_component_macros::cli_command(path = "show trace", args = ShowTraceArgs, mp_safe = false)]
 fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, CliError> {
     let mut output = String::new();
-    let timestamp_format = main.trace_main.timestamp_format;
+    let timestamp_format = main.trace_main().timestamp_format;
     let threads = ThreadMain::global();
     let mains = std::iter::once((0, "main", &*main)).chain(threads.data_workers().map(|worker| {
         // SAFETY: the non-MP-safe CLI holds WorkerBarrier until formatting ends.
@@ -313,7 +208,7 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, C
 
         // Only record slices are sorted; payload bytes stay in the owner pool.
         let mut traces: Vec<&[TraceHeader]> = owner
-            .trace_main
+            .trace_main()
             .trace_buffer_pool
             .iter()
             .filter_map(|(_, record)| (!record.is_empty()).then_some(record.as_slice()))
@@ -325,7 +220,7 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, C
         traces.sort_unstable_by_key(|record| record[0].time);
         for (index, record) in traces.iter().take(args.max as usize).enumerate() {
             writeln!(output, "Packet {}", index + 1).expect("write to String");
-            format_trace_buffer(owner, record, timestamp_format, &mut output);
+            owner.format_trace_buffer(record, timestamp_format, &mut output);
             output.push_str("\n\n");
         }
         if traces.len() > args.max as usize {
@@ -344,17 +239,17 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, C
 #[hammer_component_macros::cli_command(path = "clear trace", args = ClearTraceArgs, mp_safe = false)]
 fn clear_trace(main: &mut DataPlaneMain, _: ClearTraceArgs) -> Result<(), CliError> {
     let threads = ThreadMain::global();
-    main.trace_main.trace_enable = false;
+    main.trace_main_mut().trace_enable = false;
     for worker in threads.data_workers() {
         // SAFETY: the non-MP-safe CLI holds WorkerBarrier for both passes.
         unsafe { threads.worker_main_at_barrier(worker) }
-            .trace_main
+            .trace_main_mut()
             .trace_enable = false;
     }
-    main.trace_main.clear();
+    main.trace_main_mut().clear();
     for worker in threads.data_workers() {
         unsafe { threads.worker_main_at_barrier(worker) }
-            .trace_main
+            .trace_main_mut()
             .clear();
     }
     Ok(())
@@ -369,7 +264,7 @@ fn set_trace_timestamp_format(
     main: &mut DataPlaneMain,
     args: TraceTimestampArgs,
 ) -> Result<(), CliError> {
-    main.trace_main.timestamp_format = args.format;
+    main.trace_main_mut().timestamp_format = args.format;
     Ok(())
 }
 
@@ -382,5 +277,5 @@ fn show_trace_timestamp_format(
     main: &mut DataPlaneMain,
     _: ShowTraceTimestampArgs,
 ) -> Result<TraceTimestampFormat, CliError> {
-    Ok(main.trace_main.timestamp_format)
+    Ok(main.trace_main().timestamp_format)
 }

@@ -52,11 +52,6 @@ crate::__declare_registration_image!(
     cli_commands = [
         cli::__CLI_COMMAND_SHOW_VERSION,
         cli::__CLI_COMMAND_WAIT,
-        trace::cli::__CLI_COMMAND_TRACE_ADD,
-        trace::cli::__CLI_COMMAND_SHOW_TRACE,
-        trace::cli::__CLI_COMMAND_CLEAR_TRACE,
-        trace::cli::__CLI_COMMAND_SET_TRACE_TIMESTAMP_FORMAT,
-        trace::cli::__CLI_COMMAND_SHOW_TRACE_TIMESTAMP_FORMAT,
     ];
 );
 
