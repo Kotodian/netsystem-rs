@@ -44,19 +44,19 @@ flowchart TB
 
     subgraph data["Data Workers · threads 1..N"]
         workers["Worker-owned DataPlaneMain<br/>NodeMain · Frames · timers"]
-        graph["Packet graph<br/>Device RX → IP → TCP → Session<br/>Session → TCP → IP → Device TX"]
+        packet_graph["Packet graph<br/>Device RX → IP → TCP → Session<br/>Session → TCP → IP → Device TX"]
         apps["Application plugins<br/>Session FIFOs · message queues"]
         files["FileMain<br/>Worker io_uring polling"]
-        workers --> graph
+        workers --> packet_graph
         workers <--> files
-        graph <--> apps
+        packet_graph <--> apps
     end
 
     daemon --> control
     daemon --> workers
     client -->|"Unix CLI / Binary API"| control
     control -. "Worker barrier · graph refork" .-> workers
-    tun["Linux TUN · vhost-net queues"] <--> graph
+    tun["Linux TUN · vhost-net queues"] <--> packet_graph
     control -->|"Stats collector"| stats["Shared-memory stats segment"]
     workers -->|"Owner counters"| stats
     stats -->|"Stats access"| client
