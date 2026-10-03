@@ -308,6 +308,26 @@ impl BufferMain {
         &self.pools[usize::from(pool_index)].name
     }
 
+    /// Fixed Pool properties used by VPP `format_vlib_buffer_pool`.
+    pub fn pool_properties(&self, pool_index: u8) -> (u32, usize, usize) {
+        let pool = &self.pools[usize::from(pool_index)];
+        (
+            PhysmemMain::global()
+                .get_map(pool.mapping_index)
+                .numa_node(),
+            std::mem::size_of::<Buffer>() + pool.data_size,
+            pool.data_size,
+        )
+    }
+
+    /// VPP `bp->threads[thread_index].n_cached`, sampled without borrowing
+    /// the worker-owned cache.
+    pub fn pool_cached_count(&self, pool_index: u8, thread_index: u32) -> u32 {
+        self.pools[usize::from(pool_index)].workers[thread_index as usize]
+            .cached_count
+            .load(Ordering::Relaxed)
+    }
+
     /// VPP: vlib/buffer_funcs.h:127-131, `vlib_buffer_get_default_data_size` selects the
     /// current NUMA node's default Buffer Pool before reading its data size.
     #[inline(always)]

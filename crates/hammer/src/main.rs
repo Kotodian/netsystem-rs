@@ -37,6 +37,7 @@ hammer_runtime::__declare_registration_image!(
         cli::errors::__CLI_COMMAND_ERRORS,
         cli::errors::__CLI_COMMAND_CLEAR_ERRORS,
         cli::memory::__CLI_COMMAND_MEMORY,
+        cli::buffer::__CLI_COMMAND_BUFFER,
     ];
 );
 
