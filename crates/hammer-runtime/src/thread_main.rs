@@ -62,12 +62,16 @@ pub struct ThreadMain {
     cpu_socket_bitmap: Bitmap,
     worker_threads: Vec<WorkerThread>,
     worker_mains: UnsafeCell<Vec<UnsafeCell<Box<crate::DataPlaneMain>>>>,
+    node_slots: UnsafeCell<Vec<UnsafeCell<Arc<Vec<crate::node::NodeRuntimeSlot>>>>>,
 }
 
 // SAFETY: worker_mains is installed once before launch and its Vec never
 // changes afterward. Each Data Worker exclusively borrows its own entry
 // between barrier checks; thread zero borrows entries only while all workers
 // have acknowledged the barrier and released those borrows.
+// node_slots shares ownership of the actual graph arrays. Its fixed per-thread
+// entries change only during startup or graph refork, before the existing
+// refork acknowledgement. Thread-zero collection cannot overlap either phase.
 unsafe impl Send for ThreadMain {}
 unsafe impl Sync for ThreadMain {}
 
@@ -104,6 +108,7 @@ impl ThreadMain {
             cpu_socket_bitmap,
             worker_threads: Vec::new(),
             worker_mains: UnsafeCell::new(Vec::new()),
+            node_slots: UnsafeCell::new(Vec::new()),
         })
     }
 
@@ -394,6 +399,52 @@ impl ThreadMain {
         *worker_mains = mains;
     }
 
+    pub(crate) fn initialize_node_slots(&self, nodes: Vec<Arc<Vec<crate::node::NodeRuntimeSlot>>>) {
+        crate::ensure_main_thread().expect("node arrays initialize on thread zero before launch");
+        assert_eq!(nodes.len(), self.worker_count as usize + 1);
+        // SAFETY: initialization precedes launch and Process scheduling.
+        let slots = unsafe { &mut *self.node_slots.get() };
+        assert!(slots.is_empty(), "per-thread node arrays initialize once");
+        *slots = nodes.into_iter().map(UnsafeCell::new).collect();
+    }
+
+    pub(crate) fn set_node_slots(
+        &self,
+        thread_index: u32,
+        nodes: Arc<Vec<crate::node::NodeRuntimeSlot>>,
+    ) {
+        if thread_index == 0 {
+            crate::ensure_main_thread().expect("thread zero owns its node array");
+        } else {
+            assert!(
+                self.thread_by_index(thread_index)
+                    .expect("node array belongs to a configured thread")
+                    .is_current(),
+                "only the owning thread replaces its node array"
+            );
+        }
+        // SAFETY: the fixed collection exists before launch. Thread zero
+        // replaces its own entry during synchronous graph publication. Each
+        // worker replaces only its entry during startup/refork, before its
+        // acknowledgement; collection runs on thread zero after that completes.
+        let slots = unsafe { &*self.node_slots.get() };
+        if slots.is_empty() {
+            return;
+        }
+        let slot = &slots[thread_index as usize];
+        unsafe { *slot.get() = nodes };
+    }
+
+    /// Shared ownership of one thread's existing Node Runtime array.
+    /// No DataPlaneMain or worker-local protocol state is borrowed.
+    pub(crate) fn node_slots(&self, thread_index: u32) -> Arc<Vec<crate::node::NodeRuntimeSlot>> {
+        crate::ensure_main_thread().expect("the stats collector executes on thread zero");
+        // SAFETY: thread zero cannot initiate a refork while this synchronous
+        // lookup runs; prior reforks completed before barrier release returned.
+        let slots = unsafe { &*self.node_slots.get() };
+        Arc::clone(unsafe { &*slots[thread_index as usize].get() })
+    }
+
     /// Mirror one queue directory entry while workers are stopped. Before
     /// launch the main's directory is copied by DataPlaneMain::new_worker.
     pub(crate) fn set_handoff_queue(&self, queue: Arc<HandoffQueueMain>) {
@@ -447,8 +498,10 @@ impl ThreadMain {
     /// # Safety
     /// Thread zero holds WorkerBarrier, this Worker has released its mutable
     /// borrow, and no other borrow of this main overlaps the returned one.
+    /// Any control-plane operation may use this worker-indexed access while
+    /// stopped; the returned borrow must end before barrier release.
     #[expect(clippy::mut_from_ref, reason = "the barrier excludes Worker borrows")]
-    pub(crate) unsafe fn worker_main_at_barrier(
+    pub unsafe fn worker_main_at_barrier(
         &self,
         worker: &WorkerThread,
     ) -> &mut crate::DataPlaneMain {
@@ -458,7 +511,7 @@ impl ThreadMain {
         let mains = unsafe { &*self.worker_mains.get() };
         let main = mains
             .get(index)
-            .expect("Data Worker mains install before barrier CLI");
+            .expect("Data Worker mains install before barrier access");
         unsafe { &mut **main.get() }
     }
 

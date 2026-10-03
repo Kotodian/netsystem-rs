@@ -9,7 +9,7 @@ use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::SpinLock;
 use hammer_runtime::handoff::buffer_enqueue_to_thread;
-use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
+use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity, NodeFlags};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, HandoffAllocQueuesArgs, Node, NodeProcessFn, NodeRuntime,
     TraceFormatter,
@@ -518,6 +518,9 @@ fn register_ip4_reassembly_handoff(runtime: &DataPlaneMain) -> RuntimeResult<Nod
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(Ip4ReassemblyHandoffNode::new(), &[])?;
+    runtime
+        .nodes()
+        .set_node_flags(node, NodeFlags::IS_HANDOFF)?;
     runtime.register_node_errors(node, &IpReassemblyHandoffError::DESCRIPTORS)?;
     let queue = runtime.handoff_alloc_queues(HandoffAllocQueuesArgs {
         node_index: target,
@@ -543,6 +546,9 @@ fn register_ip6_reassembly_handoff(runtime: &DataPlaneMain) -> RuntimeResult<Nod
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(Ip6ReassemblyHandoffNode::new(), &[])?;
+    runtime
+        .nodes()
+        .set_node_flags(node, NodeFlags::IS_HANDOFF)?;
     runtime.register_node_errors(node, &IpReassemblyHandoffError::DESCRIPTORS)?;
     let queue = runtime.handoff_alloc_queues(HandoffAllocQueuesArgs {
         node_index: target,

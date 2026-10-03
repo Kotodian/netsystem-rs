@@ -8,7 +8,7 @@
 
 use hammer_core::buffer::BufferMain;
 use hammer_stats::buffer_pools::{BufferPoolGauge, update_pool_gauge};
-use hammer_stats::{Collector, DirectoryEntry, DirectoryIndex, StatsMain};
+use hammer_stats::{Collector, DirectoryIndex, StatsMain, StatsSegment};
 
 use crate::error::RuntimeResult;
 
@@ -46,7 +46,10 @@ impl Collector for BufferPoolGaugeCollector {
         self.entry_index
     }
 
-    fn collect(&self, entry: &DirectoryEntry) {
+    fn collect(&self, segment: &StatsSegment) {
+        let entry = segment
+            .entry(self.entry_index())
+            .expect("Buffer Pool collector owns its declared entry");
         // VPP: `bp = buffer_get_by_index (vm->buffer_main, d->private_data)`
         // then `d->entry->value = …` (`buffer.c:838-872`). The pool set is fixed
         // when it is created, so a missing pool is a bug, not a state.

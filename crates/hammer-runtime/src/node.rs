@@ -2,7 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -26,6 +27,17 @@ pub use next::default_prefetch_indices;
 /// [`NodeErrorIndex`].
 pub trait NodeErrorCode {
     fn local_code(self) -> u16;
+}
+
+bitflags::bitflags! {
+    /// Node accounting flags corresponding to VPP `vlib_node_t::flags`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NodeFlags: u16 {
+        const IS_OUTPUT = 1 << 1;
+        const IS_DROP = 1 << 2;
+        const IS_PUNT = 1 << 3;
+        const IS_HANDOFF = 1 << 4;
+    }
 }
 
 /// Run packet logic for every u32 in `frame`, record one typed local next
@@ -465,10 +477,6 @@ impl NodeEntry {
 }
 
 pub struct NodeMain {
-    /// This thread's per-node counters: VPP's `vlib_node_runtime_t` counter
-    /// fields in that thread's `node_main.nodes`. The owner grows the row
-    /// under the Worker barrier when the graph acquires new nodes.
-    node_counters: Option<(&'static crate::node_stats::NodeCounterRows, u32)>,
     inner: RefCell<NodeRuntimeInner>,
     pending_frames: RefCell<Vec<PendingFrame>>,
     scheduled_nodes: RefCell<Vec<NodeId>>,
@@ -566,7 +574,7 @@ struct NodeErrorColumnRange {
 }
 
 pub(crate) struct NodeRuntimeInner {
-    nodes: Vec<NodeRuntimeSlot>,
+    nodes: Arc<Vec<NodeRuntimeSlot>>,
     node_states: Vec<NodeState>,
     interrupt_pending: Vec<bool>,
     input_main_loops_per_call: Vec<u32>,
@@ -584,6 +592,7 @@ pub(crate) struct NodeRuntimeInner {
     node_names: Vec<Option<&'static str>>,
     node_trace_formatters: Vec<Option<TraceFormatter>>,
     next_nodes: Vec<Vec<Option<NodeId>>>,
+    n_vectors_by_next_node: Vec<Vec<u64>>,
     pending_next_names: Vec<Vec<Option<&'static str>>>,
     sibling_owners: Vec<Option<NodeId>>,
     siblings: Vec<Vec<NodeId>>,
@@ -592,8 +601,22 @@ pub(crate) struct NodeRuntimeInner {
 impl Clone for NodeRuntimeInner {
     fn clone(&self) -> Self {
         let node_count = self.nodes.len();
+        let mut nodes: Vec<_> = self.nodes.iter().cloned().collect();
+        for node in &mut nodes {
+            node.calls_since_last_overflow = AtomicU32::new(0);
+            node.vectors_since_last_overflow = AtomicU32::new(0);
+            node.clocks_since_last_overflow = AtomicU32::new(0);
+            node.max_clock = AtomicU32::new(0);
+            node.max_clock_n = AtomicU32::new(0);
+            node.total_calls = AtomicU64::new(0);
+            node.total_vectors = AtomicU64::new(0);
+            node.total_clocks = AtomicU64::new(0);
+            node.last_clear_calls = AtomicU64::new(0);
+            node.last_clear_vectors = AtomicU64::new(0);
+            node.last_clear_clocks = AtomicU64::new(0);
+        }
         Self {
-            nodes: self.nodes.clone(),
+            nodes: Arc::new(nodes),
             node_states: self.node_states.clone(),
             interrupt_pending: vec![false; node_count],
             input_main_loops_per_call: self.input_main_loops_per_call.clone(),
@@ -605,6 +628,11 @@ impl Clone for NodeRuntimeInner {
             node_names: self.node_names.clone(),
             node_trace_formatters: self.node_trace_formatters.clone(),
             next_nodes: self.next_nodes.clone(),
+            n_vectors_by_next_node: self
+                .next_nodes
+                .iter()
+                .map(|nexts| vec![0; nexts.len()])
+                .collect(),
             pending_next_names: vec![Vec::new(); node_count],
             sibling_owners: self.sibling_owners.clone(),
             siblings: self.siblings.clone(),
@@ -612,21 +640,64 @@ impl Clone for NodeRuntimeInner {
     }
 }
 
-struct NodeRuntimeSlot {
+#[repr(C, align(64))]
+pub(crate) struct NodeRuntimeSlot {
     kind: NodeKind,
+    flags: NodeFlags,
     process: NodeFunction,
     declared_process: NodeFunction,
     frame_args_size: (u16, u16, u16),
-    runtime_data: Option<NodeRuntime>,
+    runtime_data: Cell<Option<NodeRuntime>>,
     trace_supported: bool,
+    calls_since_last_overflow: AtomicU32,
+    vectors_since_last_overflow: AtomicU32,
+    clocks_since_last_overflow: AtomicU32,
+    max_clock: AtomicU32,
+    max_clock_n: AtomicU32,
+    total_calls: AtomicU64,
+    total_vectors: AtomicU64,
+    total_clocks: AtomicU64,
+    last_clear_calls: AtomicU64,
+    last_clear_vectors: AtomicU64,
+    last_clear_clocks: AtomicU64,
 }
 
-impl Copy for NodeRuntimeSlot {}
+// SAFETY: only the NodeMain owner accesses runtime_data. Collectors receive
+// shared ownership of these same slots and read only atomic counters and
+// immutable metadata. This crate-private type is cloned/debugged only by its
+// owner or during graph publication, which excludes runtime_data writes.
+// Metadata changes replace the array; collectors never clone its elements.
+unsafe impl Sync for NodeRuntimeSlot {}
 
 impl Clone for NodeRuntimeSlot {
     #[inline]
     fn clone(&self) -> Self {
-        *self
+        Self {
+            kind: self.kind,
+            flags: self.flags,
+            process: self.process,
+            declared_process: self.declared_process,
+            frame_args_size: self.frame_args_size,
+            runtime_data: Cell::new(self.runtime_data.get()),
+            trace_supported: self.trace_supported,
+            calls_since_last_overflow: AtomicU32::new(
+                self.calls_since_last_overflow.load(Ordering::Relaxed),
+            ),
+            vectors_since_last_overflow: AtomicU32::new(
+                self.vectors_since_last_overflow.load(Ordering::Relaxed),
+            ),
+            clocks_since_last_overflow: AtomicU32::new(
+                self.clocks_since_last_overflow.load(Ordering::Relaxed),
+            ),
+            max_clock: AtomicU32::new(self.max_clock.load(Ordering::Relaxed)),
+            max_clock_n: AtomicU32::new(self.max_clock_n.load(Ordering::Relaxed)),
+            total_calls: AtomicU64::new(self.total_calls.load(Ordering::Relaxed)),
+            total_vectors: AtomicU64::new(self.total_vectors.load(Ordering::Relaxed)),
+            total_clocks: AtomicU64::new(self.total_clocks.load(Ordering::Relaxed)),
+            last_clear_calls: AtomicU64::new(self.last_clear_calls.load(Ordering::Relaxed)),
+            last_clear_vectors: AtomicU64::new(self.last_clear_vectors.load(Ordering::Relaxed)),
+            last_clear_clocks: AtomicU64::new(self.last_clear_clocks.load(Ordering::Relaxed)),
+        }
     }
 }
 
@@ -642,14 +713,93 @@ impl std::fmt::Debug for NodeRuntimeSlot {
 
 impl NodeRuntimeSlot {
     #[inline]
-    fn dispatch(&mut self, runtime: &mut DataPlaneMain, frame: &mut Frame) -> usize {
-        (self.process)(
-            runtime,
-            self.runtime_data
-                .as_mut()
-                .expect("Node owns its executing runtime"),
-            frame,
+    fn sync_stats(&self, calls: u64, vectors: u64, clocks: u64) {
+        self.total_calls.store(
+            self.total_calls
+                .load(Ordering::Relaxed)
+                .wrapping_add(calls.wrapping_add(u64::from(
+                    self.calls_since_last_overflow.load(Ordering::Relaxed),
+                ))),
+            Ordering::Relaxed,
+        );
+        self.total_vectors.store(
+            self.total_vectors
+                .load(Ordering::Relaxed)
+                .wrapping_add(vectors.wrapping_add(u64::from(
+                    self.vectors_since_last_overflow.load(Ordering::Relaxed),
+                ))),
+            Ordering::Relaxed,
+        );
+        self.total_clocks.store(
+            self.total_clocks
+                .load(Ordering::Relaxed)
+                .wrapping_add(clocks.wrapping_add(u64::from(
+                    self.clocks_since_last_overflow.load(Ordering::Relaxed),
+                ))),
+            Ordering::Relaxed,
+        );
+        self.calls_since_last_overflow.store(0, Ordering::Relaxed);
+        self.vectors_since_last_overflow.store(0, Ordering::Relaxed);
+        self.clocks_since_last_overflow.store(0, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    fn update_dispatch(&self, vectors: u64, clocks: u64) {
+        let old_calls = self.calls_since_last_overflow.load(Ordering::Relaxed);
+        let old_vectors = self.vectors_since_last_overflow.load(Ordering::Relaxed);
+        let old_clocks = self.clocks_since_last_overflow.load(Ordering::Relaxed);
+        let calls = old_calls.wrapping_add(1);
+        let next_vectors = old_vectors.wrapping_add(vectors as u32);
+        let next_clocks = old_clocks.wrapping_add(clocks as u32);
+        self.calls_since_last_overflow
+            .store(calls, Ordering::Relaxed);
+        self.vectors_since_last_overflow
+            .store(next_vectors, Ordering::Relaxed);
+        self.clocks_since_last_overflow
+            .store(next_clocks, Ordering::Relaxed);
+        if self.max_clock.load(Ordering::Relaxed) <= clocks as u32 {
+            self.max_clock.store(clocks as u32, Ordering::Relaxed);
+            self.max_clock_n.store(vectors as u32, Ordering::Relaxed);
+        }
+        if crate::unlikely(
+            calls < old_calls || next_vectors < old_vectors || next_clocks < old_clocks,
+        ) {
+            self.calls_since_last_overflow
+                .store(old_calls, Ordering::Relaxed);
+            self.vectors_since_last_overflow
+                .store(old_vectors, Ordering::Relaxed);
+            self.clocks_since_last_overflow
+                .store(old_clocks, Ordering::Relaxed);
+            self.sync_stats(1, vectors, clocks);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn counter_values(&self) -> (u64, u64, u64) {
+        (
+            self.total_calls
+                .load(Ordering::Relaxed)
+                .wrapping_add(u64::from(
+                    self.calls_since_last_overflow.load(Ordering::Relaxed),
+                ))
+                .wrapping_sub(self.last_clear_calls.load(Ordering::Relaxed)),
+            self.total_vectors
+                .load(Ordering::Relaxed)
+                .wrapping_add(u64::from(
+                    self.vectors_since_last_overflow.load(Ordering::Relaxed),
+                ))
+                .wrapping_sub(self.last_clear_vectors.load(Ordering::Relaxed)),
+            self.total_clocks
+                .load(Ordering::Relaxed)
+                .wrapping_add(u64::from(
+                    self.clocks_since_last_overflow.load(Ordering::Relaxed),
+                ))
+                .wrapping_sub(self.last_clear_clocks.load(Ordering::Relaxed)),
         )
+    }
+
+    pub(crate) fn is_process(&self) -> bool {
+        self.kind == NodeKind::Process
     }
 }
 
@@ -660,6 +810,9 @@ struct PendingFrame {
 }
 
 impl NodeRuntimeInner {
+    pub(crate) fn node_slots(&self) -> Arc<Vec<NodeRuntimeSlot>> {
+        Arc::clone(&self.nodes)
+    }
     pub(crate) fn node_names(&self) -> &[Option<&'static str>] {
         &self.node_names
     }
@@ -689,7 +842,21 @@ impl NodeRuntimeInner {
             // the runtime published by the topology owner. An unchanged node
             // retains state owned by its established worker-local instance.
             if !recycled {
-                self.nodes[slot].runtime_data = current.nodes[slot].runtime_data;
+                let target = &mut Arc::make_mut(&mut self.nodes)[slot];
+                let source = &current.nodes[slot];
+                let process = target.process;
+                let declared_process = target.declared_process;
+                let flags = target.flags;
+                let frame_args_size = target.frame_args_size;
+                let trace_supported = target.trace_supported;
+                *target = source.clone();
+                target.process = process;
+                target.declared_process = declared_process;
+                target.flags = flags;
+                target.frame_args_size = frame_args_size;
+                target.trace_supported = trace_supported;
+                self.n_vectors_by_next_node[slot] = current.n_vectors_by_next_node[slot].clone();
+                self.n_vectors_by_next_node[slot].resize(self.next_nodes[slot].len(), 0);
             }
             self.node_states[slot] = current.node_states[slot];
             self.input_main_loops_per_call[slot] = current.input_main_loops_per_call[slot];
@@ -779,10 +946,10 @@ impl NodeRuntimeInner {
 
     fn push_node_slot(&mut self, mut slot: NodeRuntimeSlot) -> NodeId {
         let id = NodeId::new(u32::try_from(self.nodes.len()).expect("node index fits u32"));
-        if let Some(runtime_data) = slot.runtime_data.as_mut() {
+        if let Some(runtime_data) = slot.runtime_data.get_mut() {
             runtime_data.node_index = id;
         }
-        self.nodes.push(slot);
+        Arc::make_mut(&mut self.nodes).push(slot);
         self.node_states.push(NodeState::Polling);
         self.interrupt_pending.push(false);
         self.input_main_loops_per_call.push(0);
@@ -791,6 +958,7 @@ impl NodeRuntimeInner {
         self.node_names.push(None);
         self.node_trace_formatters.push(None);
         self.next_nodes.push(Vec::new());
+        self.n_vectors_by_next_node.push(Vec::new());
         self.pending_next_names.push(Vec::new());
         self.sibling_owners.push(None);
         self.siblings.push(Vec::new());
@@ -806,11 +974,23 @@ impl NodeRuntimeInner {
     ) -> NodeId {
         self.push_node_slot(NodeRuntimeSlot {
             kind,
+            flags: NodeFlags::empty(),
             process,
             declared_process: process,
             frame_args_size: (0, 4, 0),
-            runtime_data: Some(runtime_data),
+            runtime_data: Cell::new(Some(runtime_data)),
             trace_supported,
+            calls_since_last_overflow: AtomicU32::new(0),
+            vectors_since_last_overflow: AtomicU32::new(0),
+            clocks_since_last_overflow: AtomicU32::new(0),
+            max_clock: AtomicU32::new(0),
+            max_clock_n: AtomicU32::new(0),
+            total_calls: AtomicU64::new(0),
+            total_vectors: AtomicU64::new(0),
+            total_clocks: AtomicU64::new(0),
+            last_clear_calls: AtomicU64::new(0),
+            last_clear_vectors: AtomicU64::new(0),
+            last_clear_clocks: AtomicU64::new(0),
         })
     }
 
@@ -906,6 +1086,7 @@ impl NodeRuntimeInner {
                         .take(next_count)
                         .collect();
                 }
+                self.n_vectors_by_next_node[id.slot() as usize] = vec![0; next_count];
                 self.declared_nodes.insert(name, id);
                 if let Some(handle) = handle {
                     self.handles.insert(handle, id);
@@ -928,6 +1109,8 @@ impl NodeRuntimeInner {
                 self.node_names[id.slot() as usize] = Some(name);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 self.next_nodes[id.slot() as usize] = owner_nexts;
+                self.n_vectors_by_next_node[id.slot() as usize] =
+                    vec![0; self.next_nodes[id.slot() as usize].len()];
                 self.sibling_owners[id.slot() as usize] = Some(owner);
                 let mut group = self.siblings[owner.slot() as usize].clone();
                 group.push(owner);
@@ -1169,6 +1352,11 @@ impl NodeRuntimeInner {
             return Err(error);
         }
         let changed = self.next_nodes != original_next_nodes;
+        if changed {
+            for (nexts, totals) in self.next_nodes.iter().zip(&mut self.n_vectors_by_next_node) {
+                totals.resize(nexts.len(), 0);
+            }
+        }
         Ok((slots, changed))
     }
 
@@ -1191,9 +1379,8 @@ impl NodeRuntimeInner {
 impl Default for NodeMain {
     fn default() -> Self {
         Self {
-            node_counters: None,
             inner: RefCell::new(NodeRuntimeInner {
-                nodes: Vec::new(),
+                nodes: Arc::new(Vec::new()),
                 node_states: Vec::new(),
                 interrupt_pending: Vec::new(),
                 input_main_loops_per_call: Vec::new(),
@@ -1205,6 +1392,7 @@ impl Default for NodeMain {
                 node_names: Vec::new(),
                 node_trace_formatters: Vec::new(),
                 next_nodes: Vec::new(),
+                n_vectors_by_next_node: Vec::new(),
                 pending_next_names: Vec::new(),
                 sibling_owners: Vec::new(),
                 siblings: Vec::new(),
@@ -1251,7 +1439,6 @@ impl From<NodeRuntimeInner> for NodeMain {
         let (next_frames, next_frame_indices) = Self::next_frames_for_graph(&inner);
         let enqueue_owners = vec![None; inner.nodes.len()];
         Self {
-            node_counters: None,
             inner: RefCell::new(inner),
             pending_frames: RefCell::new(Vec::with_capacity(32)),
             scheduled_nodes: RefCell::new(Vec::new()),
@@ -1400,7 +1587,7 @@ impl NodeMain {
         self.enqueue_owners.clear();
         self.readiness.clear_pending();
         *self.inner.borrow_mut() = NodeRuntimeInner {
-            nodes: Vec::new(),
+            nodes: Arc::new(Vec::new()),
             node_states: Vec::new(),
             interrupt_pending: Vec::new(),
             input_main_loops_per_call: Vec::new(),
@@ -1412,6 +1599,7 @@ impl NodeMain {
             node_names: Vec::new(),
             node_trace_formatters: Vec::new(),
             next_nodes: Vec::new(),
+            n_vectors_by_next_node: Vec::new(),
             pending_next_names: Vec::new(),
             sibling_owners: Vec::new(),
             siblings: Vec::new(),
@@ -1420,6 +1608,10 @@ impl NodeMain {
     }
 
     pub(crate) fn refork(&mut self, mut graph: NodeRuntimeInner) {
+        for slot in 0..self.inner.get_mut().nodes.len() {
+            self.sync_node_stats(NodeId::new(slot as u32))
+                .expect("refork synchronizes an existing Node");
+        }
         self.refork_next_frames(&graph);
         graph.inherit_worker_state(self.inner.get_mut());
         *self.inner.get_mut() = graph;
@@ -1438,7 +1630,7 @@ impl NodeMain {
         };
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
-        let slot = &mut inner.nodes[node.slot() as usize];
+        let slot = &mut Arc::make_mut(&mut inner.nodes)[node.slot() as usize];
         slot.declared_process = process;
         slot.process = registration.map_or(process, |candidate| candidate.function);
         if let Some(candidate) = registration {
@@ -1462,7 +1654,7 @@ impl NodeMain {
                     .map(Option::flatten)
             })
             .collect::<RuntimeResult<Vec<_>>>()?;
-        for (slot, registration) in inner.nodes.iter_mut().zip(selected) {
+        for (slot, registration) in Arc::make_mut(&mut inner.nodes).iter_mut().zip(selected) {
             slot.process =
                 registration.map_or(slot.declared_process, |candidate| candidate.function);
             if let Some(candidate) = registration {
@@ -1658,18 +1850,38 @@ impl NodeMain {
         inner.declared_nodes.insert(name, node);
         inner.node_names[slot] = Some(name);
         inner.node_trace_formatters[slot] = descriptor.trace_formatter;
-        inner.nodes[slot].process = descriptor.process;
+        let runtime = &mut Arc::make_mut(&mut inner.nodes)[slot];
+        runtime.process = descriptor.process;
+        runtime.declared_process = descriptor.process;
         let mut runtime_data = descriptor.runtime_data;
         runtime_data.node_index = node;
-        inner.nodes[slot].runtime_data = Some(runtime_data);
-        inner.nodes[slot].trace_supported = descriptor.trace_supported;
-        inner.nodes[slot].frame_args_size = descriptor.frame_args_size;
+        runtime.runtime_data.set(Some(runtime_data));
+        runtime.trace_supported = descriptor.trace_supported;
+        runtime.flags = NodeFlags::empty();
+        runtime.frame_args_size = descriptor.frame_args_size;
+        runtime
+            .calls_since_last_overflow
+            .store(0, Ordering::Relaxed);
+        runtime
+            .vectors_since_last_overflow
+            .store(0, Ordering::Relaxed);
+        runtime
+            .clocks_since_last_overflow
+            .store(0, Ordering::Relaxed);
+        runtime.total_calls.store(0, Ordering::Relaxed);
+        runtime.total_vectors.store(0, Ordering::Relaxed);
+        runtime.total_clocks.store(0, Ordering::Relaxed);
+        runtime.last_clear_calls.store(0, Ordering::Relaxed);
+        runtime.last_clear_vectors.store(0, Ordering::Relaxed);
+        runtime.last_clear_clocks.store(0, Ordering::Relaxed);
+        runtime.max_clock.store(0, Ordering::Relaxed);
+        runtime.max_clock_n.store(0, Ordering::Relaxed);
         drop(inner);
 
         if let Some(barrier) =
             crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0)
         {
-            barrier.request_node_refork(self.inner.borrow().clone());
+            barrier.request_node_refork(&self.inner.borrow());
         }
         Ok(())
     }
@@ -1692,10 +1904,10 @@ impl NodeMain {
             descriptor.trace_formatter,
             descriptor.trace_supported,
         )?;
-        self.inner.borrow_mut().nodes[node.slot() as usize].frame_args_size =
+        Arc::make_mut(&mut self.inner.borrow_mut().nodes)[node.slot() as usize].frame_args_size =
             descriptor.frame_args_size;
         if let Some(barrier) = barrier {
-            barrier.request_node_refork(self.inner.borrow().clone());
+            barrier.request_node_refork(&self.inner.borrow());
         }
         Ok(node)
     }
@@ -1722,7 +1934,8 @@ impl NodeMain {
             Some(handle),
             None,
         )?;
-        inner.nodes[id.slot() as usize].frame_args_size = descriptor.frame_args_size;
+        Arc::make_mut(&mut inner.nodes)[id.slot() as usize].frame_args_size =
+            descriptor.frame_args_size;
         Ok(id)
     }
 
@@ -1842,34 +2055,111 @@ impl NodeMain {
             .ok_or(RuntimeError::NodeHandleNotRegistered { handle })
     }
 
-    /// Installs this thread's counter row.
-    ///
-    /// Called once before the Worker is launched. Refork changes graph facts,
-    /// while the same thread-indexed row retains its existing counter values.
-    pub(crate) fn install_node_counters(
-        &mut self,
-        rows: &'static crate::node_stats::NodeCounterRows,
-        thread_index: u32,
-    ) {
-        assert!(
-            rows.row(thread_index).is_some(),
-            "thread owns a node counter row"
-        );
-        self.node_counters = Some((rows, thread_index));
+    /// Synchronizes this thread's Node Runtime and next-frame pending counts.
+    pub fn sync_node_stats(&mut self, node: NodeId) -> RuntimeResult<()> {
+        let slot = node.slot() as usize;
+        let graph = self.inner.get_mut();
+        graph.validate_node(node)?;
+        graph.nodes[slot].sync_stats(0, 0, 0);
+        let totals = &mut graph.n_vectors_by_next_node[slot];
+        totals.resize(graph.next_nodes[slot].len(), 0);
+        if let Some(indices) = self.next_frame_indices.get(slot) {
+            for (arc, &next_frame_index) in indices.iter().enumerate() {
+                if next_frame_index == usize::MAX {
+                    continue;
+                }
+                let pending = &mut self.next_frames[next_frame_index].vectors_since_last_overflow;
+                totals[arc] = totals[arc].wrapping_add(u64::from(*pending));
+                *pending = 0;
+            }
+        }
+        Ok(())
     }
 
-    /// The counters of `node` in this thread's row, or `None` while the graph
-    /// has no published row.
-    ///
-    /// A row is published when the graph is frozen against the node capacity
-    /// (`start_workers`, before any Worker launch), and every runtime that
-    /// dispatches inside the daemon lifecycle passed that point. A runtime built
-    /// directly (unit tests, benches) never publishes a row and therefore
-    /// accumulates no node counters; that is an ordinary absence, not a bug.
-    #[inline(always)]
-    pub(crate) fn node_counters(&self, node: NodeId) -> Option<&crate::node_stats::NodeCounters> {
-        let (rows, thread_index) = self.node_counters?;
-        rows.row(thread_index)?.get(node.slot() as usize)
+    /// VPP `clear_node_runtime`: synchronize every Node before moving its
+    /// clear baseline, including pending next-frame vectors.
+    pub(crate) fn clear_runtime_stats(&mut self) {
+        let node_count = self.inner.get_mut().nodes.len();
+        for slot in 0..node_count {
+            let node = NodeId::new(slot as u32);
+            self.sync_node_stats(node)
+                .expect("clear runtime visits registered Node slots");
+            let graph = self.inner.get_mut();
+            let runtime = &graph.nodes[slot];
+            runtime.last_clear_calls.store(
+                runtime.total_calls.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            runtime.last_clear_vectors.store(
+                runtime.total_vectors.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            runtime.last_clear_clocks.store(
+                runtime.total_clocks.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            runtime.max_clock.store(0, Ordering::Relaxed);
+
+            if runtime.kind == NodeKind::Process && self.topology_owner {
+                let stats = hammer_stats::StatsMain::global()
+                    .expect("Process runtime has initialized stats");
+                if stats.segment.node_counters_enabled() {
+                    let counters = crate::node_stats::NodeStats::global();
+                    let column = node.slot();
+                    stats
+                        .segment
+                        .set_simple_counter(counters.calls.index, 0, column, 0);
+                    stats
+                        .segment
+                        .set_simple_counter(counters.vectors.index, 0, column, 0);
+                    stats
+                        .segment
+                        .set_simple_counter(counters.clocks.index, 0, column, 0);
+                    stats
+                        .segment
+                        .set_simple_counter(counters.suspends.index, 0, column, 0);
+                }
+            }
+        }
+    }
+
+    pub fn node_stats(&self, node: NodeId) -> RuntimeResult<(u64, u64, u64, u64, u32, u32)> {
+        let graph = self.inner.borrow();
+        graph.validate_node(node)?;
+        let slot = &graph.nodes[node.slot() as usize];
+        if slot.kind == NodeKind::Process {
+            let stats =
+                hammer_stats::StatsMain::global().expect("Process runtime has initialized stats");
+            assert!(
+                stats.segment.node_counters_enabled(),
+                "Process counters are read only when per-node counters are enabled"
+            );
+            let counters = crate::node_stats::NodeStats::global();
+            let column = node.slot();
+            return Ok((
+                stats
+                    .segment
+                    .simple_counter(counters.calls.index, 0, column),
+                0,
+                stats
+                    .segment
+                    .simple_counter(counters.clocks.index, 0, column),
+                stats
+                    .segment
+                    .simple_counter(counters.suspends.index, 0, column),
+                0,
+                0,
+            ));
+        }
+        let (calls, vectors, clocks) = slot.counter_values();
+        Ok((
+            calls,
+            vectors,
+            clocks,
+            0,
+            slot.max_clock.load(Ordering::Relaxed),
+            slot.max_clock_n.load(Ordering::Relaxed),
+        ))
     }
 
     /// VPP `input_node_counts_by_state[VLIB_NODE_STATE_POLLING]`: polling
@@ -1912,10 +2202,50 @@ impl NodeMain {
     }
 
     #[inline]
+    pub fn node_flags(&self, node: NodeId) -> RuntimeResult<NodeFlags> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.nodes[node.slot() as usize].flags)
+    }
+
+    /// Add VPP-style Node statistics flags during graph publication.
+    pub fn set_node_flags(&self, node: NodeId, flags: NodeFlags) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
+        let barrier = crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0);
+        if barrier.is_some() {
+            crate::WorkerThread::__assert_held();
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        Arc::make_mut(&mut inner.nodes)[node.slot() as usize].flags |= flags;
+        drop(inner);
+        if let Some(barrier) = barrier {
+            barrier.request_node_refork(&self.inner.borrow());
+        }
+        Ok(())
+    }
+
+    #[inline]
     pub fn node_state(&self, node: NodeId) -> RuntimeResult<NodeState> {
         let inner = self.inner.borrow();
         inner.validate_node(node)?;
         Ok(inner.node_states[node.slot() as usize])
+    }
+
+    /// VPP `format_vlib_node_state` for the states Hammer's scheduler owns.
+    pub fn node_display_state(&self, node: NodeId) -> RuntimeResult<&'static str> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        let slot = node.slot() as usize;
+        match inner.nodes[slot].kind {
+            NodeKind::Internal => Ok("active"),
+            NodeKind::Process => Ok("async"),
+            NodeKind::Driver | NodeKind::PreInput => match inner.node_states[slot] {
+                NodeState::Disabled => Ok("disabled"),
+                NodeState::Polling => Ok("polling"),
+                NodeState::Interrupt => Ok("interrupt wait"),
+            },
+        }
     }
 
     #[inline]
@@ -1924,6 +2254,7 @@ impl NodeMain {
         inner.validate_node(node)?;
         Ok(inner.nodes[node.slot() as usize]
             .runtime_data
+            .get()
             .expect("Node runtime is borrowed by its invocation"))
     }
 
@@ -1994,13 +2325,15 @@ impl NodeMain {
         node: NodeId,
         mut runtime_data: NodeRuntime,
     ) -> RuntimeResult<()> {
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.borrow();
         inner.validate_node(node)?;
         runtime_data.node_index = node;
-        *inner.nodes[node.slot() as usize]
-            .runtime_data
-            .as_mut()
-            .expect("Node runtime is borrowed by its invocation") = runtime_data;
+        let slot = &inner.nodes[node.slot() as usize];
+        assert!(
+            slot.runtime_data.get().is_some(),
+            "Node runtime is borrowed by its invocation"
+        );
+        slot.runtime_data.set(Some(runtime_data));
         Ok(())
     }
 
@@ -2134,7 +2467,7 @@ impl NodeMain {
         let changed = inner.set_node_next_slot(node, slot, next)?;
         drop(inner);
         if changed && let Some(barrier) = barrier {
-            barrier.request_node_refork(self.inner.borrow().clone());
+            barrier.request_node_refork(&self.inner.borrow());
         }
         Ok(())
     }
@@ -2177,7 +2510,7 @@ impl NodeMain {
             && let Some(barrier) =
                 crate::WorkerThread::main().filter(|barrier| barrier.worker_count() != 0)
         {
-            barrier.request_node_refork(self.inner.borrow().clone());
+            barrier.request_node_refork(&self.inner.borrow());
         }
         Ok(slots)
     }
@@ -2231,24 +2564,21 @@ impl NodeMain {
         self.inner.borrow().validate_node(node)
     }
 
-    fn runtime_slot(&self, node: NodeId) -> RuntimeResult<NodeRuntimeSlot> {
-        let mut inner = self.inner.borrow_mut();
+    pub(crate) fn node_slots(&self) -> Arc<Vec<NodeRuntimeSlot>> {
+        self.inner.borrow().node_slots()
+    }
+
+    fn runtime_slot(&self, node: NodeId) -> RuntimeResult<(NodeFunction, NodeRuntime)> {
+        let inner = self.inner.borrow();
         let slot = inner
             .nodes
-            .get_mut(node.slot() as usize)
+            .get(node.slot() as usize)
             .ok_or(RuntimeError::NodeNotRegistered { node })?;
-        Ok(NodeRuntimeSlot {
-            kind: slot.kind,
-            process: slot.process,
-            declared_process: slot.declared_process,
-            frame_args_size: slot.frame_args_size,
-            runtime_data: Some(
-                slot.runtime_data
-                    .take()
-                    .expect("Node runtime has one active invocation"),
-            ),
-            trace_supported: slot.trace_supported,
-        })
+        let runtime_data = slot
+            .runtime_data
+            .take()
+            .expect("Node runtime has one active invocation");
+        Ok((slot.process, runtime_data))
     }
 
     pub fn frame_args_size(&self, node: NodeId) -> RuntimeResult<(u16, u16, u16)> {
@@ -2531,14 +2861,20 @@ impl DataPlaneMain {
                 trace
             });
             {
-                let mut graph = self.nodes.inner.borrow_mut();
-                let runtime = graph.nodes[node.slot() as usize]
+                let graph = self.nodes.inner.borrow();
+                let slot = &graph.nodes[node.slot() as usize];
+                let mut runtime = slot
                     .runtime_data
-                    .as_mut()
+                    .get()
                     .expect("pending node runtime is available before dispatch");
                 runtime.flags = (runtime.flags & !(1 << 5)) | trace;
+                slot.runtime_data.set(Some(runtime));
             }
             self.dispatch_node(node, &mut frame)?;
+            self.internal_node_vectors = self
+                .internal_node_vectors
+                .wrapping_add(input_vectors as u64);
+            self.internal_node_calls = self.internal_node_calls.wrapping_add(1);
             // VPP dispatch_pending_node, vlib/main.c:1064-1066. The input
             // count is captured before dispatch because Hammer may reuse
             // this Frame after the Node returns.
@@ -2568,26 +2904,22 @@ impl DataPlaneMain {
 
 impl DataPlaneMain {
     fn dispatch_node(&mut self, node: NodeId, frame: &mut Frame) -> RuntimeResult<usize> {
-        let mut slot = self.nodes.runtime_slot(node)?;
+        let (process, mut state) = self.nodes.runtime_slot(node)?;
         self.set_current_node(Some(node));
-        let count = slot.dispatch(self, frame);
+        let count = process(self, &mut state, frame);
         // VPP `dispatch_node`: take one timestamp after the node returns, hand
         // the delta from the start of this dispatch to the counters, and leave
         // the value as the start of the next dispatch.
         let dispatch_end = hammer_infra::time::cpu_time_now();
-        if let Some(counters) = self.nodes.node_counters(node) {
-            counters.update_dispatch(count as u64, dispatch_end - self.last_time_stamp);
-        }
+        let dispatch_clocks = dispatch_end - self.last_time_stamp;
         self.last_time_stamp = dispatch_end;
-        let state = slot.runtime_data.take().expect("Node returns its runtime");
-        let mut inner = self.nodes.inner.borrow_mut();
+        let inner = self.nodes.inner.borrow();
+        let owner = &inner.nodes[node.slot() as usize];
         assert!(
-            inner.nodes[node.slot() as usize]
-                .runtime_data
-                .replace(state)
-                .is_none(),
+            owner.runtime_data.replace(Some(state)).is_none(),
             "Node runtime has one active invocation"
         );
+        owner.update_dispatch(count as u64, dispatch_clocks);
         drop(inner);
         self.set_current_node(None);
         Ok(count)

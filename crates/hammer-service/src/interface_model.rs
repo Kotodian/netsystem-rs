@@ -7,6 +7,7 @@ use hammer_core::buffer::Buffer;
 use hammer_core::data_plane::{NodeId, NodeKind, NodeRegistration};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
+use hammer_runtime::node::NodeFlags;
 use hammer_runtime::{
     CombinedCounterMain, DataPlaneMain, DataWorkerId, NodeDescriptor, NodeProcessFn, NodeRuntime,
     RuntimeResult, SimpleCounterMain, StatsMain,
@@ -813,6 +814,9 @@ impl InterfaceMain {
                     )
                     .expect("interface TX node recycle must succeed");
                 main.nodes()
+                    .set_node_flags(tx_node, NodeFlags::IS_OUTPUT)
+                    .expect("interface TX node declares output accounting");
+                main.nodes()
                     .recycle_node_descriptor(
                         output_node,
                         NodeDescriptor::new(
@@ -842,6 +846,9 @@ impl InterfaceMain {
                         .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                     )
                     .expect("interface TX node registration must succeed");
+                main.nodes()
+                    .set_node_flags(tx_node, NodeFlags::IS_OUTPUT)
+                    .expect("interface TX node declares output accounting");
                 let output_node = main
                     .nodes()
                     .try_register_descriptor(
@@ -1117,6 +1124,9 @@ impl InterfaceMain {
                     .with_frame_args::<crate::interface::TxFrame, u32, ()>(),
                 )
                 .expect("deleted interface TX runtime must publish");
+            main.nodes()
+                .set_node_flags(tx, NodeFlags::IS_OUTPUT)
+                .expect("deleted interface TX node retains output accounting");
         }
         for index in hw.rx_queue_indices {
             state.rx_queues.remove(index);

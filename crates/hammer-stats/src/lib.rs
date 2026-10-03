@@ -28,7 +28,7 @@ pub use protocol::{
     RingConfig, STAT_COUNTER_BOOTTIME, STAT_COUNTER_HEARTBEAT, STAT_COUNTER_LAST_STATS_CLEAR,
     SharedHeader, ring_layout,
 };
-pub use segment::StatsSegment;
+pub use segment::{StatsSegment, StatsSegmentGuard};
 
 /// One collector, the Rust form of one row of VPP's collector table.
 ///
@@ -55,10 +55,11 @@ pub trait Collector: Send + Sync {
     /// The round's one call, the Rust form of VPP's `c->fn (&data)`
     /// (`collector.c:137-146`).
     ///
-    /// The argument is the shared borrow of that entry, matching VPP's
-    /// `data.entry = sm->directory_vector + c->entry_index`: a collector writes
-    /// only its own cells, never the header, a segment lock or a global lookup.
-    fn collect(&self, entry: &DirectoryEntry);
+    /// The segment lets each collector resolve its declared entry after any
+    /// structural updates. A borrowed directory entry must not remain live
+    /// across directory growth; collectors performing a structural batch use
+    /// the segment guard and resolve their counter entries afterward.
+    fn collect(&self, segment: &StatsSegment);
 }
 
 /// The single process stats owner, corresponding to VPP's `vlib_stats_main_t`.
@@ -136,20 +137,13 @@ impl StatsMain {
     ///
     /// Every registered collector runs once in registration order, then the
     /// heartbeat advances. Neither the table nor the segment is locked: writes
-    /// land on published cells of the shared directory, exactly like VPP's
-    /// loop. A collector that names a missing entry is a declaration/write
-    /// mismatch, which asserts; the round has no recoverable failure and no
-    /// family names.
+    /// land on published cells of the shared directory. A collector changing
+    /// directory structure uses the segment's existing lock scope before its
+    /// numeric writes. A missing declared entry is a declaration/write mismatch
+    /// which asserts; the round has no family names or worker barrier.
     pub fn collect(&self) {
         for collector in &self.collectors {
-            // VPP: `data.entry = sm->directory_vector + c->entry_index`
-            // (`collector.c:139`): the mechanism resolves the entry and hands it
-            // to the collector.
-            let entry = self
-                .segment
-                .entry(collector.entry_index())
-                .expect("a registered collector names a live directory entry");
-            collector.collect(entry);
+            collector.collect(&self.segment);
         }
         // The last statement takes the heartbeat entry and writes its value + 1,
         // the same "take entry → write value" shape as every collector above

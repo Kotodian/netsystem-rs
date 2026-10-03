@@ -24,11 +24,14 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         .into_iter()
         .map(|index| global.worker_init_function_registrations[index])
         .collect();
-    // One counter row per thread at the frozen graph capacity.
-    let node_counter_rows =
-        crate::node_stats::NodeCounterRows::install(worker_count + 1, main.nodes());
-    main.nodes.install_node_counters(node_counter_rows, 0);
-    crate::node_stats::publish_node_stats()?;
+    let node_names = (0..main.nodes().node_count())
+        .map(|slot| {
+            main.nodes()
+                .node_name(hammer_core::data_plane::NodeId::new(slot as u32))
+                .expect("installed Node slot has a name entry")
+        })
+        .collect::<Vec<_>>();
+    crate::node_stats::set_node_names(&node_names);
     // Every Worker runtime receives its per-thread error fact at this freeze
     // point, like VPP's worker clone refresh
     // (`third_party/vpp/src/vlib/threads.c:766-778`): the entry thread zero's
@@ -36,13 +39,14 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     // record row is the thread index, so the entry is the whole per-thread fact.
     let node_error_stats_entry = main.node_error_stats_entry_index.get();
     let mut worker_mains = Vec::with_capacity(worker_count as usize);
+    let mut node_slots = Vec::with_capacity(worker_count as usize + 1);
+    node_slots.push(main.nodes().node_slots());
     for worker_slot in 0..worker_count {
         let thread_index = worker_slot + 1;
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
-        let mut nodes = main.nodes.clone();
-        nodes.install_node_counters(node_counter_rows, thread_index);
+        let nodes = main.nodes.clone();
         let worker_main = DataPlaneMain::new_worker(
             main,
             nodes,
@@ -50,9 +54,11 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
             descriptor.numa_node().unwrap_or(0),
         )?;
         worker_main.install_node_error_stats_entry(node_error_stats_entry);
+        node_slots.push(worker_main.nodes().node_slots());
         worker_mains.push(UnsafeCell::new(Box::new(worker_main)));
     }
     threads.install_worker_mains(worker_mains);
+    threads.initialize_node_slots(node_slots);
 
     for worker_slot in 0..worker_count {
         let worker = threads

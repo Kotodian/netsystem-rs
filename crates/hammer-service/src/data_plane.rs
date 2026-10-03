@@ -1,5 +1,6 @@
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
+use hammer_runtime::node::NodeFlags;
 use hammer_runtime::{DataPlaneMain, InternalNode, Node, NodeErrorCode, TraceFormatter, unlikely};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -31,8 +32,19 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
 
-#[hammer_component_macros::graph_node(graph = service, kind = internal, name = "punt")]
+#[hammer_component_macros::graph_node(
+    graph = service,
+    init = register_punt,
+    role = internal,
+    name = "punt"
+)]
 pub struct PuntNode;
+
+fn register_punt(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime.nodes().try_register_internal(PuntNode::new())?;
+    runtime.nodes().set_node_flags(node, NodeFlags::IS_PUNT)?;
+    Ok(node)
+}
 
 impl Node for PuntNode {
     fn process(
@@ -61,6 +73,7 @@ impl DropNode {
 
 pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime.nodes().try_register_internal(DropNode)?;
+    runtime.nodes().set_node_flags(node, NodeFlags::IS_DROP)?;
     NetMain::global()?
         .register_dpo(
             Some(DpoType::DROP),

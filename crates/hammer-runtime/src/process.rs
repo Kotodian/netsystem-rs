@@ -54,9 +54,13 @@ where
     type Output = RuntimeResult<()>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: pinning `Process` pins `future`; this projection never moves
-        // either `future` or `state` out of the enclosing value.
-        unsafe { self.map_unchecked_mut(|process| &mut process.future) }.poll(context)
+        let start = hammer_infra::time::cpu_time_now();
+        // SAFETY: the Process stays pinned and only its Future is projected.
+        let process = unsafe { self.get_unchecked_mut() };
+        let result = unsafe { Pin::new_unchecked(&mut process.future) }.poll(context);
+        let clocks = hammer_infra::time::cpu_time_now().wrapping_sub(start);
+        crate::node_stats::count_process_poll(process.node_index, result.is_pending(), clocks);
+        result
     }
 }
 
@@ -94,6 +98,7 @@ impl NodeMain {
             self.process_event_state.resize_with(slot + 1, Vec::new);
             self.process_event_senders.resize_with(slot + 1, || None);
         }
+        crate::node_stats::initialize_process_counters(node)?;
         self.set_node_state(node, NodeState::Polling)?;
         let task = tokio::task::spawn_local(Process::new(node, (), future));
         self.running_processes.push(RunningProcess { node, task });
@@ -123,6 +128,7 @@ impl NodeMain {
             .process_runtime
             .as_ref()
             .ok_or(RuntimeError::MainProcessRuntimeUnavailable)?;
+        crate::node_stats::initialize_process_counters(node)?;
         let task = runtime.spawn(process);
         self.running_processes.push(RunningProcess { node, task });
         Ok(())
@@ -157,11 +163,6 @@ impl NodeMain {
         *sender_slot = Some(sender);
         if !self.suspended_processes.contains(&node) {
             self.suspended_processes.push(node);
-        }
-        // VPP `p->n_suspends += 1` (`main.c:1272`): this node now waits for an
-        // event, which is one suspend of the process node.
-        if let Some(counters) = self.node_counters(node) {
-            counters.add_suspend();
         }
         Ok(receiver)
     }
@@ -216,10 +217,6 @@ impl NodeMain {
         }
         if !self.suspended_processes.contains(&node) {
             self.suspended_processes.push(node);
-        }
-        // VPP `vlib_process_suspend`: one more suspend of this process node.
-        if let Some(counters) = self.node_counters(node) {
-            counters.add_suspend();
         }
         self.process_timer_state
             .retain(|(current, _)| *current != node);

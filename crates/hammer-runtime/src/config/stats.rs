@@ -16,9 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use byte_unit::Byte;
 use hammer_component_macros::Stats;
 use hammer_infra::mem::{MemHeap, MemMain, PageSize};
-use hammer_stats::{
-    Collector, DirectoryEntry, DirectoryIndex, SimpleCounter, StatsMain, Timestamp,
-};
+use hammer_stats::{Collector, DirectoryIndex, SimpleCounter, StatsMain, StatsSegment, Timestamp};
 use socket2::{Domain, MsgHdr, SockAddr, SockRef, Socket, Type};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
@@ -101,7 +99,7 @@ pub(crate) struct Sys {
     #[allow(dead_code)]
     heartbeat: Timestamp,
     #[stats(bootstrap = hammer_stats::STAT_COUNTER_LAST_STATS_CLEAR)]
-    // Consumed by the owner clear baseline, which does not exist yet.
+    // Updated by `clear runtime` after all graph threads move their baselines.
     #[allow(dead_code)]
     last_stats_clear: Timestamp,
     #[stats(bootstrap = hammer_stats::STAT_COUNTER_BOOTTIME)]
@@ -165,7 +163,6 @@ fn stat_segment_collector_process(
             .set_timestamp(sys.boottime.index, boottime);
 
         loop {
-            crate::node_stats::publish_node_stats()?;
             stats_main.collect();
             let update_interval = stats_main.segment.update_interval();
             tokio::time::sleep(update_interval).await;
@@ -265,7 +262,10 @@ impl Collector for HeapCollector {
         self.entry_index
     }
 
-    fn collect(&self, entry: &DirectoryEntry) {
+    fn collect(&self, segment: &StatsSegment) {
+        let entry = segment
+            .entry(self.entry_index())
+            .expect("heap collector owns its declared entry");
         hammer_stats::mem::update_mem_usage(entry, self.heap.usage());
     }
 }
@@ -292,7 +292,10 @@ impl Collector for WorkerCounterCollector {
         self.entry_index
     }
 
-    fn collect(&self, entry: &DirectoryEntry) {
+    fn collect(&self, segment: &StatsSegment) {
+        let entry = segment
+            .entry(self.entry_index())
+            .expect("worker collector owns its declared entry");
         let threads = ThreadMain::global();
         for slot in 0..threads.worker_count() {
             let thread_index = slot + 1;
@@ -443,7 +446,9 @@ fn stats_socket_accept_ready<Owner>(
     })?;
     tokio::task::spawn_local(async move {
         if let Err(source) = peer
-            .async_io(Interest::WRITABLE, |socket| send_segment_fd(socket, segment_fd))
+            .async_io(Interest::WRITABLE, |socket| {
+                send_segment_fd(socket, segment_fd)
+            })
             .await
         {
             tracing::warn!(%source, "failed to hand the stats segment descriptor to a reader");

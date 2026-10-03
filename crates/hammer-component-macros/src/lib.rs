@@ -2702,21 +2702,26 @@ fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStr
             },
             ReturnType::Default => false,
         };
-        let format_output = if unit_output {
+        let invoke = if unit_output {
             quote! {
                 #function_name(runtime, args)?;
-                String::new()
             }
         } else {
             quote! {
                 let output = #function_name(runtime, args)?;
-                format!("{output}")
             }
+        };
+        let format_output = if unit_output {
+            quote! { String::new() }
+        } else {
+            quote! { format!("{output}") }
         };
         quote! {
             let args: #args_type = input.parse()?;
-            let output = { #format_output };
-            Ok(::hammer_runtime::__private::spawn_local(async move { Ok(output) }))
+            #invoke
+            Ok(::hammer_runtime::__private::spawn_local(async move {
+                Ok(#format_output)
+            }))
         }
     } else {
         quote! {

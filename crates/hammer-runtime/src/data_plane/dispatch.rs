@@ -200,6 +200,40 @@ impl DataPlaneMain {
         Ok(())
     }
 
+    /// VPP `show_errors`: report this thread's counter since `clear errors`.
+    pub fn node_error_count_since_clear(&self, index: NodeErrorIndex) -> u64 {
+        let entry = self
+            .node_error_stats_entry_index
+            .get()
+            .expect("registered Node errors have a stats entry");
+        let current = StatsMain::global()
+            .expect("Node errors require initialized stats")
+            .segment
+            .simple_counter(entry, self.thread_index(), u32::from(index.get()));
+        let baseline = self
+            .error_counters_last_clear
+            .get(usize::from(index.get()))
+            .copied()
+            .unwrap_or(0);
+        current.wrapping_sub(baseline)
+    }
+
+    /// VPP `clear_error_counters`: retain this thread's current counter row.
+    pub fn clear_node_error_counters(&mut self) {
+        let Some(entry) = self.node_error_stats_entry_index.get() else {
+            return;
+        };
+        let columns = self.nodes.node_error_columns();
+        self.error_counters_last_clear.resize(columns as usize, 0);
+        let segment = &StatsMain::global()
+            .expect("Node errors require initialized stats")
+            .segment;
+        for column in 0..columns {
+            self.error_counters_last_clear[column as usize] =
+                segment.simple_counter(entry, self.thread_index(), column);
+        }
+    }
+
     /// Global Graph Transaction: drain residual scheduled frames, detach the
     /// live topology, rebuild and renumber from `entries`, then publish the
     /// updated topology to workers.

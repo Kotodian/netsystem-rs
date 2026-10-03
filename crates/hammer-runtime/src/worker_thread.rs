@@ -361,7 +361,7 @@ impl WorkerThread {
                     .as_ref()
                     .expect("requested refork retains its graph")
             };
-            crate::node_stats::NodeCounterRows::global().refresh_graph(graph.node_names());
+            crate::node_stats::set_node_names(graph.node_names());
             let previous = self
                 .node_reforks_required
                 .fetch_add(self.worker_count(), Ordering::Release);
@@ -416,7 +416,7 @@ impl WorkerThread {
         self.node_reforks_required.load(Ordering::Acquire) != 0
     }
 
-    pub(crate) fn request_node_refork(&self, graph: crate::node::NodeRuntimeInner) {
+    pub(crate) fn request_node_refork(&self, graph: &crate::node::NodeRuntimeInner) {
         self.assert_held();
         assert_eq!(
             self.node_reforks_required.load(Ordering::Acquire),
@@ -424,10 +424,11 @@ impl WorkerThread {
             "previous graph refork must complete before publication"
         );
         // SAFETY: all participants are parked; only thread zero writes.
-        unsafe { *self.node_runtime.get() = Some(graph) };
+        crate::ThreadMain::global().set_node_slots(0, graph.node_slots());
+        unsafe { *self.node_runtime.get() = Some(graph.clone()) };
     }
 
-    pub(crate) fn refork(&self, nodes: &mut crate::NodeMain) {
+    pub(crate) fn refork(&self, main: &mut crate::DataPlaneMain) -> RuntimeResult<()> {
         assert_ne!(
             self.node_reforks_required.load(Ordering::Acquire),
             0,
@@ -441,12 +442,15 @@ impl WorkerThread {
                 .expect("refork count and graph stay paired")
                 .clone()
         };
-        nodes.refork(graph);
+        main.nodes.refork(graph);
+        let selection = main.select_node_functions();
+        crate::ThreadMain::global().set_node_slots(main.thread_index(), main.nodes.node_slots());
         let previous = self.node_reforks_required.fetch_sub(1, Ordering::Release);
         assert_ne!(previous, 0, "graph refork completion underflow");
         while self.node_reforks_required.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
+        selection
     }
 
     /// VPP `vlib_worker_wait_one_loop`: wait for each Data Worker to advance
@@ -785,12 +789,14 @@ impl WorkerThread {
                     let main =
                         unsafe { crate::ThreadMain::global().worker_main_on_worker(descriptor) };
                     if refork_required {
-                        barrier.refork(&mut main.nodes);
+                        barrier.refork(main)?;
                     }
                     main.select_architecture_functions(
                         cfg!(target_os = "linux") && cpu_index.is_some(),
                     )?;
                     crate::init::run_worker_init_functions(main, &init_functions)?;
+                    crate::ThreadMain::global()
+                        .set_node_slots(thread_index, main.nodes.node_slots());
                 }
                 let exit_status = crate::main_loop::data_plane_main_loop(descriptor);
                 if exit_status == 0 {

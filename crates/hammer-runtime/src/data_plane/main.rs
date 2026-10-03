@@ -49,6 +49,7 @@ pub struct DataPlaneMain {
     /// nothing. Installed once at the freeze point, like VPP's per-thread
     /// `error_main.counters` refresh (`third_party/vpp/src/vlib/threads.c:766-778`).
     pub(crate) node_error_stats_entry_index: Cell<Option<DirectoryIndex>>,
+    error_counters_last_clear: Vec<u64>,
     pub(crate) handoff_queue_mains: RefCell<Vec<Arc<HandoffQueueMain>>>,
     pub(crate) handoff_queue_pending_bmp: Arc<AtomicU64>,
     pub(crate) file_poll_no_sleep_epolls: u32,
@@ -77,6 +78,11 @@ pub struct DataPlaneMain {
     loop_interval_end: Instant,
     /// Damped loops per second of the latest window (`loops_per_second`).
     loops_per_second: f64,
+    internal_node_vectors: u64,
+    internal_node_calls: u64,
+    internal_node_vectors_last_clear: u64,
+    internal_node_calls_last_clear: u64,
+    time_last_runtime_stats_clear: Instant,
     /// `exp(-1.0 / 20.0)`, computed once like VPP's `damping_constant`.
     damping_constant: f64,
     main_loop_exit_now: bool,
@@ -178,6 +184,53 @@ impl DataPlaneMain {
     #[inline(always)]
     pub fn max_internal_frame_vectors(&self) -> usize {
         self.max_internal_frame_vectors
+    }
+
+    /// VPP `vlib_internal_node_vector_rate`: pending internal Frames only.
+    #[inline]
+    pub fn internal_node_vector_rate(&self) -> f64 {
+        let calls = self
+            .internal_node_calls
+            .wrapping_sub(self.internal_node_calls_last_clear);
+        if calls == 0 {
+            return 0.0;
+        }
+        self.internal_node_vectors
+            .wrapping_sub(self.internal_node_vectors_last_clear) as f64
+            / calls as f64
+    }
+
+    #[inline]
+    pub fn loops_per_second(&self) -> f64 {
+        self.loops_per_second
+    }
+
+    #[inline]
+    pub fn runtime_stats_elapsed_seconds(&self) -> f64 {
+        self.time_last_runtime_stats_clear.elapsed().as_secs_f64()
+    }
+
+    #[inline]
+    pub fn seconds_per_cpu_tick(&self) -> f64 {
+        self.seconds_per_cpu_tick
+    }
+
+    /// VPP `vlib_node_sync_stats`, called by this main's owner or under the
+    /// WorkerBarrier while its worker has released the mutable main borrow.
+    #[inline]
+    pub fn sync_node_stats(&mut self, node: NodeId) -> RuntimeResult<()> {
+        self.nodes.sync_node_stats(node)
+    }
+
+    /// VPP `clear_node_runtime`: retain this thread's totals as the baseline
+    /// for `runtime` and restart the internal-frame rate interval.
+    pub fn clear_runtime_stats(&mut self) -> u64 {
+        self.nodes.clear_runtime_stats();
+        self.internal_node_vectors_last_clear = self.internal_node_vectors;
+        self.internal_node_calls_last_clear = self.internal_node_calls;
+        self.time_last_runtime_stats_clear = Instant::now();
+        let ticks = hammer_infra::time::cpu_time_now().wrapping_sub(self.cpu_reference_ticks);
+        (self.unix_reference_seconds + ticks as f64 * self.seconds_per_cpu_tick) as u64
     }
 
     /// Worker-local, non-cryptographic randomness seeded at worker construction.

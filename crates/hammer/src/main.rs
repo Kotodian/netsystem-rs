@@ -32,6 +32,8 @@ hammer_runtime::__declare_registration_image!(
     process_nodes = [];
     stats_registrations = [];
     cli_commands = [
+        cli::runtime::__CLI_COMMAND_RUNTIME,
+        cli::runtime::__CLI_COMMAND_CLEAR_RUNTIME,
         cli::errors::__CLI_COMMAND_ERRORS,
         cli::memory::__CLI_COMMAND_MEMORY,
     ];

@@ -15,7 +15,7 @@ pub(super) struct NextFrame {
     pub(super) pending_index: Option<usize>,
     node: NodeId,
     pub(super) flags: u16,
-    vectors_since_last_overflow: u32,
+    pub(super) vectors_since_last_overflow: u32,
 }
 
 impl NodeMain {
@@ -174,7 +174,13 @@ impl NodeMain {
         }
     }
 
-    pub(crate) fn put_next_frame_index(&mut self, index: usize, vectors_left: usize) {
+    pub(crate) fn put_next_frame_index(
+        &mut self,
+        source: NodeId,
+        next_slot: u32,
+        index: usize,
+        vectors_left: usize,
+    ) {
         assert!(vectors_left <= FRAME_VECTOR_CAPACITY);
         let count = FRAME_VECTOR_CAPACITY - vectors_left;
         let frame = self.next_frame_mut(index);
@@ -182,8 +188,9 @@ impl NodeMain {
             count >= frame.len(),
             "put retains previously enqueued vectors"
         );
+        let added = count - frame.len();
         frame.set_vector_count(count);
-        if count == 0 {
+        if added == 0 {
             return;
         }
         frame.frame_flags |= IS_PENDING;
@@ -198,8 +205,14 @@ impl NodeMain {
             });
         }
         next.flags |= IS_PENDING;
-        next.vectors_since_last_overflow =
-            next.vectors_since_last_overflow.wrapping_add(count as u32);
+        let previous = next.vectors_since_last_overflow;
+        next.vectors_since_last_overflow = previous.wrapping_add(added as u32);
+        if crate::unlikely(next.vectors_since_last_overflow < previous) {
+            let graph = self.inner.get_mut();
+            graph.n_vectors_by_next_node[source.slot() as usize][next_slot as usize] = graph
+                .n_vectors_by_next_node[source.slot() as usize][next_slot as usize]
+                .wrapping_add(u64::from(previous));
+        }
         self.readiness.mark_pending();
     }
 }
@@ -272,7 +285,8 @@ impl DataPlaneMain {
             runtime.cached_next_index = next_index;
             self.nodes.next_frames[index].flags |= runtime.flags & (1 << 5);
         }
-        self.nodes.put_next_frame_index(index, vectors_left);
+        self.nodes
+            .put_next_frame_index(source, next_index, index, vectors_left);
     }
 }
 

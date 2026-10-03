@@ -278,8 +278,7 @@ pub fn data_plane_main_loop(worker: &crate::WorkerThread) -> i32 {
         // its main until the end of this loop iteration.
         let main = unsafe { crate::ThreadMain::global().worker_main_on_worker(worker) };
         if refork_required {
-            barrier.refork(&mut main.nodes);
-            if main.select_node_functions().is_err() {
+            if barrier.refork(main).is_err() {
                 return 1;
             }
         }

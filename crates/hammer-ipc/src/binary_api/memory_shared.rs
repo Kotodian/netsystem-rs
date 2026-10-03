@@ -16,7 +16,7 @@ use hammer_infra::svm::region::{
     RegionLock, SvmRegion, SvmRegionConfig, SvmRegionError, SvmRegionFlags,
 };
 use hammer_runtime::RuntimeResult;
-use hammer_stats::{Collector, DirectoryEntry, DirectoryIndex, SimpleCounter, StatsMain};
+use hammer_stats::{Collector, DirectoryIndex, SimpleCounter, StatsMain, StatsSegment};
 use serde::de::Error as _;
 
 use super::{Api, api::ApiMain, codec};
@@ -993,10 +993,13 @@ impl Collector for RegionHeapCollector {
         self.entry_index
     }
 
-    fn collect(&self, entry: &DirectoryEntry) {
+    fn collect(&self, segment: &StatsSegment) {
         if !self.api_main.is_mapped() {
             return;
         }
+        let entry = segment
+            .entry(self.entry_index())
+            .expect("region heap collector owns its declared entry");
         let usage = match self.region {
             RegionRole::Root => {
                 let region = self

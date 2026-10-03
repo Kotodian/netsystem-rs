@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use hammer_infra::align::{CACHE_LINE, VEC_MIN_ALIGN};
 use hammer_infra::mem::{MemError, MemHeap, MemMain, PageSize};
-use hammer_infra::sync::SpinLock;
+use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::metric::{
     CombinedCounter, Gauge, Histogram, NameVector, Ring, RingSchema, SimpleCounter, Timestamp,
@@ -52,6 +52,64 @@ struct DirectoryState {
     dir_vector_first_free_elt: Option<DirectoryIndex>,
 }
 
+/// One stats-segment lock scope, including its reader-visible directory epoch.
+///
+/// Operations on this guard reuse the held lock. The transaction begins at the
+/// first mutation and ends before the spin lock is released.
+#[must_use]
+pub struct StatsSegmentGuard<'a> {
+    segment: &'a StatsSegment,
+    transaction: Option<DirectoryWrite>,
+    directory: SpinLockGuard<'a, DirectoryState>,
+}
+
+impl StatsSegmentGuard<'_> {
+    pub fn validate(&mut self, index: DirectoryIndex, row: u32, column: u32) -> StatsResult<()> {
+        self.segment
+            .validate_counter(index, row, column, &mut self.transaction)
+    }
+
+    pub fn set_name(
+        &mut self,
+        index: DirectoryIndex,
+        element: u32,
+        value: &str,
+    ) -> StatsResult<()> {
+        self.segment
+            .set_name_element(index, element, value, &mut self.transaction)
+    }
+
+    pub fn add_symlink(
+        &mut self,
+        target: DirectoryIndex,
+        column: u32,
+        name: &str,
+    ) -> StatsResult<DirectoryIndex> {
+        let length = self.segment.directory().len();
+        if target.raw() as usize >= length {
+            return Err(StatsError::DirectoryIndexOutOfBounds {
+                index: target.raw(),
+                length,
+            });
+        }
+        self.segment.create_directory_entry(
+            &mut self.directory,
+            &mut self.transaction,
+            name,
+            DirectoryType::Symlink,
+            DirectoryData::symlink_index(SymlinkIndex {
+                entry_index: target.raw(),
+                vector_index: column,
+            }),
+        )
+    }
+
+    pub fn remove_entry(&mut self, index: DirectoryIndex) -> StatsResult<()> {
+        self.segment
+            .remove_directory_entry(&mut self.directory, &mut self.transaction, index)
+    }
+}
+
 // SAFETY: the mapped addresses owned by a segment outlive every borrower (the
 // segment is owned by the process-level `StatsMain` and has no destruction
 // path), directory state is guarded by `stat_segment_lock`, each counter row
@@ -60,13 +118,23 @@ unsafe impl Send for StatsSegment {}
 unsafe impl Sync for StatsSegment {}
 
 impl StatsSegment {
+    /// VPP `vlib_stats_segment_lock` / `vlib_stats_segment_unlock` scope.
+    /// Use the guard's methods for every nested directory operation.
+    pub fn lock(&self) -> StatsSegmentGuard<'_> {
+        StatsSegmentGuard {
+            segment: self,
+            transaction: None,
+            directory: self.stat_segment_lock.lock(),
+        }
+    }
+
     /// Holds the stats directory lock and its reader-visible transaction
     /// across a graph refork, as `vlib_worker_thread_barrier_release` does.
-    /// The caller must not invoke another directory mutation while held.
-    pub fn lock_refork(&self) -> impl Sized + '_ {
-        let stat_segment_lock = self.stat_segment_lock.lock();
-        let transaction = DirectoryWrite::begin(self);
-        (transaction, stat_segment_lock)
+    /// Use the returned guard for any directory mutation while it is held.
+    pub fn lock_refork(&self) -> StatsSegmentGuard<'_> {
+        let mut guard = self.lock();
+        guard.transaction = Some(DirectoryWrite::begin(self));
+        guard
     }
 
     pub(crate) fn create(
@@ -445,21 +513,7 @@ impl StatsSegment {
         column: u32,
         name: &str,
     ) -> StatsResult<DirectoryIndex> {
-        let length = self.directory().len();
-        if target.raw() as usize >= length {
-            return Err(StatsError::DirectoryIndexOutOfBounds {
-                index: target.raw(),
-                length,
-            });
-        }
-        self.create_entry(
-            name,
-            DirectoryType::Symlink,
-            DirectoryData::symlink_index(SymlinkIndex {
-                entry_index: target.raw(),
-                vector_index: column,
-            }),
-        )
+        self.lock().add_symlink(target, column, name)
     }
 
     /// Publishes one name-vector element and its symlinks in a single
@@ -776,6 +830,16 @@ impl StatsSegment {
     /// Sets or clears one element of a name vector, like
     /// `vlib_stats_set_string_vector`.
     pub fn set_name(&self, index: DirectoryIndex, element: u32, value: &str) -> StatsResult<()> {
+        self.lock().set_name(index, element, value)
+    }
+
+    fn set_name_element(
+        &self,
+        index: DirectoryIndex,
+        element: u32,
+        value: &str,
+        transaction: &mut Option<DirectoryWrite>,
+    ) -> StatsResult<()> {
         let outer = {
             let entry = self.entry_of_type(index, DirectoryType::NameVector)?;
             entry.string_vector_pointer()?
@@ -796,10 +860,9 @@ impl StatsSegment {
             if previous.is_null() {
                 return Ok(());
             }
-            let transaction = DirectoryWrite::begin(self);
+            transaction.get_or_insert_with(|| DirectoryWrite::begin(self));
             // SAFETY: the element belongs to the outer vector of this entry.
             unsafe { ptr::write(outer.add(position), ptr::null_mut()) };
-            drop(transaction);
             // SAFETY: the element was allocated by `allocate_string`.
             unsafe { free_vector(self.heap(), NonNull::new_unchecked(previous), 1) };
             return Ok(());
@@ -809,14 +872,21 @@ impl StatsSegment {
         let mut replaced_outer = None;
         let mut target = outer;
         if position >= outer_length {
-            let replacement = allocate_vector(
+            let replacement = match allocate_vector(
                 self.heap(),
                 size_of::<*mut u8>(),
                 position + 1,
                 VEC_MIN_ALIGN,
                 NAME_VECTOR_USER_HEADER,
                 true,
-            )?;
+            ) {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    // SAFETY: the new string has not been published.
+                    unsafe { free_vector(self.heap(), string, 1) };
+                    return Err(error);
+                }
+            };
             // SAFETY: both vectors belong to this segment and the previous
             // `outer_length` elements are initialized.
             unsafe {
@@ -841,17 +911,16 @@ impl StatsSegment {
         // SAFETY: `position` is inside `target`, which is either the published
         // outer vector or its unpublished replacement.
         let previous = unsafe { ptr::read(target.add(position)) };
-        let transaction = DirectoryWrite::begin(self);
+        transaction.get_or_insert_with(|| DirectoryWrite::begin(self));
         // SAFETY: the target element belongs to this entry.
         unsafe { ptr::write(target.add(position), string.as_ptr()) };
-        if replaced_outer.is_some() {
+        if target != outer {
             // SAFETY: the caller holds the segment lock and `index` is the
             // published name vector slot.
             unsafe {
                 (*self.entry_pointer(index)).set_data(DirectoryData::string_vector(target));
             }
         }
-        drop(transaction);
         if !previous.is_null() {
             // SAFETY: the replaced element was allocated by `allocate_string`.
             unsafe { free_vector(self.heap(), NonNull::new_unchecked(previous), 1) };
@@ -871,6 +940,16 @@ impl StatsSegment {
     /// `vlib_stats_validate`: a counter row and its outer vector are
     /// default-heap vectors, so VPP releases them through the active heap.
     pub fn validate(&self, index: DirectoryIndex, row: u32, column: u32) -> StatsResult<()> {
+        self.lock().validate(index, row, column)
+    }
+
+    fn validate_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+        transaction: &mut Option<DirectoryWrite>,
+    ) -> StatsResult<()> {
         let (element_size, published) = {
             let entry = self.entry(index)?;
             let kind = entry.directory_type()?;
@@ -929,7 +1008,7 @@ impl StatsSegment {
         )?;
         let slots = replacement.as_ptr().cast::<*mut u8>();
         let mut installed = 0;
-        while installed < row_length {
+        while installed < outer_length {
             let row_pointer = if installed < published_length {
                 // SAFETY: `installed` is inside the published outer vector.
                 unsafe { ptr::read(published.add(installed)) }
@@ -942,6 +1021,14 @@ impl StatsSegment {
                 // SAFETY: the published outer vector owns this row.
                 unsafe { vector_length(row_pointer) as usize }
             };
+            if installed >= row_length {
+                // Rows above the requested index keep their existing storage.
+                // Initializing a thread-zero Process column must not erase the
+                // already published Data Worker rows.
+                unsafe { ptr::write(slots.add(installed), row_pointer) };
+                installed += 1;
+                continue;
+            }
             if row_length_here >= column_length {
                 // SAFETY: `installed` is inside the replacement outer vector.
                 unsafe { ptr::write(slots.add(installed), row_pointer) };
@@ -999,14 +1086,13 @@ impl StatsSegment {
             installed += 1;
         }
 
-        let transaction = DirectoryWrite::begin(self);
+        transaction.get_or_insert_with(|| DirectoryWrite::begin(self));
         // SAFETY: the caller holds the segment lock and `index` is the
         // published counter slot.
         unsafe {
             (*self.entry_pointer(index))
                 .set_data(DirectoryData::data(replacement.as_ptr().cast::<c_void>()));
         }
-        drop(transaction);
 
         for position in 0..published_length {
             // SAFETY: `position` is inside both outer vectors.
@@ -1037,6 +1123,15 @@ impl StatsSegment {
     /// Releasing an entry that is already free is a no-op: the slot is on the
     /// free list and no payload is reachable from it.
     pub fn remove_entry(&self, index: DirectoryIndex) -> StatsResult<()> {
+        self.lock().remove_entry(index)
+    }
+
+    fn remove_directory_entry(
+        &self,
+        directory: &mut DirectoryState,
+        transaction: &mut Option<DirectoryWrite>,
+        index: DirectoryIndex,
+    ) -> StatsResult<()> {
         let (kind, name, payload) = {
             let entry = self.entry(index)?;
             let kind = entry.directory_type()?;
@@ -1053,10 +1148,10 @@ impl StatsSegment {
             };
             (kind, entry.name_bytes()?, payload)
         };
-        let mut directory = self.stat_segment_lock.lock();
-        let next_free = directory.dir_vector_first_free_elt
+        let next_free = directory
+            .dir_vector_first_free_elt
             .map_or(STAT_SEGMENT_INDEX_INVALID, DirectoryIndex::raw);
-        let transaction = DirectoryWrite::begin(self);
+        transaction.get_or_insert_with(|| DirectoryWrite::begin(self));
         // The slot becomes empty before its payload is released: a reader that
         // re-reads the directory never follows a payload that is already gone.
         self.store_entry(
@@ -1067,10 +1162,8 @@ impl StatsSegment {
                 DirectoryData::index(u64::from(next_free)),
             ),
         );
-        drop(transaction);
         directory.directory_vector_by_name.remove(&name);
         directory.dir_vector_first_free_elt = Some(index);
-        drop(directory);
         self.release_payload(kind, payload)
     }
 
@@ -1171,8 +1264,25 @@ impl StatsSegment {
         directory_type: DirectoryType,
         data: DirectoryData,
     ) -> StatsResult<DirectoryIndex> {
+        let mut guard = self.lock();
+        self.create_directory_entry(
+            &mut guard.directory,
+            &mut guard.transaction,
+            name,
+            directory_type,
+            data,
+        )
+    }
+
+    fn create_directory_entry(
+        &self,
+        directory: &mut DirectoryState,
+        transaction: &mut Option<DirectoryWrite>,
+        name: &str,
+        directory_type: DirectoryType,
+        data: DirectoryData,
+    ) -> StatsResult<DirectoryIndex> {
         let name_bytes = NameBytes::try_from(name)?;
-        let mut directory = self.stat_segment_lock.lock();
         if directory.directory_vector_by_name.contains_key(&name_bytes) {
             return Err(StatsError::DuplicateName {
                 name: name.to_owned(),
@@ -1183,7 +1293,7 @@ impl StatsSegment {
             Some(index) => Some((index, self.entry(index)?.directory_index()?)),
             None => None,
         };
-        let transaction = DirectoryWrite::begin(self);
+        transaction.get_or_insert_with(|| DirectoryWrite::begin(self));
         let index = match reused {
             Some((index, next)) => {
                 directory.dir_vector_first_free_elt =
@@ -1197,9 +1307,7 @@ impl StatsSegment {
             }
         };
         self.store_entry(index, entry);
-        drop(transaction);
         directory.directory_vector_by_name.insert(name_bytes, index);
-        drop(directory);
         Ok(index)
     }
 
