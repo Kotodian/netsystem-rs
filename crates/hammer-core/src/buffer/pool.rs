@@ -42,6 +42,10 @@ impl BufferMain {
     /// every overlapping shared or mutable borrow for the same slot.
     #[doc(hidden)]
     #[inline]
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "the caller exclusively owns this Buffer slot"
+    )]
     pub unsafe fn buffer_mut_for_worker<'a>(
         &'a self,
         thread_index: u32,
@@ -156,6 +160,10 @@ impl BufferMain {
     }
 
     #[inline]
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "the caller exclusively owns this Buffer slot"
+    )]
     pub(super) unsafe fn buffer_mut_unchecked(&self, index: u32) -> &mut Buffer {
         let pool = self.pool(index);
         // SAFETY: inspect the live shared segment before constructing &mut Buffer.
@@ -248,6 +256,10 @@ impl BufferPool {
         unsafe { &*mapping.base().add(offset).cast::<Buffer>() }
     }
 
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "the caller exclusively owns this Buffer slot"
+    )]
     unsafe fn buffer_mut(&self, index: u32) -> &mut Buffer {
         #[cfg(debug_assertions)]
         assert!(

@@ -60,12 +60,6 @@ pub enum DataPlaneError {
     BufferInvariant(#[from] BufferInvariant),
     #[error("buffer frame capacity exceeded")]
     FrameCapacityExceeded,
-    #[error("data plane handoff target worker out of bounds")]
-    HandoffTargetWorkerOutOfBounds,
-    #[error("data plane handoff queue exhausted")]
-    HandoffQueueExhausted,
-    #[error("data plane handoff is not configured")]
-    HandoffNotConfigured,
     #[error("named next fallback node is not registered")]
     NamedNextFallbackMissing,
     #[error("constructor-published graph registration is unnamed")]
