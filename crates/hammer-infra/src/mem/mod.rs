@@ -768,7 +768,15 @@ impl MemHeap {
         let main_heap = unsafe { (*state).main_heap };
         if !main_heap.is_null() {
             let previous_heap = unsafe { (*main_heap).activate() };
+            let map_lock = unsafe { AtomicU8::from_ptr(ptr::addr_of_mut!((*state).map_lock)) };
+            while map_lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::hint::spin_loop();
+            }
             unsafe { (*state).heaps.push(control) };
+            map_lock.store(0, Ordering::Release);
             drop(previous_heap);
         }
 
@@ -934,10 +942,18 @@ impl MemHeap {
         if !main_heap.is_null() {
             let active_heap = unsafe { (*main_heap).activate() };
             let pointer = (self as *const Self).cast_mut();
+            let map_lock = unsafe { AtomicU8::from_ptr(ptr::addr_of_mut!((*state).map_lock)) };
+            while map_lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                std::hint::spin_loop();
+            }
             if let Some(index) = unsafe { (*state).heaps.iter().position(|heap| *heap == pointer) }
             {
                 unsafe { (*state).heaps.remove(index) };
             }
+            map_lock.store(0, Ordering::Release);
             drop(active_heap);
         }
         unsafe { destroy_mspace(self.mspace) };
@@ -1003,6 +1019,34 @@ impl MemMain {
         unsafe { (*ptr::addr_of_mut!(MEM_MAIN)).heaps.len() }
     }
 
+    /// VPP `clib_mem_main.heaps`: take one owned reading per live heap. The
+    /// existing inventory lock also excludes heap removal until each reading
+    /// and its name have been copied.
+    pub fn heap_usages() -> Vec<(String, usize, usize, HeapUsage)> {
+        let state = ptr::addr_of_mut!(MEM_MAIN);
+        let map_lock = unsafe { AtomicU8::from_ptr(ptr::addr_of_mut!((*state).map_lock)) };
+        while map_lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        let mut heaps = Vec::new();
+        for &pointer in unsafe { &(*state).heaps } {
+            // SAFETY: the inventory lock prevents removal and destruction of
+            // this heap until its current reading is owned by `heaps`.
+            let heap = unsafe { &*pointer };
+            heaps.push((
+                heap.name().to_owned(),
+                heap.base().as_ptr() as usize,
+                heap.size(),
+                heap.usage(),
+            ));
+        }
+        map_lock.store(0, Ordering::Release);
+        heaps
+    }
+
     pub fn registered_thread_count() -> usize {
         unsafe {
             let mut count = 0;
@@ -1052,6 +1096,152 @@ impl MemMain {
         }
         map_lock.store(0, Ordering::Release);
         count
+    }
+
+    /// VPP `clib_mem_vm_get_next_map_hdr` followed by
+    /// `clib_mem_get_page_stats`: copy each mapping header under the existing
+    /// map lock, then query page placement without retaining a mapped header.
+    pub fn mappings() -> Result<
+        Vec<(
+            usize,
+            usize,
+            RawFd,
+            u8,
+            usize,
+            Vec<(u32, u64)>,
+            u64,
+            u64,
+            String,
+        )>,
+        MemError,
+    > {
+        let state = ptr::addr_of_mut!(MEM_MAIN);
+        let map_lock = unsafe { AtomicU8::from_ptr(ptr::addr_of_mut!((*state).map_lock)) };
+        while map_lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        let system_page_size = unsafe { 1usize << (*state).log2_page_size };
+        let mut headers = Vec::new();
+        let mut header = unsafe { (*state).first_map };
+        let mut header_error = None;
+        while !header.is_null() {
+            if unsafe { libc::mprotect(header.cast(), system_page_size, libc::PROT_READ) } != 0 {
+                header_error = Some(MemError::MappingHeaderProtect {
+                    address: header.addr(),
+                    writable: false,
+                    source: io::Error::last_os_error(),
+                });
+                break;
+            }
+            let (base, pages, page_log2, fd, name, next) = unsafe {
+                (
+                    (*header).base_address,
+                    (*header).page_count,
+                    (*header).page_size_log2,
+                    (*header).backing_fd,
+                    (*header).name,
+                    (*header).next,
+                )
+            };
+            if unsafe { libc::mprotect(header.cast(), system_page_size, libc::PROT_NONE) } != 0 {
+                map_lock.store(0, Ordering::Release);
+                std::process::abort();
+            }
+            headers.push((base, pages, page_log2, fd, name));
+            header = next;
+        }
+        map_lock.store(0, Ordering::Release);
+        if let Some(error) = header_error {
+            return Err(error);
+        }
+
+        let mut mappings = Vec::with_capacity(headers.len());
+        for (base, pages, page_log2, fd, name) in headers {
+            let mut per_numa = [0u64; 64];
+            let mut not_populated = 0u64;
+            let mut unknown = 0u64;
+            #[cfg(target_os = "linux")]
+            {
+                let mut addresses = Vec::with_capacity(pages);
+                let mut statuses = vec![0i32; pages];
+                for page in 0..pages {
+                    addresses.push((base + (page << page_log2)) as *mut c_void);
+                }
+                let queried = unsafe {
+                    libc::syscall(
+                        libc::SYS_move_pages,
+                        0 as libc::pid_t,
+                        pages,
+                        addresses.as_ptr(),
+                        ptr::null::<c_int>(),
+                        statuses.as_mut_ptr(),
+                        0,
+                    )
+                };
+                if queried != 0 {
+                    unknown = pages as u64;
+                } else {
+                    for (address, mut status) in addresses.into_iter().zip(statuses) {
+                        if status == -libc::ENOENT {
+                            let mut resident = 0u8;
+                            if unsafe { libc::mincore(address, 1, &mut resident) } == 0
+                                && resident & 1 != 0
+                            {
+                                if unsafe {
+                                    libc::syscall(
+                                        libc::SYS_get_mempolicy,
+                                        &mut status,
+                                        ptr::null::<usize>(),
+                                        0usize,
+                                        address,
+                                        3usize,
+                                    )
+                                } != 0
+                                {
+                                    status = -libc::ENONET;
+                                }
+                            }
+                        }
+                        if status >= 0 && (status as usize) < per_numa.len() {
+                            per_numa[status as usize] += 1;
+                        } else if status == -libc::EFAULT || status == -libc::ENOENT {
+                            not_populated += 1;
+                        } else {
+                            unknown += 1;
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unknown = pages as u64;
+            }
+            let mut numa_pages = Vec::new();
+            let mut node = Self::next_numa_node(None);
+            while let Some(index) = node {
+                numa_pages.push((index, per_numa[index as usize]));
+                node = Self::next_numa_node(Some(index));
+            }
+            let name_length = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len());
+            mappings.push((
+                base,
+                pages << page_log2,
+                fd,
+                page_log2,
+                pages,
+                numa_pages,
+                not_populated,
+                unknown,
+                String::from_utf8_lossy(&name[..name_length]).into_owned(),
+            ));
+        }
+        Ok(mappings)
     }
 
     pub fn system_page_size() -> usize {

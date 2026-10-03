@@ -31,7 +31,10 @@ hammer_runtime::__declare_registration_image!(
     node_functions = [];
     process_nodes = [];
     stats_registrations = [];
-    cli_commands = [cli::errors::__CLI_COMMAND_ERRORS];
+    cli_commands = [
+        cli::errors::__CLI_COMMAND_ERRORS,
+        cli::memory::__CLI_COMMAND_MEMORY,
+    ];
 );
 
 static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -225,7 +228,9 @@ async fn run_main_thread(
             signal = unix.wait_for_exit_signal() => signal,
             accepted = cli.accept(&main) => accepted.map(|()| 1),
         };
-        let cleanup = cli.close_listener(hammer_runtime::AsyncFileMain::global()).await;
+        let cleanup = cli
+            .close_listener(hammer_runtime::AsyncFileMain::global())
+            .await;
         return match (result, cleanup) {
             (Err(primary), Err(cleanup)) => {
                 tracing::error!(%cleanup, "CLI listener cleanup failed after main-thread error");

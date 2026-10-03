@@ -10,7 +10,7 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hammer_infra::mem::MemHeap;
+use hammer_infra::mem::{HeapUsage, MemHeap};
 use hammer_infra::svm::queue::{SvmQueue, SvmQueueConditionalWait, SvmQueueConfig, SvmQueueError};
 use hammer_infra::svm::region::{
     RegionLock, SvmRegion, SvmRegionConfig, SvmRegionError, SvmRegionFlags,
@@ -556,6 +556,25 @@ const _: () = {
 };
 
 impl ApiMain {
+    /// VPP `vl_msg_push_heap` selects the API region's Data Heap while holding
+    /// its region mutex. Copy the heap reading before releasing that mutex.
+    pub fn api_segment_heap_usage(&self) -> (String, usize, usize, HeapUsage) {
+        hammer_runtime::ensure_main_thread()
+            .expect("API segment memory is queried on the CLI main thread");
+        assert!(self.is_mapped(), "API region is mapped before CLI starts");
+        let region = self
+            .primary_region()
+            .lock()
+            .expect("mapped API region mutex remains usable");
+        let heap = region.data_heap().expect("API region has a Data Heap");
+        (
+            heap.name().to_owned(),
+            heap.base().as_ptr() as usize,
+            heap.size(),
+            heap.usage(),
+        )
+    }
+
     // Message allocation and release use this same owner. ShmemHeader supplies
     // ring storage; it never combines its own rings with a different main's heap.
     pub unsafe fn alloc(&self, payload_len: usize) -> MsgBuf {

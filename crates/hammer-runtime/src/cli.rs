@@ -108,6 +108,11 @@ pub enum CliError {
     UnexpectedArgument { argument: String },
     #[error("invalid CLI argument: {argument}")]
     InvalidArgument { argument: String },
+    #[error("read virtual-memory mapping inventory: {source}")]
+    MemoryMapping {
+        #[source]
+        source: hammer_infra::mem::MemError,
+    },
     #[error("trace Node not found: {name}")]
     TraceNodeMissing { name: String },
     #[error("Node does not support source tracing: {node}")]
