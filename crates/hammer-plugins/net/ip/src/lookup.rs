@@ -324,6 +324,10 @@ impl Ip4Main {
             .and_then(|table| table.forwarding_lookup(address))
     }
 
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "FIB mutation runs under the worker barrier"
+    )]
     pub(crate) fn fib_table_mut(&self, fib_index: u32) -> &mut Ip4FibTable {
         // SAFETY: callers hold the main-thread publication scope.
         unsafe { &mut *self.unicast_tables.get() }
@@ -392,6 +396,10 @@ impl Ip6Main {
             .and_then(|table| table.forwarding_lookup(address))
     }
 
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "FIB mutation runs under the worker barrier"
+    )]
     pub(crate) fn fib_table_mut(&self, fib_index: u32) -> &mut Ip6FibTable {
         // SAFETY: callers hold the main-thread publication scope.
         unsafe { &mut *self.unicast_tables.get() }

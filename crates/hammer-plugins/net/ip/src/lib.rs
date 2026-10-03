@@ -69,7 +69,9 @@ hammer_component_macros::declare_plugin!(
         ip::input::__IP_GRAPH_NODE_IP4_INPUT_NODE,
         ip::input::__IP_GRAPH_NODE_IP6_INPUT_NODE,
         ip::reassembly::__IP_GRAPH_NODE_IP4_REASSEMBLY_NODE,
+        ip::reassembly::__IP_GRAPH_NODE_IP4_REASSEMBLY_HANDOFF_NODE,
         ip::reassembly::__IP_GRAPH_NODE_IP6_REASSEMBLY_NODE,
+        ip::reassembly::__IP_GRAPH_NODE_IP6_REASSEMBLY_HANDOFF_NODE,
         ip::local::__IP_GRAPH_NODE_IP4_LOCAL_END_OF_ARC_NODE,
         ip::local::__IP_GRAPH_NODE_IP6_LOCAL_END_OF_ARC_NODE,
         punt::__IP_GRAPH_NODE_IP4_PUNT_NODE,
@@ -146,7 +148,7 @@ pub use ip::{
     Ip4InputNext, Ip4InputNode, Ip4LocalNext, Ip4LocalNode, Ip4ReassemblyNext, Ip4ReassemblyNode,
     Ip4ReceiveNode, Ip6InputNext, Ip6InputNode, Ip6LocalNext, Ip6LocalNode, Ip6ReassemblyNext,
     Ip6ReassemblyNode, Ip6ReceiveNode, IpInputTrace, IpLocalError, IpReassemblyDirectory,
-    IpReassemblyHandoff, pack_fragment_owner_value, unpack_fragment_owner_value,
+    pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use ip::{IpPathFlags, IpRoutePathBehavior};
 pub use lookup::{

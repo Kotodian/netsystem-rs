@@ -1213,16 +1213,33 @@ pub(crate) mod tests {
         runtime
             .buffer_mut(head)
             .set_total_len_not_including_first(tail_len)?;
-        let parsed = ip_header(
-            &packet,
-            BufferPacketCursor::new()
-                .with_packet_len(packet.len())
-                .with_network_header(0, 20)
-                .with_transport_header(20, 8),
-        )?;
-        assert_eq!(l4_checksum(&runtime, head, &parsed)?, 0);
+        let source = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        let destination = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(
+            l4_checksum(
+                &runtime,
+                head,
+                IpProtocol::Icmpv4,
+                source,
+                destination,
+                46,
+                20
+            )?,
+            0
+        );
         runtime.buffer_mut(tail).current_mut()[0] ^= 1;
-        assert_ne!(l4_checksum(&runtime, head, &parsed)?, 0);
+        assert_ne!(
+            l4_checksum(
+                &runtime,
+                head,
+                IpProtocol::Icmpv4,
+                source,
+                destination,
+                46,
+                20
+            )?,
+            0
+        );
         let segments = runtime.chain(head).count();
         let cached_free = runtime.cached_free_buffers();
         runtime.buffer_free_one(head);

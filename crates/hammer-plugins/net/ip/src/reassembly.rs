@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -7,8 +8,11 @@ use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::SpinLock;
+use hammer_runtime::handoff::buffer_enqueue_to_thread;
+use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
+    DataPlaneMain, DataWorkerId, HandoffAllocQueuesArgs, Node, NodeProcessFn, NodeRuntime,
+    TraceFormatter,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -46,6 +50,8 @@ pub fn unpack_fragment_owner_value(value: u64) -> (u32, DataWorkerId) {
 pub enum Ip4ReassemblyNext {
     #[next("ip4-input")]
     Input,
+    #[next("ip4-full-reassembly-handoff")]
+    Handoff,
     #[next("drop")]
     Drop,
 }
@@ -54,6 +60,8 @@ pub enum Ip4ReassemblyNext {
 pub enum Ip6ReassemblyNext {
     #[next("ip6-input")]
     Input,
+    #[next("ip6-full-reassembly-handoff")]
+    Handoff,
     #[next("drop")]
     Drop,
 }
@@ -61,6 +69,7 @@ pub enum Ip6ReassemblyNext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum IpReassemblyTraceAction {
+    Passthrough,
     Pending,
     Drop,
     Reassembled,
@@ -92,6 +101,7 @@ fn format_reassembly_trace(bytes: &[u8]) -> String {
     let (trace, _) = IpReassemblyTrace::ref_from_prefix(bytes)
         .expect("IP reassembly trace has its registered layout");
     let action = match trace.action {
+        action if action == IpReassemblyTraceAction::Passthrough as u8 => "passthrough",
         action if action == IpReassemblyTraceAction::Pending as u8 => "pending",
         action if action == IpReassemblyTraceAction::Drop as u8 => "drop",
         action if action == IpReassemblyTraceAction::Reassembled as u8 => "reassembled",
@@ -225,56 +235,10 @@ impl IpReassemblyDirectory {
     }
 }
 
-#[derive(Clone)]
-pub struct IpReassemblyHandoff {
-    reassembly: NodeId,
-    input: NodeId,
-    worker: DataWorkerId,
-    directory: IpReassemblyDirectory,
-}
-
-impl IpReassemblyHandoff {
-    #[inline]
-    pub fn new(
-        reassembly: NodeId,
-        input: NodeId,
-        worker: DataWorkerId,
-        directory: IpReassemblyDirectory,
-    ) -> Self {
-        Self {
-            reassembly,
-            input,
-            worker,
-            directory,
-        }
-    }
-
-    #[inline]
-    pub fn reassembly(&self) -> NodeId {
-        self.reassembly
-    }
-
-    #[inline]
-    pub fn input(&self) -> NodeId {
-        self.input
-    }
-
-    #[inline]
-    pub fn worker(&self) -> DataWorkerId {
-        self.worker
-    }
-
-    #[inline]
-    pub fn directory(&self) -> &IpReassemblyDirectory {
-        &self.directory
-    }
-}
-
 struct IpReassemblyWorker {
     worker: DataWorkerId,
     contexts: Pool<FragmentContext>,
     directory: Option<Arc<IpReassemblyDirectory>>,
-    handoff: Option<IpReassemblyHandoff>,
     timeout: Duration,
     max_reassemblies: usize,
     max_fragments_per_reassembly: usize,
@@ -283,6 +247,8 @@ struct IpReassemblyWorker {
 
 struct IpReassemblyMain {
     per_thread_data: Vec<SpinLock<IpReassemblyWorker>>,
+    ip4_handoff_queue_index: AtomicU32,
+    ip6_handoff_queue_index: AtomicU32,
 }
 
 static IP_REASSEMBLY_MAIN: OnceLock<IpReassemblyMain> = OnceLock::new();
@@ -298,14 +264,17 @@ impl IpReassemblyMain {
                 worker: DataWorkerId::new(worker as u32),
                 contexts: Pool::with_capacity(config.max_reassemblies),
                 directory: Some(Arc::clone(&directory)),
-                handoff: None,
                 timeout: config.timeout,
                 max_reassemblies: config.max_reassemblies,
                 max_fragments_per_reassembly: config.max_fragments_per_reassembly,
                 last_id: 0,
             }));
         }
-        Self { per_thread_data }
+        Self {
+            per_thread_data,
+            ip4_handoff_queue_index: AtomicU32::new(u32::MAX),
+            ip6_handoff_queue_index: AtomicU32::new(u32::MAX),
+        }
     }
 
     fn worker_slot(runtime: &DataPlaneMain) -> usize {
@@ -402,8 +371,6 @@ fn init_ip_reassembly() -> RuntimeResult<()> {
 #[derive(Clone)]
 pub struct Ip4ReassemblyNode {
     #[node(default)]
-    handoff: Option<IpReassemblyHandoff>,
-    #[node(default)]
     directory: Option<Arc<IpReassemblyDirectory>>,
     #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
     timeout: Duration,
@@ -412,13 +379,6 @@ pub struct Ip4ReassemblyNode {
 }
 
 impl Ip4ReassemblyNode {
-    #[inline]
-    pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
-        self.directory = Some(Arc::new(handoff.directory.clone()));
-        self.handoff = Some(handoff);
-        self
-    }
-
     #[inline]
     pub fn with_directory(mut self, directory: Arc<IpReassemblyDirectory>) -> Self {
         self.directory = Some(directory);
@@ -455,8 +415,6 @@ fn register_ip4_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 #[derive(Clone)]
 pub struct Ip6ReassemblyNode {
     #[node(default)]
-    handoff: Option<IpReassemblyHandoff>,
-    #[node(default)]
     directory: Option<Arc<IpReassemblyDirectory>>,
     #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
     timeout: Duration,
@@ -465,13 +423,6 @@ pub struct Ip6ReassemblyNode {
 }
 
 impl Ip6ReassemblyNode {
-    #[inline]
-    pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
-        self.directory = Some(Arc::new(handoff.directory.clone()));
-        self.handoff = Some(handoff);
-        self
-    }
-
     #[inline]
     pub fn with_directory(mut self, directory: Arc<IpReassemblyDirectory>) -> Self {
         self.directory = Some(directory);
@@ -496,6 +447,205 @@ fn register_ip6_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         Ip6ReassemblyNode::new(),
         &Ip6ReassemblyNext::NEXT_NAMES,
     )
+}
+
+#[repr(u16)]
+#[derive(Clone, Copy)]
+enum IpReassemblyHandoffError {
+    CongestionDrop,
+}
+
+impl NodeErrorCode for IpReassemblyHandoffError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
+}
+
+impl IpReassemblyHandoffError {
+    const DESCRIPTORS: [NodeErrorDescriptor; 1] = [NodeErrorDescriptor::new(
+        "congestion-drop",
+        NodeErrorSeverity::Error,
+        "Packets dropped because the reassembly handoff queue is full",
+    )];
+}
+
+#[repr(C)]
+#[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+struct IpReassemblyHandoffTrace {
+    next_worker_index: u32,
+}
+
+fn format_ip4_reassembly_handoff_trace(bytes: &[u8]) -> String {
+    let (trace, _) = IpReassemblyHandoffTrace::ref_from_prefix(bytes)
+        .expect("IPv4 reassembly handoff trace has its registered layout");
+    format!(
+        "ip4-full-reassembly-handoff: next-worker {}",
+        trace.next_worker_index
+    )
+}
+
+fn format_ip6_reassembly_handoff_trace(bytes: &[u8]) -> String {
+    let (trace, _) = IpReassemblyHandoffTrace::ref_from_prefix(bytes)
+        .expect("IPv6 reassembly handoff trace has its registered layout");
+    format!(
+        "ip6-full-reassembly-handoff: next-worker {}",
+        trace.next_worker_index
+    )
+}
+
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip4_reassembly_handoff,
+    role = internal,
+    name = "ip4-full-reassembly-handoff",
+)]
+pub struct Ip4ReassemblyHandoffNode;
+
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip6_reassembly_handoff,
+    role = internal,
+    name = "ip6-full-reassembly-handoff",
+)]
+pub struct Ip6ReassemblyHandoffNode;
+
+fn register_ip4_reassembly_handoff(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let target = runtime
+        .nodes()
+        .node_by_name(Ip4ReassemblyNode::NODE_NAME)
+        .expect("IPv4 reassembly Node registers before its handoff Node");
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(Ip4ReassemblyHandoffNode::new(), &[])?;
+    runtime.register_node_errors(node, &IpReassemblyHandoffError::DESCRIPTORS)?;
+    let queue = runtime.handoff_alloc_queues(HandoffAllocQueuesArgs {
+        node_index: target,
+        queue_size: 0,
+        dequeue_vector_limit: 0,
+    })?;
+    let main = IP_REASSEMBLY_MAIN
+        .get()
+        .expect("IP reassembly Main initializes before graph registration");
+    assert_eq!(
+        main.ip4_handoff_queue_index.swap(queue, Ordering::Relaxed),
+        u32::MAX,
+        "IPv4 handoff queue registers once"
+    );
+    Ok(node)
+}
+
+fn register_ip6_reassembly_handoff(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let target = runtime
+        .nodes()
+        .node_by_name(Ip6ReassemblyNode::NODE_NAME)
+        .expect("IPv6 reassembly Node registers before its handoff Node");
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(Ip6ReassemblyHandoffNode::new(), &[])?;
+    runtime.register_node_errors(node, &IpReassemblyHandoffError::DESCRIPTORS)?;
+    let queue = runtime.handoff_alloc_queues(HandoffAllocQueuesArgs {
+        node_index: target,
+        queue_size: 0,
+        dequeue_vector_limit: 0,
+    })?;
+    let main = IP_REASSEMBLY_MAIN
+        .get()
+        .expect("IP reassembly Main initializes before graph registration");
+    assert_eq!(
+        main.ip6_handoff_queue_index.swap(queue, Ordering::Relaxed),
+        u32::MAX,
+        "IPv6 handoff queue registers once"
+    );
+    Ok(node)
+}
+
+impl Node for Ip4ReassemblyHandoffNode {
+    fn process(runtime: &mut DataPlaneMain, node: &mut NodeRuntime, frame: &mut Frame) -> usize {
+        let indices = frame.vector_args();
+        let mut threads = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+        for (position, &index) in indices.iter().enumerate() {
+            threads[position] = hammer_core::buffer_opaque!(runtime.buffer(index) => NetworkOpaque)
+                .reassembly()
+                .owner_thread_index();
+            assert_ne!(
+                threads[position], 0,
+                "reassembly handoff has an owner thread"
+            );
+            if hammer_runtime::unlikely(
+                node.trace_enabled() && runtime.buffer(index).trace_handle().is_some(),
+            ) {
+                if let Some(trace) = runtime.add_trace::<IpReassemblyHandoffTrace>(node, index) {
+                    trace.next_worker_index = u32::from(threads[position]);
+                }
+            }
+        }
+        let queue = IP_REASSEMBLY_MAIN
+            .get()
+            .expect("IP reassembly Main exists")
+            .ip4_handoff_queue_index
+            .load(Ordering::Relaxed);
+        assert_ne!(queue, u32::MAX, "IPv4 handoff queue is registered");
+        let accepted =
+            buffer_enqueue_to_thread(runtime, node, queue, indices, &threads[..indices.len()]);
+        if accepted < indices.len() {
+            runtime
+                .record_current_node_error_count(
+                    IpReassemblyHandoffError::CongestionDrop,
+                    (indices.len() - accepted) as u64,
+                )
+                .expect("handoff congestion counter is registered");
+        }
+        indices.len()
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip4_reassembly_handoff_trace)
+    }
+}
+
+impl Node for Ip6ReassemblyHandoffNode {
+    fn process(runtime: &mut DataPlaneMain, node: &mut NodeRuntime, frame: &mut Frame) -> usize {
+        let indices = frame.vector_args();
+        let mut threads = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
+        for (position, &index) in indices.iter().enumerate() {
+            threads[position] = hammer_core::buffer_opaque!(runtime.buffer(index) => NetworkOpaque)
+                .reassembly()
+                .owner_thread_index();
+            assert_ne!(
+                threads[position], 0,
+                "reassembly handoff has an owner thread"
+            );
+            if hammer_runtime::unlikely(
+                node.trace_enabled() && runtime.buffer(index).trace_handle().is_some(),
+            ) {
+                if let Some(trace) = runtime.add_trace::<IpReassemblyHandoffTrace>(node, index) {
+                    trace.next_worker_index = u32::from(threads[position]);
+                }
+            }
+        }
+        let queue = IP_REASSEMBLY_MAIN
+            .get()
+            .expect("IP reassembly Main exists")
+            .ip6_handoff_queue_index
+            .load(Ordering::Relaxed);
+        assert_ne!(queue, u32::MAX, "IPv6 handoff queue is registered");
+        let accepted =
+            buffer_enqueue_to_thread(runtime, node, queue, indices, &threads[..indices.len()]);
+        if accepted < indices.len() {
+            runtime
+                .record_current_node_error_count(
+                    IpReassemblyHandoffError::CongestionDrop,
+                    (indices.len() - accepted) as u64,
+                )
+                .expect("handoff congestion counter is registered");
+        }
+        indices.len()
+    }
+
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip6_reassembly_handoff_trace)
+    }
 }
 
 #[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk")]
@@ -555,8 +705,6 @@ impl IpReassemblyWorker {
             }
             if let Some(directory) = &self.directory {
                 directory.remove(key);
-            } else if let Some(handoff) = &self.handoff {
-                handoff.directory.remove(key);
             }
         }
         count
@@ -629,6 +777,46 @@ impl IpReassemblyWorker {
         version: IpVersion,
     ) -> RuntimeResult<()> {
         let current_worker = self.worker;
+        let pass_through = {
+            let packet = runtime.buffer(index).current();
+            match version {
+                IpVersion::V4 => Ipv4Header::ref_from_prefix(packet).is_ok_and(|(header, _)| {
+                    header.version() == 4
+                        && header.flags_fragment()
+                            & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK)
+                            == 0
+                }),
+                IpVersion::V6 => Ipv6Header::ref_from_prefix(packet).is_ok_and(|(header, _)| {
+                    header.version() == 6 && header.next_protocol() != IPV6_NEXT_HEADER_FRAGMENT
+                }),
+            }
+        };
+        if pass_through {
+            let next = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Input),
+                IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Input),
+            };
+            trace_reassembly(
+                runtime,
+                node_runtime,
+                index,
+                None,
+                IpReassemblyTraceAction::Passthrough,
+                current_worker,
+                None,
+                Some(next),
+            );
+            Self::emit_local(
+                runtime,
+                node_runtime,
+                out_frame,
+                nexts,
+                out_len,
+                next,
+                index,
+            )?;
+            return Ok(());
+        }
         let fragment = {
             let buffer = runtime.buffer(index);
             let packet = buffer.current();
@@ -769,16 +957,22 @@ impl IpReassemblyWorker {
                     more_fragments,
                 );
         }
-        let directory = self
-            .directory
-            .as_ref()
-            .map(|d| d.as_ref())
-            .or_else(|| self.handoff.as_ref().map(|h| &h.directory));
+        let directory = self.directory.as_deref();
 
         // Memory-owner handoff before touching local pool.
-        if let (Some(directory), Some(handoff)) = (directory, self.handoff.as_ref()) {
+        if let Some(directory) = directory {
             if let Some((_, owner)) = directory.lookup(key) {
                 if owner != current_worker {
+                    let next = match version {
+                        IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Handoff),
+                        IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Handoff),
+                    };
+                    hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
+                        .reassembly_mut()
+                        .set_owner_thread_index(
+                            u16::try_from(owner.thread_index())
+                                .expect("configured runtime thread index fits u16"),
+                        );
                     trace_reassembly(
                         runtime,
                         node_runtime,
@@ -787,13 +981,17 @@ impl IpReassemblyWorker {
                         IpReassemblyTraceAction::Handoff,
                         current_worker,
                         Some(owner),
-                        None,
+                        Some(next),
                     );
-                    if let Err(error) = runtime.handoff_index(owner, handoff.reassembly, index) {
-                        // A rejected enqueue leaves this Worker owning the chain.
-                        runtime.buffer_free_one(index);
-                        return Err(error);
-                    }
+                    Self::emit_local(
+                        runtime,
+                        node_runtime,
+                        out_frame,
+                        nexts,
+                        out_len,
+                        next,
+                        index,
+                    )?;
                     return Ok(());
                 }
             }
@@ -854,7 +1052,17 @@ impl IpReassemblyWorker {
                     if !created {
                         let _ = self.contexts.remove(ctx_index);
                         if owner != current_worker {
-                            if let Some(handoff) = &self.handoff {
+                            {
+                                let next = match version {
+                                    IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Handoff),
+                                    IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Handoff),
+                                };
+                                hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
+                                    .reassembly_mut()
+                                    .set_owner_thread_index(
+                                        u16::try_from(owner.thread_index())
+                                            .expect("configured runtime thread index fits u16"),
+                                    );
                                 trace_reassembly(
                                     runtime,
                                     node_runtime,
@@ -863,15 +1071,17 @@ impl IpReassemblyWorker {
                                     IpReassemblyTraceAction::Handoff,
                                     current_worker,
                                     Some(owner),
-                                    None,
+                                    Some(next),
                                 );
-                                if let Err(error) =
-                                    runtime.handoff_index(owner, handoff.reassembly, index)
-                                {
-                                    // A rejected enqueue leaves this Worker owning the chain.
-                                    runtime.buffer_free_one(index);
-                                    return Err(error);
-                                }
+                                Self::emit_local(
+                                    runtime,
+                                    node_runtime,
+                                    out_frame,
+                                    nexts,
+                                    out_len,
+                                    next,
+                                    index,
+                                )?;
                                 return Ok(());
                             }
                         }
@@ -1032,8 +1242,6 @@ impl IpReassemblyWorker {
             )?;
             if let Some(directory) = &self.directory {
                 directory.remove(key);
-            } else if let Some(handoff) = &self.handoff {
-                handoff.directory.remove(key);
             }
             return Ok(());
         }
@@ -1050,28 +1258,38 @@ impl IpReassemblyWorker {
                 .ok_or(IpReassemblyError::FragmentContextMissing)?;
             if let Some(directory) = &self.directory {
                 directory.remove(key);
-            } else if let Some(handoff) = &self.handoff {
-                handoff.directory.remove(key);
             }
-            if let Some(handoff) = &self.handoff {
-                if sendout != current_worker {
-                    trace_reassembly(
-                        runtime,
-                        node_runtime,
-                        index,
-                        Some(key),
-                        IpReassemblyTraceAction::Handoff,
-                        current_worker,
-                        Some(sendout),
-                        None,
+            if sendout != current_worker {
+                let next = match version {
+                    IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Handoff),
+                    IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Handoff),
+                };
+                hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
+                    .reassembly_mut()
+                    .set_owner_thread_index(
+                        u16::try_from(sendout.thread_index())
+                            .expect("configured runtime thread index fits u16"),
                     );
-                    if let Err(error) = runtime.handoff_index(sendout, handoff.input, index) {
-                        // A rejected enqueue leaves this Worker owning the chain.
-                        runtime.buffer_free_one(index);
-                        return Err(error);
-                    }
-                    return Ok(());
-                }
+                trace_reassembly(
+                    runtime,
+                    node_runtime,
+                    index,
+                    Some(key),
+                    IpReassemblyTraceAction::Handoff,
+                    current_worker,
+                    Some(sendout),
+                    Some(next),
+                );
+                Self::emit_local(
+                    runtime,
+                    node_runtime,
+                    out_frame,
+                    nexts,
+                    out_len,
+                    next,
+                    index,
+                )?;
+                return Ok(());
             }
             let input_next = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Input),
@@ -1160,11 +1378,10 @@ fn ip_reassembly_process(
     version: IpVersion,
 ) -> usize {
     let processed_vectors = frame.len();
-    (|| {
-        if let Some(main) = IP_REASSEMBLY_MAIN.get() {
-            main.process_frame(runtime, node_runtime, frame, version);
-        }
-    })();
+    IP_REASSEMBLY_MAIN
+        .get()
+        .expect("IP reassembly Main initializes before its graph Nodes")
+        .process_frame(runtime, node_runtime, frame, version);
     processed_vectors
 }
 
@@ -1509,6 +1726,29 @@ mod tests {
 
     #[test]
     fn reassembly_transfers_complete_chains_and_expires_incomplete_chains() {
+        const CASE: &str = "ip::reassembly::tests::reassembly_transfers_complete_chains_and_expires_incomplete_chains";
+        const PROCESS_CASE: &str = "HAMMER_IP_REASSEMBLY_TEST_CASE";
+        let child = std::env::var(PROCESS_CASE).as_deref() == Ok(CASE);
+        if !child {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .env(PROCESS_CASE, CASE)
+                    .arg("--exact")
+                    .arg(CASE)
+                    .arg("--nocapture")
+                    .output()
+                    .expect("spawn IP reassembly test process");
+            assert!(
+                output.status.success(),
+                "IP reassembly test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        hammer_infra::mem::MainHeapConfig::default()
+            .initialize()
+            .expect("initialize process Main Heap before IP Buffer test");
         crate::BUFFER_MAIN_INIT.call_once(|| {
             hammer_core::buffer::BufferMain::new(
                 64,
@@ -1535,7 +1775,6 @@ mod tests {
             worker: DataWorkerId::new(1),
             contexts: Pool::with_capacity(1),
             directory: Some(Arc::clone(&directory)),
-            handoff: None,
             timeout: Duration::from_millis(100),
             max_reassemblies: 1,
             max_fragments_per_reassembly: 4,
@@ -1549,20 +1788,7 @@ mod tests {
         let mut context = FragmentContext::new(key, IpVersion::V4, now);
         assert!(matches!(
             context
-                .insert_fragment(
-                    &mut runtime,
-                    indices[0],
-                    ParsedIpFragment {
-                        version: IpVersion::V4,
-                        key,
-                        payload_offset: 0,
-                        payload_len: 16,
-                        more_fragments: true,
-                        header_len: 20,
-                    },
-                    now,
-                    4
-                )
+                .insert_fragment(&mut runtime, indices[0], 0, 16, true, now, 4)
                 .unwrap(),
             ReassemblyInsert::Pending
         ));
@@ -1598,20 +1824,7 @@ mod tests {
         let mut context = FragmentContext::new(key, IpVersion::V4, now);
         assert!(matches!(
             context
-                .insert_fragment(
-                    &mut runtime,
-                    last[0],
-                    ParsedIpFragment {
-                        version: IpVersion::V4,
-                        key,
-                        payload_offset: 16,
-                        payload_len: 8,
-                        more_fragments: false,
-                        header_len: 20,
-                    },
-                    now,
-                    4
-                )
+                .insert_fragment(&mut runtime, last[0], 16, 24, false, now, 4)
                 .unwrap(),
             ReassemblyInsert::Pending
         ));
@@ -1641,43 +1854,27 @@ mod tests {
                 packet[2..4].copy_from_slice(&28u16.to_be_bytes());
                 packet[9] = 17;
                 packet[20..].fill(offset as u8 + 1);
+                let network =
+                    hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque);
+                *network = NetworkOpaque::default();
+                network.reassembly_mut().set_fragment(
+                    0,
+                    20,
+                    offset * 8,
+                    offset * 8 + 8,
+                    offset == 0,
+                );
             }
             let cached_free = runtime.cached_free_buffers();
             let mut context = FragmentContext::new(key, IpVersion::V4, now);
             assert!(matches!(
                 context
-                    .insert_fragment(
-                        &mut runtime,
-                        indices[0],
-                        ParsedIpFragment {
-                            version: IpVersion::V4,
-                            key,
-                            payload_offset: 0,
-                            payload_len: 8,
-                            more_fragments: true,
-                            header_len: 20,
-                        },
-                        now,
-                        4
-                    )
+                    .insert_fragment(&mut runtime, indices[0], 0, 8, true, now, 4)
                     .unwrap(),
                 ReassemblyInsert::Pending
             ));
             let ReassemblyInsert::Reassembled(head) = context
-                .insert_fragment(
-                    &mut runtime,
-                    indices[1],
-                    ParsedIpFragment {
-                        version: IpVersion::V4,
-                        key,
-                        payload_offset: 8,
-                        payload_len: 8,
-                        more_fragments: false,
-                        header_len: 20,
-                    },
-                    now,
-                    4,
-                )
+                .insert_fragment(&mut runtime, indices[1], 8, 16, false, now, 4)
                 .unwrap()
             else {
                 panic!("complete IPv4 fragment range produces one chain");
@@ -1725,7 +1922,8 @@ mod tests {
                             packet[9] = 17;
                             packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
                             packet[16..20].copy_from_slice(&[192, 0, 2, 2]);
-                            update_ipv4_header_checksum(packet, header_len);
+                            let checksum = internet_checksum(&packet[..header_len]);
+                            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
                         }
                         IpVersion::V6 => {
                             packet[0] = 0x60;
@@ -1749,11 +1947,35 @@ mod tests {
                         .buffer_mut(chain[0])
                         .set_total_len_not_including_first(23)
                         .unwrap();
+                    let network = hammer_core::buffer_opaque!(mut runtime.buffer_mut(chain[0]) => NetworkOpaque);
+                    *network = NetworkOpaque::default();
+                    network.reassembly_mut().set_fragment(
+                        if version == IpVersion::V4 {
+                            0
+                        } else {
+                            IPV6_HEADER_LEN
+                        },
+                        header_len,
+                        offset * 16,
+                        (offset + 1) * 16,
+                        offset == 0,
+                    );
                 }
-                let parsed =
-                    parse_ip_fragment_with_chain_len(runtime.buffer(indices[0]).current(), 23)
-                        .unwrap();
-                let mut context = FragmentContext::new(parsed.key, version, now);
+                let key = match version {
+                    IpVersion::V4 => IpFragmentKey::V4 {
+                        source: Ipv4Addr::new(192, 0, 2, 1),
+                        destination: Ipv4Addr::new(192, 0, 2, 2),
+                        protocol: 17,
+                        identification: 7,
+                    },
+                    IpVersion::V6 => IpFragmentKey::V6 {
+                        source: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                        destination: std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                        next_header: 17,
+                        identification: 7,
+                    },
+                };
+                let mut context = FragmentContext::new(key, version, now);
                 let cached_free = runtime.cached_free_buffers();
                 let order = if reversed {
                     [indices[3], indices[0]]
@@ -1761,11 +1983,13 @@ mod tests {
                     [indices[0], indices[3]]
                 };
                 for (position, index) in order.into_iter().enumerate() {
-                    let parsed =
-                        parse_ip_fragment_with_chain_len(runtime.buffer(index).current(), 23)
-                            .unwrap();
+                    let (start, end, more_fragments) = if index == indices[0] {
+                        (0, 16, true)
+                    } else {
+                        (16, 32, false)
+                    };
                     let result = context
-                        .insert_fragment(&mut runtime, index, parsed, now, 4)
+                        .insert_fragment(&mut runtime, index, start, end, more_fragments, now, 4)
                         .unwrap();
                     if position == 0 {
                         assert!(matches!(result, ReassemblyInsert::Pending));
@@ -1869,5 +2093,8 @@ mod tests {
         assert_eq!(runtime.buffer(indices[1]).ref_count(), 1);
         runtime.buffer_free(output.vector_args());
         assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
+        // The test harness has pre-init System allocations; do not run its
+        // destructors after switching to the Main Heap in this child.
+        unsafe { libc::_exit(0) }
     }
 }
