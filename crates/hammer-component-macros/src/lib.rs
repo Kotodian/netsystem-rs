@@ -6,6 +6,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::{
     Attribute, Error, Expr, Field, Fields, FieldsNamed, FnArg, GenericArgument, GenericParam,
     Generics, Ident, Item, ItemEnum, ItemFn, ItemMod, ItemStruct, LitBool, LitStr, Path,
@@ -1081,6 +1082,162 @@ fn expand_node_function_variant(
                 },
             );
     }
+}
+
+struct MarchFunctionsArgs {
+    entries: Vec<Ident>,
+    slot_copy: Vec<Ident>,
+}
+
+impl Parse for MarchFunctionsArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut entries = None;
+        let mut slot_copy = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let values;
+            bracketed!(values in input);
+            let values = Punctuated::<Ident, Token![,]>::parse_terminated(&values)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            match key.to_string().as_str() {
+                "entries" if entries.is_none() => entries = Some(values),
+                "slot_copy" if slot_copy.is_none() => slot_copy = Some(values),
+                _ => {
+                    return Err(Error::new(
+                        key.span(),
+                        "unknown or duplicate march_functions argument",
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        let entries = entries.ok_or_else(|| Error::new(Span::call_site(), "missing entries"))?;
+        let slot_copy =
+            slot_copy.ok_or_else(|| Error::new(Span::call_site(), "missing slot_copy"))?;
+        if entries.is_empty() || slot_copy.len() != 3 {
+            return Err(Error::new(
+                Span::call_site(),
+                "march_functions needs entries and three slot_copy functions",
+            ));
+        }
+        Ok(Self { entries, slot_copy })
+    }
+}
+
+/// Clone one handoff body for the baseline, x86-64-v3 and x86-64-v4.
+/// Only the named entry functions receive process/loop-level selectors.
+#[proc_macro_attribute]
+pub fn march_functions(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as MarchFunctionsArgs);
+    let module = parse_macro_input!(input as ItemMod);
+    expand_march_functions(args, module)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_march_functions(args: MarchFunctionsArgs, module: ItemMod) -> Result<TokenStream2> {
+    let Some((_, items)) = module.content.as_ref() else {
+        return Err(Error::new_spanned(
+            module,
+            "march_functions requires an inline module",
+        ));
+    };
+    let mut selectors = Vec::with_capacity(args.entries.len());
+    for entry in &args.entries {
+        let function = items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(function) if function.sig.ident == *entry => Some(function),
+                _ => None,
+            })
+            .ok_or_else(|| Error::new_spanned(entry, "entry is not a function in the module"))?;
+        if !function.sig.generics.params.is_empty() || function.sig.unsafety.is_none() {
+            return Err(Error::new_spanned(
+                &function.sig,
+                "march entry must be a non-generic unsafe function",
+            ));
+        }
+        let types = function
+            .sig
+            .inputs
+            .iter()
+            .map(|argument| match argument {
+                FnArg::Typed(argument) => Ok(argument.ty.as_ref()),
+                _ => Err(Error::new_spanned(
+                    argument,
+                    "march entry cannot have a receiver",
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output = &function.sig.output;
+        let selector = format_ident!("select_{}", entry);
+        let base = format_ident!("{}_base", module.ident);
+        let v3 = format_ident!("{}_v3", module.ident);
+        let v4 = format_ident!("{}_v4", module.ident);
+        selectors.push(quote! {
+            pub(crate) fn #selector() -> unsafe fn(#(#types),*) #output {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if ::hammer_runtime::node::NodeVariant::X86_64V4
+                        .priority_on_current_cpu().is_some()
+                    {
+                        return #v4::#entry;
+                    }
+                    if ::hammer_runtime::node::NodeVariant::X86_64V3
+                        .priority_on_current_cpu().is_some()
+                    {
+                        return #v3::#entry;
+                    }
+                }
+                #base::#entry
+            }
+        });
+    }
+    let variants = [
+        ("base", quote!(), quote!()),
+        (
+            "v3",
+            quote!(#[cfg(target_arch = "x86_64")]),
+            quote!(#[target_feature(enable = "avx2,bmi1,bmi2,fma,f16c,lzcnt,movbe")]),
+        ),
+        (
+            "v4",
+            quote!(#[cfg(target_arch = "x86_64")]),
+            quote!(#[target_feature(enable = "avx2,bmi1,bmi2,fma,f16c,lzcnt,movbe,avx512f,avx512bw,avx512dq,avx512vl,avx512cd")]),
+        ),
+    ];
+    let mut modules = Vec::with_capacity(variants.len());
+    for (index, (suffix, platform_cfg, target_feature)) in variants.into_iter().enumerate() {
+        let name = format_ident!("{}_{}", module.ident, suffix);
+        let slot_copy = &args.slot_copy[index];
+        let mut variant_items = items.clone();
+        if index != 0 {
+            for item in &mut variant_items {
+                if let Item::Fn(function) = item {
+                    if function.sig.unsafety.is_none() {
+                        return Err(Error::new_spanned(
+                            &function.sig,
+                            "march body functions must be unsafe",
+                        ));
+                    }
+                    function.attrs.push(parse_quote!(#target_feature));
+                }
+            }
+        }
+        modules.push(quote! {
+            #platform_cfg
+            mod #name {
+                use super::*;
+                use super::#slot_copy as slot_copy;
+                #(#variant_items)*
+            }
+        });
+    }
+    Ok(quote! { #(#modules)* #(#selectors)* })
 }
 
 struct FeatureArgs {
