@@ -17,6 +17,23 @@ use hammer_runtime::{
 // builtins; loadable protocol and device-driver code comes only from DSOs.
 use hammer_service as _;
 
+mod cli;
+
+hammer_runtime::__declare_registration_image!(
+    init_functions = [];
+    config_functions = [];
+    main_loop_enter_functions = [];
+    main_loop_exit_functions = [];
+    worker_init_functions = [];
+    num_workers_change_functions = [];
+    api_init_functions = [];
+    graph_nodes = [];
+    node_functions = [];
+    process_nodes = [];
+    stats_registrations = [];
+    cli_commands = [cli::errors::__CLI_COMMAND_ERRORS];
+);
+
 static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Fields that must exist before the Main Heap can be published. Unknown
@@ -175,6 +192,7 @@ fn run(
     let exec_path = argv.first().cloned().unwrap_or_default();
     let mut global = GlobalMain::new("hammer".to_owned(), exec_path, argv, config.clone());
     let mut plugins = PluginMain::default();
+    plugins.register_image(&__HAMMER_REGISTRATION_IMAGE);
     plugins.register_image(hammer_service::registration_image());
     plugins.load(env!("CARGO_PKG_VERSION"), &startup.plugins)?;
     plugins.register_global_declarations(&mut global);

@@ -135,7 +135,7 @@ impl DataPlaneMain {
     pub fn register_node_errors(
         &self,
         node: NodeId,
-        descriptors: &[NodeErrorDescriptor],
+        descriptors: &'static [NodeErrorDescriptor],
     ) -> RuntimeResult<()> {
         self.nodes.register_node_errors(node, descriptors)?;
         if descriptors.is_empty() {

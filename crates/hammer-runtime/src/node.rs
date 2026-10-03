@@ -578,6 +578,7 @@ pub(crate) struct NodeRuntimeInner {
     /// Per node slot: the column range that node owns, `None` before it
     /// registers errors.
     error_columns: Vec<Option<NodeErrorColumnRange>>,
+    error_descriptors: Vec<&'static [NodeErrorDescriptor]>,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
     node_names: Vec<Option<&'static str>>,
@@ -598,6 +599,7 @@ impl Clone for NodeRuntimeInner {
             input_main_loops_per_call: self.input_main_loops_per_call.clone(),
             error_column_heap: self.error_column_heap.clone(),
             error_columns: self.error_columns.clone(),
+            error_descriptors: self.error_descriptors.clone(),
             handles: self.handles.clone(),
             declared_nodes: self.declared_nodes.clone(),
             node_names: self.node_names.clone(),
@@ -678,6 +680,10 @@ impl NodeRuntimeInner {
                 self.error_columns[slot], current.error_columns[slot],
                 "published worker graph changed node error layout"
             );
+            assert_eq!(
+                self.error_descriptors[slot], current.error_descriptors[slot],
+                "published worker graph changed node error descriptors"
+            );
 
             // A renamed node is a deliberately recycled identity and keeps
             // the runtime published by the topology owner. An unchanged node
@@ -700,7 +706,7 @@ impl NodeRuntimeInner {
     fn register_node_errors(
         &mut self,
         node: NodeId,
-        descriptors: &[NodeErrorDescriptor],
+        descriptors: &'static [NodeErrorDescriptor],
     ) -> RuntimeResult<()> {
         self.validate_node(node)?;
         if descriptors.is_empty() {
@@ -728,6 +734,7 @@ impl NodeRuntimeInner {
         let first =
             NodeErrorIndex::new(first_column).expect("column 0 is the reserved no-error slot");
         self.error_columns[slot] = Some(NodeErrorColumnRange { first, count });
+        self.error_descriptors[slot] = descriptors;
         Ok(())
     }
 
@@ -780,6 +787,7 @@ impl NodeRuntimeInner {
         self.interrupt_pending.push(false);
         self.input_main_loops_per_call.push(0);
         self.error_columns.push(None);
+        self.error_descriptors.push(&[]);
         self.node_names.push(None);
         self.node_trace_formatters.push(None);
         self.next_nodes.push(Vec::new());
@@ -1191,6 +1199,7 @@ impl Default for NodeMain {
                 input_main_loops_per_call: Vec::new(),
                 error_column_heap: Heap::new(),
                 error_columns: Vec::new(),
+                error_descriptors: Vec::new(),
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
                 node_names: Vec::new(),
@@ -1346,7 +1355,7 @@ impl NodeMain {
     pub(crate) fn register_node_errors(
         &self,
         node: NodeId,
-        descriptors: &[NodeErrorDescriptor],
+        descriptors: &'static [NodeErrorDescriptor],
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
         self.inner
@@ -1397,6 +1406,7 @@ impl NodeMain {
             input_main_loops_per_call: Vec::new(),
             error_column_heap: Heap::new(),
             error_columns: Vec::new(),
+            error_descriptors: Vec::new(),
             handles: HashMap::new(),
             declared_nodes: HashMap::new(),
             node_names: Vec::new(),
@@ -1885,7 +1895,7 @@ impl NodeMain {
     }
 
     #[inline]
-    pub(crate) fn node_count(&self) -> usize {
+    pub fn node_count(&self) -> usize {
         self.inner.borrow().nodes.len()
     }
 
@@ -2077,13 +2087,19 @@ impl NodeMain {
 
     /// Resolve the global column for a node-local error code.
     #[inline]
-    pub(crate) fn node_error_index(
-        &self,
-        node: NodeId,
-        code: u16,
-    ) -> RuntimeResult<NodeErrorIndex> {
+    pub fn node_error_index(&self, node: NodeId, code: u16) -> RuntimeResult<NodeErrorIndex> {
         let inner = self.inner.borrow();
         inner.node_error_index(node, code)
+    }
+
+    #[inline]
+    pub fn node_error_descriptors(
+        &self,
+        node: NodeId,
+    ) -> RuntimeResult<&'static [NodeErrorDescriptor]> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.error_descriptors[node.slot() as usize])
     }
 
     #[inline]

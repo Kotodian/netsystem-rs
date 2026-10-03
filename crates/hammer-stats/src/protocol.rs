@@ -525,6 +525,14 @@ impl DirectoryEntry {
         unsafe { AtomicU64::from_ptr(cell).store(value, Ordering::Relaxed) };
     }
 
+    /// Reads one published simple-counter cell without claiming a snapshot
+    /// across columns or threads.
+    pub fn simple_counter_cell(&self, row: u32, column: u32) -> u64 {
+        let cell = self.simple_counter_cell_pointer(row, column);
+        // SAFETY: the cell is published and all concurrent updates use atomics.
+        unsafe { AtomicU64::from_ptr(cell).load(Ordering::Relaxed) }
+    }
+
     /// Adds `increment` to one cell of a published simple counter vector, the
     /// cell update VPP's `vlib_error_count` performs through the published
     /// vector: `em->counters[counter] += increment`

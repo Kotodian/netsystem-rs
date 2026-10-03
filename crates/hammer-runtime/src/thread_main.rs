@@ -107,7 +107,7 @@ impl ThreadMain {
         })
     }
 
-    pub(crate) fn global() -> &'static Self {
+    pub fn global() -> &'static Self {
         THREAD_MAIN
             .get()
             .expect("ThreadMain is published before worker startup")

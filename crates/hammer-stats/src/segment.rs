@@ -263,6 +263,14 @@ impl StatsSegment {
             .set_simple_counter_cell(row, column, value);
     }
 
+    /// Reads one published simple-counter cell, as VPP's `show errors` reads
+    /// one per-thread error column. The directory shape is fixed before use.
+    pub fn simple_counter(&self, index: DirectoryIndex, row: u32, column: u32) -> u64 {
+        self.entry_of_type(index, DirectoryType::CounterVectorSimple)
+            .expect("simple_counter reads a declared simple counter vector")
+            .simple_counter_cell(row, column)
+    }
+
     /// Adds `increment` to one cell of a simple counter vector, the mechanism
     /// behind VPP's `em->counters[counter] += increment`
     /// (`third_party/vpp/src/vlib/error_funcs.h:35`).

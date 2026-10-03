@@ -716,7 +716,7 @@ impl WorkerThread {
             == std::thread::current().id()
     }
 
-    pub(crate) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         self.name
     }
 
