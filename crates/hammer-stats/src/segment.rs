@@ -54,8 +54,8 @@ struct DirectoryState {
 
 // SAFETY: the mapped addresses owned by a segment outlive every borrower (the
 // segment is owned by the process-level `StatsMain` and has no destruction
-// path), directory state is guarded by `stat_segment_lock`, and value writes
-// are relaxed stores to published cells.
+// path), directory state is guarded by `stat_segment_lock`, each counter row
+// has one writer, and cross-thread counter readers stop workers first.
 unsafe impl Send for StatsSegment {}
 unsafe impl Sync for StatsSegment {}
 
@@ -264,7 +264,8 @@ impl StatsSegment {
     }
 
     /// Reads one published simple-counter cell, as VPP's `show errors` reads
-    /// one per-thread error column. The directory shape is fixed before use.
+    /// one per-thread error column. The caller stops worker writers first;
+    /// the directory shape is fixed before use.
     pub fn simple_counter(&self, index: DirectoryIndex, row: u32, column: u32) -> u64 {
         self.entry_of_type(index, DirectoryType::CounterVectorSimple)
             .expect("simple_counter reads a declared simple counter vector")

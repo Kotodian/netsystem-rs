@@ -519,18 +519,17 @@ impl DirectoryEntry {
     /// `vlib_stats_set_simple_counter` performs through the published vector.
     pub fn set_simple_counter_cell(&self, row: u32, column: u32, value: u64) {
         let cell = self.simple_counter_cell_pointer(row, column);
-        // SAFETY: `column` is inside the row vector of `u64` cells; the relaxed
-        // store is the whole update and readers are not promised a cross-column
-        // snapshot.
-        unsafe { AtomicU64::from_ptr(cell).store(value, Ordering::Relaxed) };
+        // SAFETY: the owning collector writes this published cell; structural
+        // growth stops workers before moving its row.
+        unsafe { ptr::write(cell, value) };
     }
 
-    /// Reads one published simple-counter cell without claiming a snapshot
-    /// across columns or threads.
+    /// Reads one published simple-counter cell after stopping its worker writer.
     pub fn simple_counter_cell(&self, row: u32, column: u32) -> u64 {
         let cell = self.simple_counter_cell_pointer(row, column);
-        // SAFETY: the cell is published and all concurrent updates use atomics.
-        unsafe { AtomicU64::from_ptr(cell).load(Ordering::Relaxed) }
+        // SAFETY: callers such as `errors` hold the WorkerBarrier while reading
+        // other threads' rows; the published cell cannot move during that scope.
+        unsafe { ptr::read(cell) }
     }
 
     /// Adds `increment` to one cell of a published simple counter vector, the
@@ -541,10 +540,9 @@ impl DirectoryEntry {
     /// Same shape discipline as [`Self::set_simple_counter_cell`].
     pub fn add_simple_counter_cell(&self, row: u32, column: u32, increment: u64) {
         let cell = self.simple_counter_cell_pointer(row, column);
-        // SAFETY: `column` is inside the row vector of `u64` cells; the relaxed
-        // read-modify-write is the whole update, the row has a single writer,
-        // and readers are not promised a cross-column snapshot.
-        unsafe { AtomicU64::from_ptr(cell).fetch_add(increment, Ordering::Relaxed) };
+        // SAFETY: only the executing thread writes this row. Cross-thread
+        // readers stop worker writers before accessing it.
+        unsafe { ptr::write(cell, ptr::read(cell).wrapping_add(increment)) };
     }
 
     pub(crate) fn data_pointer(&self) -> Result<*mut c_void, ProtocolError> {
