@@ -22,10 +22,9 @@ use hammer_runtime::{
 use hammer_service::data_plane::DropNode;
 use hammer_service::feature::FeatureMain;
 use hammer_service::interface::{
-    HwClassFlags, HwInterfaceFlags, InterfaceCombinedCounter, InterfaceMtu, InterfaceSimpleCounter,
-    SwInterfaceFlags, TxFrame,
+    DriverScheduleMode, HwClassFlags, HwInterfaceFlags, InterfaceCombinedCounter, InterfaceMtu,
+    InterfaceSimpleCounter, SwInterfaceFlags, TxFrame,
 };
-use hammer_service::interface_model::DriverScheduleMode;
 use hammer_service::net::NetMain;
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -809,7 +808,7 @@ fn open_tun_queues(
     Ok((fds, actual_name))
 }
 
-fn tun_call_ready(graph: &mut hammer_runtime::NodeMain, file: &mut File) -> RuntimeResult<()> {
+fn tun_call_ready(graph: &mut hammer_runtime::NodeMain, file: &File) -> RuntimeResult<()> {
     let mut count = 0u64;
     let read = unsafe {
         libc::read(
@@ -1009,7 +1008,8 @@ fn tun_ip_nexts(nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY], count: usize, 
         // VPP uses u16x8u: the stack array need not have 16-byte alignment.
         // u16x8 consists solely of integer lanes, so every initialized u16
         // pattern in this padded range is a valid vector value.
-        let versions = unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast::<u16x8>()) } >> 4;
+        let versions: u16x8 =
+            unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast::<u16x8>()) } >> 4;
         let ip4 = versions.simd_eq(u16x8::splat(4));
         let ip6 = versions.simd_eq(u16x8::splat(6));
         let selected = (!(ip4 | ip6) & u16x8::splat(layout.drop))
