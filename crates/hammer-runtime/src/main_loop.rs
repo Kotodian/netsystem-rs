@@ -69,7 +69,7 @@ impl DataPlaneMain {
         F: Future,
     {
         crate::ensure_main_thread()?;
-        let (runtime, files) = {
+        let runtime = {
             let mut owner = main.borrow_mut();
             if owner.thread_index() != 0 || owner.nodes.process_runtime.is_none() {
                 return Err(crate::RuntimeError::MainProcessRuntimeUnavailable);
@@ -79,9 +79,9 @@ impl DataPlaneMain {
                 .process_runtime
                 .take()
                 .expect("validated thread-zero runtime remains installed");
-            let files = owner.async_file_main();
-            (runtime, files)
+            runtime
         };
+        let files = crate::file::AsyncFileMain::global();
         let local = tokio::task::LocalSet::new();
         let output = runtime.block_on(local.run_until(async {
             tokio::pin!(future);
@@ -102,13 +102,20 @@ impl DataPlaneMain {
                     owner.nodes.restore_processes(Instant::now())?;
                 }
                 let queue_signal_enabled = main.borrow().queue_signal_callback.is_some();
-                tokio::select! {
-                    _ = MAIN_THREAD_FUTURES_READY.notified() => {}
-                    _ = queue_signal_interval.tick(), if queue_signal_enabled => {}
-                    output = &mut future => break Ok(output),
-                    readiness = crate::file::AsyncFileMain::next_ready(files.clone()) => {
+                let selected: crate::RuntimeResult<Option<F::Output>> = tokio::select! {
+                    biased;
+                    _ = MAIN_THREAD_FUTURES_READY.notified() => Ok(None),
+                    _ = queue_signal_interval.tick(), if queue_signal_enabled => Ok(None),
+                    output = &mut future => Ok(Some(output)),
+                    readiness = files.next_ready() => {
                         readiness?;
-                    }
+                        let mut owner = main.borrow_mut();
+                        files.dispatch_ready(&mut owner.nodes);
+                        Ok(None)
+                    },
+                };
+                if let Some(output) = selected? {
+                    break Ok(output);
                 }
             }
         }));
@@ -250,9 +257,6 @@ where
 /// 6. Expire the DataPlane Main timing wheel
 /// 7. Increment the thread's main-loop counter and check exit
 pub fn data_plane_main_loop(worker: &crate::WorkerThread) -> i32 {
-    // SAFETY: this is the owning Worker, before the first barrier check.
-    unsafe { crate::ThreadMain::global().worker_main_on_worker(worker) }
-        .attach_worker_interrupt_thread();
     let file_poll = crate::config::worker::file_poll();
     let barrier = crate::WorkerThread::main().expect("worker barrier installs before dispatch");
     let files = crate::file::FILE_MAIN
@@ -260,6 +264,7 @@ pub fn data_plane_main_loop(worker: &crate::WorkerThread) -> i32 {
         .expect("FileMain initializes before Data Worker dispatch");
     let mut file_poll_skip_loops = 0u32;
     let mut last_barrier_release = Instant::now();
+    let handoff_queues_dequeue = crate::handoff::select_handoff_queues_dequeue();
 
     loop {
         // The preceding iteration's mutable main borrow has ended before
@@ -287,64 +292,76 @@ pub fn data_plane_main_loop(worker: &crate::WorkerThread) -> i32 {
         // this iteration measures from it or from the previous dispatch's end.
         main.last_time_stamp = hammer_infra::time::cpu_time_now();
 
-        match main.schedule_remote_interrupts() {
-            Ok(scheduled) => progress |= scheduled != 0,
-            Err(_) => return 1,
+        if main.handoff_queue_pending_bmp.load(Ordering::Relaxed) != 0 {
+            unsafe { handoff_queues_dequeue(main) };
+            progress = true;
         }
         match main.schedule_worker_node_interrupts() {
             Ok(scheduled) => progress |= scheduled != 0,
             Err(_) => return 1,
         }
 
-        // VPP `vlib_file_poll`: skip File checks for a bounded number of
-        // busy dispatch rounds; otherwise only an idle adaptive worker waits.
-        if file_poll_skip_loops != 0 {
+        // VPP `vlib_file_poll`: busy rounds skip sleep but still poll File
+        // nonblocking; only an idle adaptive worker may wait.
+        let skip_sleep = if file_poll_skip_loops != 0 {
             file_poll_skip_loops -= 1;
+            true
         } else {
             let busy = worker.last_vectors_per_main_loop().load(Ordering::Relaxed) >= 2
                 || main.nodes.has_polling_input_nodes()
                 || last_barrier_release.elapsed() < Duration::from_millis(500);
             if busy {
                 file_poll_skip_loops = 1024;
-            } else {
-                let may_wait = matches!(file_poll, crate::file::WorkerFilePollMode::Adaptive)
-                    && !progress
-                    && !barrier.is_pending()
-                    && !worker.has_node_interrupts()
-                    && !main.nodes.has_pending_work();
-                match main.poll_file_readiness() {
-                    Ok(dispatched) => progress |= dispatched != 0,
-                    Err(_) => return 1,
-                }
-                if may_wait && !progress {
-                    // File poll clears the CQ eventfd. Recheck handoff after
-                    // that clear so a concurrent notification cannot be lost
-                    // before the worker enters its bounded wait.
-                    match main.schedule_remote_interrupts() {
-                        Ok(scheduled) => progress |= scheduled != 0,
-                        Err(_) => return 1,
-                    }
-                    match main.schedule_worker_node_interrupts() {
-                        Ok(scheduled) => progress |= scheduled != 0,
-                        Err(_) => return 1,
-                }
-                if may_wait
-                    && !progress
-                    && !barrier.is_pending()
-                    && !worker.has_node_interrupts()
-                    && !main.nodes.has_pending_work()
-                {
-                    let pending = files.has_pending_for_worker(main.thread_index());
-                    match pending {
-                        Ok(false) => {
-                            if files.wait_for_worker(main).is_err() {
-                                return 1;
-                            }
+            }
+            busy
+        };
+        if skip_sleep {
+            if main.poll_file_readiness().is_err() {
+                return 1;
+            }
+        } else {
+            let no_sleep = main.file_poll_no_sleep_epolls != 0;
+            if no_sleep {
+                main.file_poll_no_sleep_epolls -= 1;
+            }
+            let may_wait = matches!(file_poll, crate::file::WorkerFilePollMode::Adaptive)
+                && !progress
+                && !no_sleep
+                && !barrier.is_pending()
+                && !worker.has_node_interrupts()
+                && !main.nodes.has_pending_work();
+            match main.poll_file_readiness() {
+                Ok(dispatched) => progress |= dispatched != 0,
+                Err(_) => return 1,
+            }
+            if may_wait && !progress {
+                worker.advertise_runtime_sleep();
+            }
+            if may_wait
+                && !progress
+                && main.handoff_queue_pending_bmp.load(Ordering::SeqCst) == 0
+                && !barrier.is_pending()
+                && !worker.has_node_interrupts()
+                && !main.nodes.has_pending_work()
+            {
+                let pending = files.has_pending_for_worker(main.thread_index());
+                match pending {
+                    Ok(false) => {
+                        let waited = files.wait_for_worker(main);
+                        worker.clear_runtime_sleep();
+                        if waited.is_err() {
+                            return 1;
                         }
-                        Ok(_) => {}
-                        Err(_) => return 1,
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        worker.clear_runtime_sleep();
+                        return 1;
                     }
                 }
+            }
+            if may_wait {
+                worker.clear_runtime_sleep();
             }
         }
         if main.schedule_polling_pre_input_nodes().is_err() {
@@ -360,11 +377,15 @@ pub fn data_plane_main_loop(worker: &crate::WorkerThread) -> i32 {
             return 1;
         }
 
-        // Step 3: Drain handoff queues and run ready nodes.
-        let _ = main.run_ready_nodes();
+        // Step 3: Run destination Frames enqueued before File polling.
+        if main.run_ready_nodes().is_err() {
+            return 1;
+        }
 
         // Step 4: Run any newly-scheduled frames (pre-input + input)
-        let _ = main.run_ready_nodes();
+        if main.run_ready_nodes().is_err() {
+            return 1;
+        }
 
         // Step 5: Expire per-thread Node timers. Their scheduled frames run
         // at the next graph dispatch point, as in VPP's timing-wheel pass.

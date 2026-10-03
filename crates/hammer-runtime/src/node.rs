@@ -1841,7 +1841,10 @@ impl NodeMain {
         rows: &'static crate::node_stats::NodeCounterRows,
         thread_index: u32,
     ) {
-        assert!(rows.row(thread_index).is_some(), "thread owns a node counter row");
+        assert!(
+            rows.row(thread_index).is_some(),
+            "thread owns a node counter row"
+        );
         self.node_counters = Some((rows, thread_index));
     }
 
@@ -1873,7 +1876,12 @@ impl NodeMain {
         !self.pending_frames.borrow().is_empty()
             || !self.scheduled_nodes.borrow().is_empty()
             || self.readiness.pending.get()
-            || self.inner.borrow().interrupt_pending.iter().any(|pending| *pending)
+            || self
+                .inner
+                .borrow()
+                .interrupt_pending
+                .iter()
+                .any(|pending| *pending)
     }
 
     #[inline]

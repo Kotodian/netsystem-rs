@@ -365,7 +365,6 @@ impl DataPlaneMain {
         if self.nodes.process_runtime.is_none() {
             return Err(RuntimeError::MainProcessRuntimeUnavailable);
         }
-
         let mut declarations: Vec<(&NodeEntry, NodeId)> = Vec::new();
         for entry in entries {
             if entry.kind != NodeKind::Process {

@@ -4,7 +4,6 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
@@ -12,10 +11,12 @@ use std::sync::OnceLock;
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::pool::Pool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::{UnixListener, UnixStream};
 
 use crate::cli::{CliError, CliMain};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::AsyncFileMain;
+use crate::file::record::{File, FileFunctions};
 use crate::{DataPlaneMain, NodeRuntime};
 
 pub struct UnixCliMain {
@@ -65,7 +66,7 @@ impl UnixCliMain {
             .expect("Unix CLI initializes before accepting connections")
     }
 
-    pub fn listen(&self, runtime: &mut DataPlaneMain, path: &Path) -> Result<(), CliError> {
+    pub async fn listen(&self, path: &Path) -> Result<(), CliError> {
         crate::ensure_main_thread().expect("Unix CLI listener belongs to thread zero");
         assert!(
             self.listener.borrow().is_none(),
@@ -74,31 +75,37 @@ impl UnixCliMain {
         let directory = path
             .parent()
             .expect("CLI socket path has a parent directory");
-        std::fs::create_dir_all(directory).map_err(|source| CliError::SocketDirectory {
-            path: directory.to_owned(),
-            source,
-        })?;
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_socket() => match UnixStream::connect(path) {
-                Ok(_) => {
-                    return Err(CliError::SocketBind {
-                        path: path.to_owned(),
-                        source: io::Error::from(io::ErrorKind::AddrInUse),
-                    });
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(|source| CliError::SocketDirectory {
+                path: directory.to_owned(),
+                source,
+            })?;
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match UnixStream::connect(path).await {
+                    Ok(_) => {
+                        return Err(CliError::SocketBind {
+                            path: path.to_owned(),
+                            source: io::Error::from(io::ErrorKind::AddrInUse),
+                        });
+                    }
+                    Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
+                        tokio::fs::remove_file(path)
+                            .await
+                            .map_err(|source| CliError::SocketRemove {
+                                path: path.to_owned(),
+                                source,
+                            })?;
+                    }
+                    Err(source) => {
+                        return Err(CliError::SocketConfigure {
+                            path: path.to_owned(),
+                            source,
+                        });
+                    }
                 }
-                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
-                    std::fs::remove_file(path).map_err(|source| CliError::SocketRemove {
-                        path: path.to_owned(),
-                        source,
-                    })?;
-                }
-                Err(source) => {
-                    return Err(CliError::SocketConfigure {
-                        path: path.to_owned(),
-                        source,
-                    });
-                }
-            },
+            }
             Ok(_) => {
                 return Err(CliError::SocketBind {
                     path: path.to_owned(),
@@ -117,23 +124,28 @@ impl UnixCliMain {
             path: path.to_owned(),
             source,
         })?;
-        if let Err(source) = listener.set_nonblocking(true) {
-            if let Err(cleanup) = std::fs::remove_file(path) {
-                tracing::error!(%cleanup, "CLI socket cleanup failed after configure error");
+        let listener = match listener.into_std() {
+            Ok(listener) => listener,
+            Err(source) => {
+                if let Err(cleanup) = tokio::fs::remove_file(path).await {
+                    tracing::error!(%cleanup, "CLI socket cleanup failed after configure error");
+                }
+                return Err(CliError::SocketConfigure {
+                    path: path.to_owned(),
+                    source,
+                });
             }
-            return Err(CliError::SocketConfigure {
-                path: path.to_owned(),
-                source,
-            });
-        }
-        let index = match AsyncFileMain::add(
-            &runtime.async_file_main(),
+        };
+        let files = AsyncFileMain::global();
+        let index = match files.add(File::new(
             OwnedFd::from(listener),
             format!("CLI listener {}", path.display()),
-        ) {
+            0,
+            FileFunctions::default(),
+        )) {
             Ok(index) => index,
             Err(source) => {
-                if let Err(cleanup) = std::fs::remove_file(path) {
+                if let Err(cleanup) = tokio::fs::remove_file(path).await {
                     tracing::error!(%cleanup, "CLI socket cleanup failed after File error");
                 }
                 return Err(CliError::FileRegister {
@@ -148,7 +160,7 @@ impl UnixCliMain {
 
     pub async fn accept(&self, main: &Rc<RefCell<DataPlaneMain>>) -> RuntimeResult<()> {
         crate::ensure_main_thread()?;
-        let files = main.borrow().async_file_main();
+        let files = AsyncFileMain::global();
         let listener_index = self
             .listener
             .borrow()
@@ -156,19 +168,18 @@ impl UnixCliMain {
             .copied()
             .expect("CLI listener starts before accepting");
         let listener = files
-            .borrow()
             .file(listener_index)
             .expect("registered CLI listener remains live");
         loop {
             let descriptor = listener.accept().await?;
-            self.add_file(main, &files, descriptor).await?;
+            self.add_file(main, files, descriptor).await?;
         }
     }
 
     async fn add_file(
         &self,
         main: &Rc<RefCell<DataPlaneMain>>,
-        files: &Rc<RefCell<AsyncFileMain>>,
+        files: &'static AsyncFileMain,
         descriptor: OwnedFd,
     ) -> RuntimeResult<()> {
         self.reap_finished(main).await?;
@@ -190,7 +201,12 @@ impl UnixCliMain {
         };
 
         let file_index =
-            match AsyncFileMain::add(files, descriptor, format!("CLI connection {node:?}")) {
+            match files.add(File::new(
+                descriptor,
+                format!("CLI connection {node:?}"),
+                0,
+                FileFunctions::default(),
+            )) {
                 Ok(index) => index,
                 Err(source) => {
                     self.unused_process_nodes.borrow_mut().push(node);
@@ -201,14 +217,13 @@ impl UnixCliMain {
             file_index,
             process_node: node,
         });
-        let future = unix_cli_process(Rc::downgrade(main), Rc::clone(files), node, file_index);
+        let future = unix_cli_process(Rc::downgrade(main), files, node, file_index);
         if let Err(source) = main.borrow_mut().start_process(node, future) {
             assert!(
                 self.files.borrow_mut().remove(cli_file_index).is_some(),
                 "new CLI connection remains registered"
             );
             files
-                .borrow_mut()
                 .remove(file_index)
                 .expect("new CLI File has no in-flight operation");
             self.unused_process_nodes.borrow_mut().push(node);
@@ -231,10 +246,10 @@ impl UnixCliMain {
             let finished = main.borrow_mut().nodes.take_finished_process(node);
             let Some(finished) = finished else { continue };
             let result = finished.task.await;
-            let files = main.borrow().async_file_main();
-            let still_registered = files.borrow().file(file_index).is_some();
+            let files = AsyncFileMain::global();
+            let still_registered = files.file(file_index).is_some();
             if still_registered {
-                files.borrow_mut().remove(file_index)?;
+                files.remove(file_index)?;
             }
             main.borrow()
                 .nodes
@@ -257,16 +272,17 @@ impl UnixCliMain {
         Ok(())
     }
 
-    pub fn close_listener(&self, files: &Rc<RefCell<AsyncFileMain>>) -> RuntimeResult<()> {
+    pub async fn close_listener(&self, files: &AsyncFileMain) -> RuntimeResult<()> {
         crate::ensure_main_thread()?;
         let listener = *self.listener.borrow();
         if let Some(index) = listener {
-            files.borrow_mut().remove(index)?;
+            files.remove(index)?;
             *self.listener.borrow_mut() = None;
         }
         let path = self.socket_path.borrow().clone();
         if let Some(path) = path {
-            std::fs::remove_file(&path)
+            tokio::fs::remove_file(&path)
+                .await
                 .map_err(|source| CliError::SocketRemove { path, source })?;
             *self.socket_path.borrow_mut() = None;
         }
@@ -281,21 +297,26 @@ fn init_unix_cli(_: &mut DataPlaneMain) -> RuntimeResult<()> {
 }
 
 #[hammer_component_macros::main_loop_exit_function(name = "unix_cli_exit")]
-fn exit_unix_cli(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
+fn exit_unix_cli(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     if let Some(cli) = UNIX_CLI_MAIN.get() {
-        cli.close_listener(&runtime.async_file_main())?;
+        let runtime = main
+            .nodes
+            .process_runtime
+            .as_ref()
+            .expect("thread-zero Process runtime remains available through exit");
+        runtime.block_on(cli.close_listener(AsyncFileMain::global()))?;
     }
     Ok(())
 }
 
 async fn unix_cli_process(
     main: Weak<RefCell<DataPlaneMain>>,
-    files: Rc<RefCell<AsyncFileMain>>,
+    files: &'static AsyncFileMain,
     node: NodeId,
     file_index: u32,
 ) -> RuntimeResult<()> {
-    let result = unix_cli_command(main, &files, node, file_index).await;
-    let cleanup = files.borrow_mut().remove(file_index);
+    let result = unix_cli_command(main, files, node, file_index).await;
+    let cleanup = files.remove(file_index);
     match (result, cleanup) {
         (Err(primary), Err(cleanup)) => {
             tracing::error!(%cleanup, "CLI File cleanup failed after Process error");
@@ -309,12 +330,11 @@ async fn unix_cli_process(
 
 async fn unix_cli_command(
     main: Weak<RefCell<DataPlaneMain>>,
-    files: &Rc<RefCell<AsyncFileMain>>,
+    files: &AsyncFileMain,
     node: NodeId,
     file_index: u32,
 ) -> RuntimeResult<()> {
     let file = files
-        .borrow()
         .file(file_index)
         .expect("CLI Process File remains registered");
     let mut input = BufReader::new(file.as_ref());

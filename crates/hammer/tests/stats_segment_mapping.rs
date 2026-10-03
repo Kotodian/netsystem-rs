@@ -785,8 +785,8 @@ fn stats_segment_publishes_mem_and_system_values() {
         other => panic!("`/sys/num_worker_threads` is a gauge, got {other:?}"),
     }
 
-    // The counters and rates need at least one collect round and one window.
-    std::thread::sleep(Duration::from_secs(1));
+    // Let the VPP-style damped loop rate settle after startup's busy burst.
+    std::thread::sleep(Duration::from_secs(3));
     let first = (
         worker_columns(&fixture, "/sys/main_loop_count_per_worker"),
         worker_columns(&fixture, "/sys/loops_per_worker"),
@@ -1020,12 +1020,11 @@ fn plugin_cdylibs_present() -> bool {
 /// `/node/errors` and `/err/<node>/<error>`: the error family VPP's
 /// `vlib_register_errors` publishes (`error.c:113-200`).
 ///
-/// The counter vector exists only once a node declares errors
-/// (`error.c:135,158-159`), so a daemon with no plugins publishes neither the
-/// vector nor a single alias; once the ip and icmp plugins are loaded, the
-/// vector carries the reserved no-error column 0, one column per registered
-/// error, one row per runtime thread, and one alias per error onto exactly its
-/// own column.
+/// The counter vector exists once a node declares errors
+/// (`error.c:135,158-159`). The built-in handoff-trace node already declares
+/// one; loading ip and icmp adds plugin errors to the same vector. The vector
+/// carries the reserved no-error column 0, one column per registered error,
+/// one row per runtime thread, and one alias per error onto its own column.
 #[test]
 fn stats_segment_publishes_node_error_columns() {
     let mut daemon = HammerDaemon::start();
@@ -1035,12 +1034,14 @@ fn stats_segment_publishes_node_error_columns() {
         .names()
         .unwrap_or_else(|| panic!("{}", daemon.diagnostics("no stable directory")));
     assert!(
-        !names.iter().any(|name| name == "/node/errors"),
-        "a daemon whose nodes declare no errors publishes no error vector: {names:?}"
+        names.iter().any(|name| name == "/node/errors"),
+        "the built-in handoff-trace node declares an error vector: {names:?}"
     );
     assert!(
-        !names.iter().any(|name| name.starts_with("/err/")),
-        "a daemon whose nodes declare no errors publishes no error alias: {names:?}"
+        names
+            .iter()
+            .any(|name| name == "/err/handoff-trace/unexpected-dispatch"),
+        "the built-in handoff-trace error has an alias: {names:?}"
     );
     drop(fixture);
     drop(mapping);

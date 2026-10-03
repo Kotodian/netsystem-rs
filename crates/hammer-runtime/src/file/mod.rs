@@ -4,13 +4,11 @@
 //! This module owns descriptors, readiness dispatch, and indexed synchronous
 //! descriptor I/O. Device queues own packet and queue semantics.
 
-use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -21,7 +19,7 @@ use crate::NodeMain;
 use crate::error::{RuntimeError, RuntimeResult};
 #[cfg(target_os = "linux")]
 mod async_file;
-mod record;
+pub(crate) mod record;
 #[cfg(target_os = "linux")]
 pub use async_file::AsyncFileMain;
 pub use record::FileReadinessMode;
@@ -172,7 +170,7 @@ pub(crate) fn init_file_main(thread_count: usize) -> RuntimeResult<()> {
     if FILE_MAIN.get().is_some() {
         return Ok(());
     }
-    let file_main = FileMain::with_worker_count(thread_count)?;
+    let file_main = FileMain::new(thread_count)?;
     assert!(
         FILE_MAIN.set(file_main).is_ok(),
         "FileMain has one startup owner"
@@ -214,13 +212,8 @@ fn dispatch_file(
 }
 
 impl FileMain {
-    /// Creates a File registry with one main poller for standalone callers.
-    pub fn new() -> RuntimeResult<Self> {
-        Self::with_worker_count(1)
-    }
-
-    pub(crate) fn with_worker_count(worker_count: usize) -> RuntimeResult<Self> {
-        let pollers = (0..worker_count)
+    fn new(thread_count: usize) -> RuntimeResult<Self> {
+        let pollers = (1..thread_count)
             .map(|_| Poller::new().map(UnsafeCell::new))
             .collect::<RuntimeResult<Vec<_>>>()?;
         Ok(Self {
@@ -236,7 +229,10 @@ impl FileMain {
 
     #[allow(clippy::mut_from_ref)]
     fn poller_mut(&self, thread_index: u32) -> RuntimeResult<&mut Poller> {
-        if thread_index != 0 && crate::thread_main::THREAD_MAIN.get().is_some() {
+        if thread_index == 0 {
+            return Err(RuntimeError::DataWorkerIdUnavailable { thread_index });
+        }
+        if crate::thread_main::THREAD_MAIN.get().is_some() {
             let worker = crate::DataWorkerId::new(thread_index - 1);
             if !crate::thread_main::is_current_worker(worker) {
                 crate::ensure_main_thread()
@@ -246,7 +242,7 @@ impl FileMain {
         }
         let poller =
             self.pollers
-                .get(thread_index as usize)
+                .get(thread_index as usize - 1)
                 .ok_or_else(|| RuntimeError::Lifecycle {
                     stage: "FileMain".to_owned(),
                     message: format!("polling thread {thread_index} is not configured"),
@@ -555,31 +551,6 @@ impl FileMain {
         Ok(previous)
     }
 
-    /// Registers a bound Unix listener with read interest, mirroring VPP's
-    /// `clib_file_main_add_socket`. Pending connections are pulled through
-    /// [`Self::accept`].
-    pub fn add_listener(
-        &self,
-        listener: UnixListener,
-        description: impl Into<String>,
-        private_data: u64,
-        functions: FileFunctions,
-    ) -> RuntimeResult<u32> {
-        listener
-            .set_nonblocking(true)
-            .map_err(|source| RuntimeError::FilePollerIo {
-                operation: "set Binary API listener nonblocking",
-                source,
-            })?;
-        let index = self.add(File::new(
-            OwnedFd::from(listener),
-            description.into(),
-            private_data,
-            functions,
-        ))?;
-        Ok(index)
-    }
-
     /// Accepts one pending connection from a registered listener, or returns
     /// `None` when no connection is pending. The accepted socket is
     /// registered with read interest. The listener registration is untouched:
@@ -594,6 +565,7 @@ impl FileMain {
         let file = self
             .file_ptr(listener)
             .ok_or(RuntimeError::FileIndexInvalid { index: listener })?;
+        let thread_index = unsafe { (*file).polling_thread_index() };
         let duplicated = unsafe { duplicate_file_descriptor(&*file) }.map_err(|source| {
             RuntimeError::FilePollerIo {
                 operation: "duplicate listener for accept",
@@ -638,12 +610,14 @@ impl FileMain {
                 return Ok(None);
             }
         }
-        let index = self.add(File::new(
+        let mut accepted_file = File::new(
             OwnedFd::from(stream),
             description.into(),
             private_data,
             functions,
-        ))?;
+        );
+        accepted_file.set_polling_thread_index(thread_index);
+        let index = self.add(accepted_file)?;
         Ok(Some(index))
     }
 
@@ -715,11 +689,6 @@ impl FileMain {
             io::ErrorKind::WouldBlock => Ok(FileIoStatus::WouldBlock),
             _ => Err(RuntimeError::FileWrite { source }.into()),
         }
-    }
-
-    /// Performs one nonblocking readiness poll and dispatches main-thread callbacks.
-    pub fn poll(&self, graph: &mut NodeMain) -> RuntimeResult<usize> {
-        self.poll_for_worker(0, graph)
     }
 
     /// Performs one nonblocking readiness poll for the selected owner thread.
@@ -804,7 +773,7 @@ impl FileMain {
 pub(crate) enum FileMode {
     Sync,
     #[cfg(target_os = "linux")]
-    Async(Rc<RefCell<AsyncFileMain>>),
+    Async,
 }
 
 pub(super) const POLL_BATCH_SIZE: usize = 16;

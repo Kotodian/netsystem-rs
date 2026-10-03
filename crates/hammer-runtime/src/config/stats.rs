@@ -7,7 +7,6 @@
 use std::io::{self, IoSlice};
 use std::mem::size_of;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
@@ -21,10 +20,18 @@ use hammer_stats::{
     Collector, DirectoryEntry, DirectoryIndex, SimpleCounter, StatsMain, Timestamp,
 };
 use socket2::{Domain, MsgHdr, SockAddr, SockRef, Socket, Type};
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
+#[cfg(target_os = "linux")]
+use tokio::io::unix::AsyncFd;
+use tokio::net::UnixStream;
 
 use crate::error::RuntimeResult;
-use crate::file::FILE_MAIN;
-use crate::{DataPlaneMain, File, RuntimeError, ThreadMain};
+#[cfg(target_os = "linux")]
+use crate::file::AsyncFileMain;
+#[cfg(target_os = "linux")]
+use crate::file::record::{File, FileFunctions};
+use crate::{DataPlaneMain, NodeMain, RuntimeError, ThreadMain};
 
 pub const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_STATS_SEGMENT_SIZE: usize = 32 << 20;
@@ -188,7 +195,7 @@ fn configure_stats(config: StatsConfig) -> RuntimeResult<()> {
 }
 
 #[hammer_component_macros::init_function(name = "stats_main_init")]
-fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
+fn init_stats_main(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     let config = stats_config();
     // Establishment order follows `vlib_stats_init`: create the segment and its
     // owner, fill the fixed slots, run the registration image (entry
@@ -206,20 +213,38 @@ fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
     Sys::bootstrap(&stats_main.segment)?;
     crate::init::run_stats_registrations(&mut stats_main)?;
     stats_main.publish()?;
-    let listener =
-        bind_listener(&config.socket_name).map_err(|source| RuntimeError::StatsListenerBind {
+    let runtime = main
+        .nodes
+        .process_runtime
+        .as_ref()
+        .expect("thread-zero Process runtime initializes before stats");
+    let listener = runtime
+        .block_on(bind_listener(&config.socket_name))
+        .map_err(|source| RuntimeError::StatsListenerBind {
             path: config.socket_name.clone(),
             source,
         })?;
-    FILE_MAIN
-        .get()
-        .expect("FileMain is initialized before stats startup")
-        .add(File::new(
+    #[cfg(target_os = "linux")]
+    {
+        let files = AsyncFileMain::global();
+        files.add(File::new(
             OwnedFd::from(listener),
             format!("stats segment listener {}", config.socket_name.display()),
             0,
-            stats_segment_listener::file_functions::<crate::NodeMain, crate::RuntimeError>(),
+            FileFunctions {
+                read: Some(stats_socket_accept_ready),
+                write: None,
+                error: None,
+            },
         ))?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        drop(listener);
+        return Err(RuntimeError::FilePollerOperationUnsupported {
+            operation: "thread-zero async stats listener",
+        });
+    }
     Ok(())
 }
 
@@ -326,45 +351,20 @@ fn register_worker_main_loop(stats_main: &mut StatsMain) -> RuntimeResult<()> {
 }
 
 #[hammer_component_macros::main_loop_exit_function]
-fn exit_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
+fn exit_stats_main(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     // `stats_segment_socket_exit` unlinks the listener path and does not fail
     // shutdown: a path that survives is reclaimed by the next startup bind.
-    if let Err(source) = std::fs::remove_file(&stats_config().socket_name)
+    let runtime = main
+        .nodes
+        .process_runtime
+        .as_ref()
+        .expect("thread-zero Process runtime remains available through exit");
+    if let Err(source) = runtime.block_on(tokio::fs::remove_file(&stats_config().socket_name))
         && source.kind() != io::ErrorKind::NotFound
     {
         tracing::warn!(%source, "failed to unlink the stats segment listener path");
     }
     Ok(())
-}
-
-/// File callbacks of the registered stats segment listener.
-///
-/// The listener only serves the descriptor handoff, so it has no write
-/// callback, like VPP's `stats_socket_accept_ready`.
-#[hammer_component_macros::file]
-mod stats_segment_listener {
-    fn read<Context, Error>(
-        _: &mut Context,
-        file: &mut crate::__private::File<Context, Error>,
-    ) -> Result<(), Error>
-    where
-        Error: From<crate::RuntimeError>,
-    {
-        super::handoff_segment(file.fd()).map_err(Into::into)
-    }
-
-    fn error<Context, Error>(
-        _: &mut Context,
-        _: &mut crate::__private::File<Context, Error>,
-    ) -> Result<(), Error>
-    where
-        Error: From<crate::RuntimeError>,
-    {
-        Err(crate::RuntimeError::FileAccept {
-            source: std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
-        }
-        .into())
-    }
 }
 
 /// Listener backlog depth, matching `clib_socket_init`'s `listen(fd, 5)`.
@@ -374,7 +374,7 @@ const SOCKET_BACKLOG: i32 = 5;
 /// `clib_socket_init`: Linux listeners keep the stats seqpacket message
 /// boundary, a listener path whose owning process is gone is reclaimed, while a
 /// live listener or an existing non-socket path is an error.
-fn bind_listener(socket_name: &Path) -> io::Result<Socket> {
+async fn bind_listener(socket_name: &Path) -> io::Result<Socket> {
     #[cfg(target_os = "linux")]
     let socket_type = Type::SEQPACKET;
     #[cfg(not(target_os = "linux"))]
@@ -387,10 +387,10 @@ fn bind_listener(socket_name: &Path) -> io::Result<Socket> {
     match bind_group_writable(&listener, &address) {
         Ok(()) => {}
         Err(bind_error) if bind_error.kind() == io::ErrorKind::AddrInUse => {
-            match UnixStream::connect(socket_name) {
+            match UnixStream::connect(socket_name).await {
                 Ok(_) => return Err(bind_error),
                 Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
-                    std::fs::remove_file(socket_name)?;
+                    tokio::fs::remove_file(socket_name).await?;
                     bind_group_writable(&listener, &address)?;
                 }
                 Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -416,12 +416,15 @@ fn bind_group_writable(listener: &Socket, address: &SockAddr) -> io::Result<()> 
     result
 }
 
-/// Accepts one pending stats reader and hands it the segment descriptor, like
-/// VPP's `stats_socket_accept_ready`.
-fn handoff_segment(listener_fd: RawFd) -> RuntimeResult<()> {
-    // SAFETY: the callback passes the descriptor of the registered listener;
-    // the reference below only borrows it.
-    let listener_fd = unsafe { BorrowedFd::borrow_raw(listener_fd) };
+/// VPP `stats_socket_accept_ready` in `vlib/stats/init.c`: accept one reader,
+/// send the segment descriptor, and leave readiness scheduling to AsyncFileMain.
+#[cfg(target_os = "linux")]
+fn stats_socket_accept_ready<Owner>(
+    _: &mut NodeMain,
+    file: &File<NodeMain, RuntimeError, Owner>,
+) -> RuntimeResult<()> {
+    // SAFETY: AsyncFileMain owns this registered listener for the callback.
+    let listener_fd = unsafe { BorrowedFd::borrow_raw(file.fd()) };
     let listener = SockRef::from(&listener_fd);
     let (peer, _) = loop {
         match listener.accept() {
@@ -431,27 +434,21 @@ fn handoff_segment(listener_fd: RawFd) -> RuntimeResult<()> {
             Err(source) => return Err(RuntimeError::FileAccept { source }),
         }
     };
-    // `clib_socket_accept` makes the accepted client non-blocking.
     peer.set_nonblocking(true)
         .map_err(|source| RuntimeError::FileAccept { source })?;
-    // Hammer does not ignore SIGPIPE process-wide like `unix_main_signal_init`,
-    // so a macOS reader that vanished before the handoff must not kill the
-    // daemon.
-    #[cfg(target_os = "macos")]
-    if let Err(source) = peer.set_nosigpipe(true) {
-        if source.kind() == io::ErrorKind::InvalidInput {
-            // macOS rejects the option once the reader closed before the
-            // accept; the connection cannot be served.
-            return Ok(());
-        }
-        return Err(RuntimeError::FileAccept { source });
-    }
     let segment_fd = StatsMain::global()?.segment.segment_fd();
-    // `stats_socket_accept_ready` reports a failed handoff and closes the
-    // connection; the listener stays registered.
-    if let Err(source) = send_segment_fd(&peer, segment_fd) {
-        tracing::warn!(%source, "failed to hand the stats segment descriptor to a reader");
-    }
+    let peer = AsyncFd::new(peer).map_err(|source| RuntimeError::FilePollerIo {
+        operation: "register stats reader with Tokio",
+        source,
+    })?;
+    tokio::task::spawn_local(async move {
+        if let Err(source) = peer
+            .async_io(Interest::WRITABLE, |socket| send_segment_fd(socket, segment_fd))
+            .await
+        {
+            tracing::warn!(%source, "failed to hand the stats segment descriptor to a reader");
+        }
+    });
     Ok(())
 }
 

@@ -39,6 +39,7 @@ socket2 = { workspace = true, features = ["all"] }
 libloading = { workspace = true }
 object = { workspace = true }
 rand = { version = "0.9", default-features = false, features = ["small_rng"] }
+wide = "1.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 core_affinity = { workspace = true }

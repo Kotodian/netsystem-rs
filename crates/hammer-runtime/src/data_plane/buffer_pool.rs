@@ -85,11 +85,10 @@ impl DataPlaneMain {
             .build()
             .map_err(|source| RuntimeError::MainRuntime { source })?;
         #[cfg(target_os = "linux")]
-        let file_main = {
+        {
             let runtime_guard = process_runtime.enter();
-            let file_main = crate::file::AsyncFileMain::init()?;
+            crate::file::AsyncFileMain::init()?;
             drop(runtime_guard);
-            file_main
         };
         #[cfg(not(target_os = "linux"))]
         return Err(RuntimeError::FilePollerOperationUnsupported {
@@ -100,7 +99,7 @@ impl DataPlaneMain {
             .and_then(crate::WorkerThread::numa_node)
             .unwrap_or(0);
         #[cfg(target_os = "linux")]
-        let main_file_mode = FileMode::Async(file_main);
+        let main_file_mode = FileMode::Async;
         #[cfg(not(target_os = "linux"))]
         let main_file_mode = FileMode::Sync;
         let mut main = Self::from_config_with_file(
@@ -141,7 +140,9 @@ impl DataPlaneMain {
             nodes: NodeMain::default(),
             current_node: Cell::new(None),
             node_error_stats_entry_index: Cell::new(None),
-            handoff: None,
+            handoff_queue_mains: RefCell::new(Vec::new()),
+            handoff_queue_pending_bmp: Arc::new(AtomicU64::new(0)),
+            file_poll_no_sleep_epolls: 0,
             trace_main: TraceMain::default(),
             handoff_trace_node: NodeId::new(0),
             main_loop_start_ticks: 0,

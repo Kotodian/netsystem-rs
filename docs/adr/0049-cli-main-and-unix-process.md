@@ -186,23 +186,23 @@ impl UnixCliMain {
     pub fn init();
     #[inline]
     pub fn global() -> &'static Self;
-    pub fn listen(&self, runtime: &mut DataPlaneMain, path: &Path) -> Result<(), CliError>;
+    pub async fn listen(&self, path: &Path) -> Result<(), CliError>;
     pub async fn accept(&self, main: &Rc<RefCell<DataPlaneMain>>) -> RuntimeResult<()>;
     async fn add_file(
         &self,
         main: &Rc<RefCell<DataPlaneMain>>,
-        files: &Rc<RefCell<AsyncFileMain>>,
+        files: &'static AsyncFileMain,
         descriptor: OwnedFd,
     ) -> RuntimeResult<()>;
     async fn reap_finished(&self, main: &Rc<RefCell<DataPlaneMain>>) -> RuntimeResult<()>;
-    pub fn close_listener(&self, files: &Rc<RefCell<AsyncFileMain>>) -> RuntimeResult<()>;
+    pub async fn close_listener(&self, files: &AsyncFileMain) -> RuntimeResult<()>;
 }
 
 #[init_function(name = "unix_cli_init")]
 fn init_unix_cli(_: &mut DataPlaneMain) -> RuntimeResult<()>;
 
 #[main_loop_exit_function(name = "unix_cli_exit")]
-fn exit_unix_cli(runtime: &mut DataPlaneMain) -> RuntimeResult<()>;
+fn exit_unix_cli(main: &mut DataPlaneMain) -> RuntimeResult<()>;
 ```
 
 宏在命令结果返回时调用 `Display` formatter，产生完整文本。非交互
@@ -591,9 +591,10 @@ socket = "/run/hammer/cli.sock"
 
 listener 在 thread 0 的 Process 启动阶段绑定；路径已有活动 listener
 时拒绝覆盖，只有确认现存 Unix socket 已拒绝连接时才清除残留路径。
-绑定成功后的配置或 File 注册失败也清除本次创建的路径；正常退出时
-注册的 `unix_cli_exit` 在 main-loop exit 阶段移除本进程的 listener
-和路径；即使主循环先报错，退出回调仍运行。VPP Unix CLI listener 的创建
+目录创建、路径检查、连接探测及 unlink 使用 Tokio 的异步接口。
+绑定成功后的 File 注册失败也清除本次创建的路径；正常退出时
+daemon 在异步主线程任务中移除 listener 和路径，`unix_cli_exit` 则在
+主循环提前出错时驱动同一个异步清理方法。VPP Unix CLI listener 的创建
 与 File 登记见 `vlib/unix/cli.c:3164-3205`。
 
 ## 6. hammerctl 与实施门槛

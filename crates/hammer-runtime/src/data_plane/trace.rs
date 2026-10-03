@@ -260,3 +260,157 @@ impl DataPlaneMain {
         preferred_frame_batch_width(self.simd_bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::NodeDescriptor;
+    use crate::trace::HandoffTraceNode;
+    use hammer_core::data_plane::Frame;
+    use hammer_core::data_plane::NodeKind;
+
+    #[repr(C)]
+    #[derive(KnownLayout, FromBytes, IntoBytes, Immutable)]
+    struct DestinationTrace {
+        packet_id: u32,
+    }
+
+    fn trace_destination(_: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+        frame.len()
+    }
+
+    #[test]
+    fn add_trace_records_cross_worker_handoff_without_changing_source_trace() {
+        if !crate::run_buffer_test_process(
+            "data_plane::main::trace::tests::add_trace_records_cross_worker_handoff_without_changing_source_trace",
+        ) {
+            return;
+        }
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                3,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
+
+        let mut source = DataPlaneMain::new(DataPlaneBufferConfig {
+            thread_index: 1,
+            ..Default::default()
+        });
+        let mut destination = DataPlaneMain::new(DataPlaneBufferConfig {
+            thread_index: 2,
+            ..Default::default()
+        });
+        let source_next = source
+            .nodes()
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    trace_destination,
+                    NodeRuntime::empty(),
+                    Some(NodeRegistration::next("source-next", 0)),
+                    &[],
+                    None,
+                    false,
+                ),
+            )
+            .unwrap();
+        let source_node = source
+            .nodes()
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    trace_destination,
+                    NodeRuntime::empty(),
+                    Some(NodeRegistration::next("source-trace", 1)),
+                    &[source_next],
+                    None,
+                    true,
+                ),
+            )
+            .unwrap();
+        let destination_node = destination
+            .nodes()
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    trace_destination,
+                    NodeRuntime::empty(),
+                    Some(NodeRegistration::next("destination-trace", 0)),
+                    &[],
+                    None,
+                    true,
+                ),
+            )
+            .unwrap();
+        destination.handoff_trace_node = destination
+            .nodes()
+            .try_register_internal_with_next_names(HandoffTraceNode, &["destination-trace"])
+            .unwrap();
+        destination.nodes().resolve_named_next_nodes().unwrap();
+        source.trace_main.trace_enable = true;
+        destination.trace_main.trace_enable = true;
+
+        let mut indices = [0u32; 1];
+        assert_eq!(source.buffer_alloc(&mut indices), 1);
+        let packet = indices[0];
+        let mut head = packet;
+        assert_eq!(source.buffer_add_data(&mut head, b"handoff"), 7);
+        assert_eq!(head, packet);
+        let source_runtime = source.nodes().node_runtime_data(source_node).unwrap();
+        assert!(source.trace_buffer(&source_runtime, 0, packet, false));
+        let source_handle = source.buffer(packet).trace_handle().unwrap();
+        let source_index = source_handle & TRACE_INDEX_LIMIT;
+        let packet_address = source.buffer(packet).current().as_ptr();
+
+        let destination_runtime = destination
+            .nodes()
+            .node_runtime_data(destination_node)
+            .unwrap();
+        destination
+            .add_trace::<DestinationTrace>(&destination_runtime, packet)
+            .unwrap()
+            .packet_id = packet;
+
+        let destination_handle = destination.buffer(packet).trace_handle().unwrap();
+        assert_eq!(destination_handle >> TRACE_THREAD_SHIFT, 2);
+        assert_eq!(
+            destination.buffer(packet).current().as_ptr(),
+            packet_address
+        );
+        assert_eq!(destination.buffer(packet).current(), b"handoff");
+        assert_eq!(
+            source
+                .trace_main
+                .trace_buffer_pool
+                .get(source_index)
+                .unwrap()
+                .len(),
+            0,
+        );
+        let destination_trace = destination
+            .trace_main
+            .trace_buffer_pool
+            .get(destination_handle & TRACE_INDEX_LIMIT)
+            .unwrap();
+        assert_eq!(destination_trace.len(), 4);
+        assert_eq!(
+            destination_trace[0].node_index,
+            destination.handoff_trace_node.slot(),
+        );
+        let (handoff, _) =
+            HandoffTrace::ref_from_prefix(destination_trace[1..2].as_bytes()).unwrap();
+        assert_eq!(handoff.prev_thread, 1);
+        assert_eq!(handoff.prev_trace_index, source_index);
+        assert_eq!(destination_trace[2].node_index, destination_node.slot());
+        let (record, _) =
+            DestinationTrace::ref_from_prefix(destination_trace[3..4].as_bytes()).unwrap();
+        assert_eq!(record.packet_id, packet);
+        destination.buffer_free(&indices);
+        crate::finish_buffer_test_process();
+    }
+}

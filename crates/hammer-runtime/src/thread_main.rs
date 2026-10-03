@@ -1,6 +1,9 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicU64;
-use std::{sync::OnceLock, thread::ThreadId};
+use std::{
+    sync::{Arc, OnceLock},
+    thread::ThreadId,
+};
 
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
@@ -10,6 +13,7 @@ use crate::config::worker::WorkerScheduler;
 #[cfg(target_os = "linux")]
 use crate::config::{CpuConfig, WorkerNuma};
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::handoff::HandoffQueueMain;
 use crate::worker_thread::WorkerThread;
 
 static MAIN_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
@@ -365,8 +369,8 @@ impl ThreadMain {
 
     pub fn thread_by_index(&self, index: u32) -> Option<&WorkerThread> {
         self.worker_threads
-            .iter()
-            .find(|thread| thread.thread_index() == index)
+            .get(index as usize)
+            .filter(|thread| thread.thread_index() == index)
     }
 
     pub(crate) fn data_workers(&self) -> impl Iterator<Item = &WorkerThread> {
@@ -390,9 +394,39 @@ impl ThreadMain {
         *worker_mains = mains;
     }
 
+    /// Mirror one queue directory entry while workers are stopped. Before
+    /// launch the main's directory is copied by DataPlaneMain::new_worker.
+    pub(crate) fn set_handoff_queue(&self, queue: Arc<HandoffQueueMain>) {
+        crate::ensure_main_thread().expect("handoff queue directory belongs to thread zero");
+        let mains = unsafe { &*self.worker_mains.get() };
+        if !mains.is_empty() {
+            crate::WorkerThread::__assert_held();
+        }
+        for worker in mains {
+            // SAFETY: the main thread holds the Worker Barrier, so no Data
+            // Worker can borrow its main until directory replacement ends.
+            let main = unsafe { &mut **worker.get() };
+            let directory = main.handoff_queue_mains.get_mut();
+            let index = queue.index as usize;
+            if index == directory.len() {
+                directory.push(Arc::clone(&queue));
+            } else {
+                assert!(
+                    index < directory.len(),
+                    "handoff queue indices are contiguous"
+                );
+                directory[index] = Arc::clone(&queue);
+            }
+        }
+    }
+
     /// # Safety
     /// The caller is this Worker and holds no other borrow of its main. Its
     /// preceding main borrow ended before the latest barrier check.
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "only the owning Worker borrows its main"
+    )]
     pub(crate) unsafe fn worker_main_on_worker(
         &self,
         worker: &WorkerThread,
@@ -413,6 +447,7 @@ impl ThreadMain {
     /// # Safety
     /// Thread zero holds WorkerBarrier, this Worker has released its mutable
     /// borrow, and no other borrow of this main overlaps the returned one.
+    #[expect(clippy::mut_from_ref, reason = "the barrier excludes Worker borrows")]
     pub(crate) unsafe fn worker_main_at_barrier(
         &self,
         worker: &WorkerThread,

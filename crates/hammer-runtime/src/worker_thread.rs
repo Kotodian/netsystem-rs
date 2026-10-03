@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::panic::Location;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,9 @@ pub struct WorkerThread {
     #[cfg(target_os = "linux")]
     file_wake: OnceLock<OwnedFd>,
     node_interrupts: UnsafeCell<Option<Box<[AtomicU64]>>>,
+    handoff_pending_bmp: Arc<AtomicU64>,
+    thread_sleeps: AtomicBool,
+    wakeup_pending: AtomicBool,
     cacheline2: CacheLineAlignMark,
     main_loop_count: AtomicU64,
     cacheline3: CacheLineAlignMark,
@@ -508,6 +511,9 @@ impl WorkerThread {
             #[cfg(target_os = "linux")]
             file_wake: OnceLock::new(),
             node_interrupts: UnsafeCell::new(None),
+            handoff_pending_bmp: Arc::new(AtomicU64::new(0)),
+            thread_sleeps: AtomicBool::new(false),
+            wakeup_pending: AtomicBool::new(false),
             cacheline2: CacheLineAlignMark,
             main_loop_count: AtomicU64::new(0),
             cacheline3: CacheLineAlignMark,
@@ -594,7 +600,10 @@ impl WorkerThread {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn install_file_wake(&self, wake: OwnedFd) {
-        assert!(self.file_wake.set(wake).is_ok(), "worker File wake installs once");
+        assert!(
+            self.file_wake.set(wake).is_ok(),
+            "worker File wake installs once"
+        );
     }
 
     #[inline]
@@ -643,6 +652,35 @@ impl WorkerThread {
                 .expect("ready WorkerThread has a launch handle");
             thread.thread().unpark();
         }
+    }
+
+    #[inline]
+    pub(crate) fn handoff_pending_bmp(&self) -> &Arc<AtomicU64> {
+        &self.handoff_pending_bmp
+    }
+
+    /// VPP vlib_thread_wakeup: only a worker that advertised sleep needs a
+    /// File wake. The pending bit coalesces concurrent producer requests.
+    #[inline]
+    pub(crate) fn wake_for_runtime(&self) {
+        assert_ne!(self.thread_index, 0, "handoff targets only Data Workers");
+        if !self.thread_sleeps.load(Ordering::SeqCst)
+            || self.wakeup_pending.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        self.wake_for_barrier();
+    }
+
+    #[inline]
+    pub(crate) fn advertise_runtime_sleep(&self) {
+        self.thread_sleeps.store(true, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub(crate) fn clear_runtime_sleep(&self) {
+        self.thread_sleeps.store(false, Ordering::Relaxed);
+        self.wakeup_pending.store(false, Ordering::Relaxed);
     }
 
     #[inline]
