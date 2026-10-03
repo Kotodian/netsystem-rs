@@ -1,9 +1,8 @@
 # ADR-0052: VLIB-style Worker Handoff Queues
 
-Status: proposed. The handoff design is not implemented. The local
-`third_party/wide` fork contains compare-mask and masked load/store entry
-points; complete native unaligned vector load/store and handoff callers are
-still required.
+Status: implementation in progress for issue #376. The local
+`third_party/wide` fork supplies the compare-mask and masked load/store entry
+points. Final review and verification gates remain pending.
 
 ## Scope and source
 
@@ -33,12 +32,11 @@ transfers ownership of Buffer **indices**, not a copy of packet bytes.
 | `src/vnet/ip/reass/ip4_full_reass.c:1242-1279,1604-1616,1886-2038` | Reassembly sets owner thread in Buffer metadata and sends to a distinct handoff Node for each entry path; each queue targets its corresponding reassembly Node. |
 | `src/vnet/tcp/tcp_inlines.h:282-367`, `src/vnet/tcp/tcp_input.c:2729-2745,2780-2891` | TCP lookup reports wrong-thread and TCP input drops it. VPP has no TCP-input handoff Node. |
 
-Current Hammer evidence: `crates/hammer-runtime/src/handoff.rs` owns a
-different per-worker `ArrayQueue`; `src/data_plane/handoff.rs` enqueues
-one index/slot at a time and builds a Frame later; `src/main_loop.rs:275-367`
-uses remote Node interrupts and drains after File readiness. TCP input and IP
-reassembly call these old APIs. The target is not a SIMD patch on that design:
-those containers and callers must be replaced together.
+Pre-migration Hammer evidence: `crates/hammer-runtime/src/handoff.rs` owned a
+per-worker `ArrayQueue`; `src/data_plane/handoff.rs` enqueued one index/slot
+at a time and built a Frame later; `src/main_loop.rs` used remote Node
+interrupts and drained after File readiness. TCP input and IP reassembly
+called those old APIs. Issue #376 replaces the containers and callers together.
 
 ## Ownership and layout
 
@@ -46,8 +44,10 @@ those containers and callers must be replaced together.
 it belongs to each `vlib_main_t`. There is no `HandoffMain`, central queue
 registry or handoff scheduler Node. Entry `i` has the same identity in all
 thread mains and may target the same Node as another entry. One entry owns
-`thread_count` MPSC rings, indexed by **destination runtime thread index**,
-including thread 0. All mains share the registered entry and rings; each main
+`worker_count` MPSC rings, indexed by **destination Data Worker slot**
+(`thread_index - 1`). Thread 0 does not execute the packet graph or consume
+handoff packets, and auxiliary threads have no ring.
+All mains share the registered entry and rings; each main
 owns its own pending bitmap. The only fixed cross-thread reference in
 `ThreadMain` is to those bitmap atomics, so a producer never borrows another
 thread's mutable `DataPlaneMain`.
@@ -269,8 +269,9 @@ ISA choice in that loop.
 
 The queue directory is populated after a target NodeId exists. This may
 occur before workers start or under the existing Worker Barrier. The main
-thread first constructs **all** rings, then appends one `Arc<HandoffQueueMain>`
-to thread zero and every Worker main in the same index position. VPP copies
+thread first constructs **all Data Worker** rings, then appends one
+`Arc<HandoffQueueMain>` to thread zero's directory and every Worker main in
+the same index position. VPP copies
 the `handoff_queue_mains` vector pointer to every `vlib_main_t` at
 `handoff.c:736-749`; Hammer copies the Arc entry because Rust must also
 retain its lifetime. `ThreadMain::worker_main_at_barrier` is the existing
@@ -326,7 +327,7 @@ impl DataPlaneMain {
         let index = self.handoff_queue_mains.borrow().len() as u32;
         let queue_bit = if index < 64 { 1u64 << index } else { u64::MAX };
         let size = queue_size as usize / 32;
-        let queues_by_thread = (0..ThreadMain::global().thread_count())
+        let queues_by_thread = (0..ThreadMain::global().worker_count())
             .map(|_| HandoffQueue::new(size, limit))
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -361,11 +362,14 @@ thread zero's list. During live graph mutation the existing main control
 scope stops Worker dispatch before any list changes; no handoff-specific
 barrier assertion or second synchronization object is introduced. VPP's
 `vlib_handoff_queue_resize` returns `clib_error_t` for an invalid index,
-size or capacity below pending slots (`handoff.c:649-677`). This ADR does
-not add Hammer handoff Error variants. The runtime copy/replace operation
-below is internal and requires its control caller to validate those inputs
-while the Worker Barrier is held; failed validation leaves the old directory
-unchanged before calling it.
+size or capacity below pending slots (`handoff.c:649-677`); both its CLI and
+soft-rss callers propagate the error (`handoff_cli.c:218`,
+`plugins/soft-rss/main.c:151`). Hammer's runtime resize entry returns the
+corresponding typed `RuntimeError` variants. It checks the published slot
+prefix on each ring before replacing any directory entry; rejected resize
+leaves every old ring and directory entry unchanged. A producer reservation
+still unpublished when the Worker Barrier has stopped workers violates the
+control-scope invariant rather than creating a fourth recoverable category.
 
 ```rust
 // VPP handoff.c:599-632. Called only while the Worker Barrier stops queue use.
@@ -404,17 +408,21 @@ fn handoff_queue_copy_pending_slots(
 
 // VPP handoff.c:576-695. Called on main under the Worker Barrier.
 impl DataPlaneMain {
-    fn handoff_queue_resize(&mut self, index: u32, queue_size: u32) {
-        ensure_main_thread_with_barrier()
-            .expect("queue resize requires the main control scope");
-        let old = self.handoff_queue_mains.get_mut()
-            .get(index as usize)
-            .expect("control caller validated handoff queue index");
-        assert!(queue_size >= 32 && queue_size.is_power_of_two(),
-            "control caller validated handoff queue size");
+    fn handoff_queue_resize(&mut self, index: u32, queue_size: u32) -> RuntimeResult<()> {
+        ensure_main_thread_with_barrier()?;
+        let directory = self.handoff_queue_mains.get_mut();
+        let old = directory.get(index as usize)
+            .ok_or(RuntimeError::HandoffQueueIndexInvalid {
+                index, queue_count: directory.len(),
+            })?;
+        if queue_size < 32 || !queue_size.is_power_of_two() {
+            return Err(RuntimeError::HandoffQueueSizeInvalid {
+                size: queue_size, minimum: 32,
+            });
+        }
         let size = queue_size as usize / 32;
         let mut replacement = Vec::with_capacity(old.queues_by_thread.len());
-        for old_queue in old.queues_by_thread.iter() {
+        for (thread_index, old_queue) in old.queues_by_thread.iter().enumerate() {
             let head = old_queue.head.load(Ordering::Relaxed);
             let tail = old_queue.tail.load(Ordering::Relaxed);
             let mask = old_queue.size - 1;
@@ -426,7 +434,12 @@ impl DataPlaneMain {
                 .count();
             assert_eq!(pending as u64, tail - head,
                 "barrier cannot interrupt a producer's reservation");
-            assert!(pending <= size, "control caller validated pending slot capacity");
+            if pending > size {
+                return Err(RuntimeError::HandoffQueueCapacityInsufficient {
+                    index, thread_index: thread_index as u32,
+                    pending: pending * 32, size: queue_size,
+                });
+            }
             let mut next = HandoffQueue::new(size, old_queue.dequeue_vector_limit);
             handoff_queue_copy_pending_slots(old, old_queue, &mut next, pending);
             replacement.push(next);
@@ -437,13 +450,14 @@ impl DataPlaneMain {
         });
         let threads = ThreadMain::global();
         let worker_mains = unsafe { &*threads.worker_mains.get() };
-        self.handoff_queue_mains.get_mut()[index as usize] = Arc::clone(&next);
+        directory[index as usize] = Arc::clone(&next);
         for worker in worker_mains {
             let worker_main = unsafe { &mut **worker.get() };
             worker_main.handoff_queue_mains.get_mut()[index as usize] =
                 Arc::clone(&next);
         }
         // The final old Arc drops its rings while Worker dispatch is stopped.
+        Ok(())
     }
 }
 ```
@@ -463,7 +477,7 @@ accepted; the queue itself frees rejected Buffer indices. Empty input returns
 zero without indexing `thread_indices[0]`.
 
 The following private functions and four selected free functions are
-fragments of **one** `handoff_arch` module. The proposed module attribute
+fragments of **one** `handoff_arch` module. The module attribute
 clones that module for baseline, v3 and v4, substitutes only the ISA-specific
 `slot_copy` import, and registers only the named four entries.
 Private functions have ordinary `#[inline]`, not `#[march_function]`.
@@ -490,8 +504,8 @@ function pointer, callback, or selector field belongs to `DataPlaneMain`,
 `WorkerThread`, or an individual handoff queue.** The existing Node dispatch
 function is a separate graph contract and is not changed by this ADR.
 `slot_copy` is a direct import in each generated module, not a per-slot
-function-pointer dispatch. This module attribute is a proposed
-API, not an existing macro or compilable declaration today.
+function-pointer dispatch. Issue #376 implements this macro in
+`hammer-component-macros`.
 
 ```rust
 // hammer-runtime::handoff; VPP buffer_funcs.c:391-415, buffer_node.h:441-475.
@@ -523,11 +537,10 @@ fn buffer_enqueue_to_thread_with_aux(
 
 The four same-named functions inside `handoff_arch` below are the selected
 implementation bodies, not these public facades. The global owner and three
-facades are proposed API: the existing `DataPlaneMain` cannot own them
+facades are part of the approved issue #376 API: `DataPlaneMain` does not own them
 without violating VPP's placement, while direct calls to ISA-specific bodies
-would bypass runtime CPU selection. They require explicit approval before
-implementation. The owner is initialized once in the existing runtime init
-phase; it owns no packet or queue state.
+would bypass runtime CPU selection. The owner is initialized once in the
+existing runtime init phase; it owns no packet or queue state.
 
 ```rust
 // VPP handoff.c:339-426. Private inline body inside handoff_arch.
@@ -819,8 +832,8 @@ The vendored VPP source gives the exact compilation boundary:
 | `39-137`, `140-218`, `268-337`, `339-468`: slot reader, dequeue inline, copy-and-publish, one-thread enqueue and grouping are `static_always_inline` in each compiled variant. | Private functions are cloned with their module; they have no individual march attribute, registration or function-pointer selection. |
 | `555-753`: allocation, pending-slot count/copy, resize and queue registration are under `#ifndef CLIB_MARCH_VARIANT`. | One ordinary implementation; no ISA attribute or duplicate symbol. |
 
-`#[hammer_component_macros::march_functions]` is a **proposed** module-level
-attribute, not an existing crate API. It clones the contained private
+`#[hammer_component_macros::march_functions]` is the module-level attribute
+implemented for issue #376. It clones the contained private
 functions and the four entries, but registers and selects only those four.
 For each clone, `slot_copy = [...]` binds the matching slot-prefix reader
 directly within the same module. Contiguous index/aux copies use
@@ -1036,9 +1049,9 @@ fn data_plane_main_loop(worker: &WorkerThread) -> i32 {
 This is a control-flow sketch: `worker.main_mut`, `poll_file_when_due`, and
 the dispatch names stand for the existing runtime operations, not proposed
 public APIs. The loop-local selector is the only selected dequeue pointer;
-`DataPlaneMain` has none. The current Hammer worker loop instead calls
-`schedule_remote_interrupts` before File readiness and drains old handoff
-frames from `run_ready_nodes`. Both paths are removed in the migration.
+`DataPlaneMain` has none. The pre-migration worker loop called
+`schedule_remote_interrupts` before File readiness and drained old handoff
+frames from `run_ready_nodes`; issue #376 removes both paths.
 
 VPP's `file.c:140-196` first applies its busy/polling/interrupt checks. If
 `file_poll_no_sleep_epolls != 0`, it decrements that counter, **still polls
@@ -1055,16 +1068,17 @@ pending bits and creates Frames; File readiness never consumes handoff slots.
 `file_poll_skip_loops`: the former suppresses sleep, not File polling.
 
 Hammer's thread-zero `run_main_until` is an async Process/File loop, whereas
-VPP runs the same packet-graph loop on thread zero. Because queue registration
-allocates a ring for thread zero as well, the async loop must select its own
-local dequeue entry on entry, check and drain its bitmap **before** async
-File/Process waiting, and dispatch resulting Frames through thread zero's
-normal graph path. It must end the `RefCell` mutable borrow before `.await`.
-Its readiness selection must include the existing runtime wake source;
-after advertising sleep, it rechecks the bitmap before waiting, just as the
-worker File path does. Until that integration exists, a producer must not
-target thread zero. Dropping thread-zero packets silently or claiming the
-worker loop covers thread zero is not acceptable.
+VPP runs the packet graph on thread zero too. Hammer allocates handoff rings
+only for Data Workers. Thread zero publishes queue registration under the
+Worker Barrier but neither drains a handoff bitmap nor dispatches handoff
+Frames; the Data Worker loop performs that scheduling. The stats listener is
+a thread-zero file: VPP's
+zero-initialized `clib_file_t` template in `src/vlib/stats/init.c:220-225`
+selects thread index 0. Hammer registers it with thread zero's existing
+`AsyncFileMain`; its generic read-readiness dispatch calls the accept function
+in the stats module. Only Data Workers use synchronous `FileMain` pollers.
+A second thread-zero `FileMain` poll or stats-specific main-loop branch is
+not part of this design.
 
 The pending bitmap is a scheduling hint, not payload publication; the slot's
 first-word Release/Acquire is payload publication. The consumer's Release
@@ -1140,7 +1154,7 @@ after filling the entire destination-thread array and before enqueue
 (`vnet/handoff.c:146-150`). That is **not** the trace timing of the IP
 reassembly handoff Nodes.
 
-Current Hammer business callers are IP reassembly and TCP input. VPP
+Pre-migration Hammer business callers were IP reassembly and TCP input. VPP
 `ip4_full_reass.c:1242-1279,1375-1457,1604-1616,1886-2038` sets
 `ip.reass.owner_thread_index` in the reassembly Node and sends to a distinct
 handoff Node for each entry path. That Node reads the owner from Buffer
@@ -1268,14 +1282,13 @@ impl Node for Ip6ReassemblyHandoffNode {
 }
 ```
 
-This describes the Node body and registration contract, not a claim that the
-current `#[graph_node]` macro accepts an empty struct or that those owner
-fields exist today. Queue allocation runs after the destination NodeIds have
+This describes the Node body and registration contract. Queue allocation runs
+after the destination NodeIds have
 been registered, in the existing startup/barrier graph registration scope;
 `handoff_alloc_queues` returns each index, stored once in `IpReassemblyMain`.
 The source reassembly Node sets the existing `NetworkReassemblyOpaque` owner
-field to a **runtime thread index** before choosing `Handoff`. The current
-`handoff_source_worker` interpretation must be replaced at its owner, not
+field to a **runtime thread index** before choosing `Handoff`. The old
+`handoff_source_worker` interpretation is removed at its owner, not
 reinterpreted in runtime. The handoff Node neither looks up the fragment
 directory nor borrows another worker's pool. Both families need a real
 handoff Node, a registered fixed-layout trace formatter and `CongestionDrop`
@@ -1309,7 +1322,7 @@ before that branch is deleted.
 
 | Owner | Required change |
 | --- | --- |
-| `hammer-component-macros` | Add the proposed module-level `#[march_functions]` attribute: clone private inline functions with their module but register only its four named entries; generated x86 candidates are target-feature gated. |
+| `hammer-component-macros` | Add the module-level `#[march_functions]` attribute: clone private inline functions with their module but register only its four named entries; generated x86 candidates are target-feature gated. |
 | `hammer-runtime` | Delete old handoff containers, `HandoffFrame`, `handoff_index`/`handoff_frame`, remote per-Node handoff interrupts and their scheduling paths. Add only the queue directory, bitmap and no-sleep count to `DataPlaneMain`; put the three selected enqueue pointers in the process-global Buffer function owner and select dequeue into each loop's local variable. Worker and thread-zero loops drain before File/Process wait, then dispatch direct destination Frames. File polling performs the sleeping-flag/bitmap recheck and honors the separate no-sleep count. |
 | `third_party/wide` | Keep the local fork and Cargo override for its existing checked compare-mask and masked-store methods used by the slot reader. Add no generic copy or unaligned load/store API. |
 | IP reassembly | Register IPv4 and IPv6 handoff Nodes and their queue indices after the target reassembly Nodes. Reassembly writes the owner thread into Buffer opaque and uses a Handoff next arc. The handoff Node makes one batch enqueue call per Frame, traces selected worker, records one `CongestionDrop` batch count and returns the original Frame length; no extra source-side free. Remove `IpReassemblyHandoff`'s old target-Node/worker carrier and all three per-packet enqueue sites. |
@@ -1332,5 +1345,8 @@ before that branch is deleted.
 | Multi-arch | Three enqueue pointers exist only in the process-global Buffer function owner; dequeue pointer exists only in each loop's local variable; none exists on `DataPlaneMain`. Private helpers have no march attribute or registration; unsupported x86 candidates are absent or unselected; emitted v3/v4 calls use the promised instructions. |
 | Masked primitives | Zero mask does not access memory; every selected lane is in bounds and every unselected lane remains untouched; default v4 uses AVX-512VL 8-lane masks, v3 uses a scalar tail, and the BITALG-only 16-lane path is not selected by default. |
 
-The handoff path remains a design. No compilation, tests, static checks or CI
-were run for the local `wide` fork or this ADR.
+The implementation and review for issue #376 remain in progress. The final
+verification record belongs below this section once the commit candidate is
+complete; this status is not a claim that its tests or build gates pass.
+The current implementation findings are recorded in
+[the issue #376 review](0052-handoff-implementation-review.md).
