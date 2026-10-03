@@ -31,8 +31,6 @@ const BUFFER_SLOT_BYTES: usize = 2_048;
 const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
 // hammer-core/src/data_plane/buffer.rs
 const BUFFER_FRAME_POOL_SIZE: usize = 64;
-// hammer-runtime/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
-const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
 // hammer-runtime/src/app/session.rs AppSessionConfig::DEFAULT
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
 const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
@@ -41,7 +39,6 @@ static STACK_SIZE: OnceLock<usize> = OnceLock::new();
 static MAX_BLOCKING: OnceLock<usize> = OnceLock::new();
 static FILE_POLL: OnceLock<WorkerFilePollMode> = OnceLock::new();
 static BUFFER: OnceLock<WorkerBuffer> = OnceLock::new();
-static HANDOFF: OnceLock<WorkerHandoff> = OnceLock::new();
 static APP_SESSION: OnceLock<WorkerAppSession> = OnceLock::new();
 static CPU: OnceLock<CpuConfig> = OnceLock::new();
 #[cfg(target_os = "linux")]
@@ -80,7 +77,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
         take_value(&mut section, "max_blocking_threads", &[])?.unwrap_or(MAX_BLOCKING_THREADS);
     let file_poll = take_value(&mut section, "file_poll", &[])?.unwrap_or_default();
     let buffer: WorkerBuffer = take_value(&mut section, "buffer", &[])?.unwrap_or_default();
-    let handoff: WorkerHandoff = take_value(&mut section, "handoff", &[])?.unwrap_or_default();
     let app_session: WorkerAppSession =
         take_value(&mut section, "app_session", &[])?.unwrap_or_default();
     #[cfg(target_os = "linux")]
@@ -98,7 +94,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
         return Err(RuntimeError::WorkerBlockingThreadCountZero);
     }
     buffer.validate()?;
-    handoff.validate()?;
     app_session.validate()?;
     #[cfg(target_os = "linux")]
     numa.validate()?;
@@ -107,7 +102,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     assert!(MAX_BLOCKING.set(max_blocking_threads).is_ok());
     assert!(FILE_POLL.set(file_poll).is_ok());
     assert!(BUFFER.set(buffer).is_ok());
-    assert!(HANDOFF.set(handoff).is_ok());
     assert!(APP_SESSION.set(app_session).is_ok());
     #[cfg(target_os = "linux")]
     assert!(NUMA.set(numa).is_ok());
@@ -147,12 +141,6 @@ pub(crate) fn buffer() -> &'static WorkerBuffer {
     BUFFER
         .get()
         .expect("worker configuration is installed before Buffer setup")
-}
-
-pub(crate) fn handoff() -> &'static WorkerHandoff {
-    HANDOFF
-        .get()
-        .expect("worker configuration is installed before handoff setup")
 }
 
 pub(crate) fn app_session() -> &'static WorkerAppSession {
@@ -218,32 +206,6 @@ impl WorkerBuffer {
         {
             return Err(RuntimeError::config_validation(
                 "worker.buffer.page_size is unsupported on this platform",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct WorkerHandoff {
-    /// Per-worker packet handoff queue capacity.
-    pub queue_capacity: usize,
-}
-
-impl Default for WorkerHandoff {
-    fn default() -> Self {
-        Self {
-            queue_capacity: HANDOFF_QUEUE_CAPACITY,
-        }
-    }
-}
-
-impl WorkerHandoff {
-    pub(crate) fn validate(&self) -> RuntimeResult<()> {
-        if self.queue_capacity == 0 {
-            return Err(RuntimeError::config_validation(
-                "worker.handoff.queue_capacity must be non-zero",
             ));
         }
         Ok(())

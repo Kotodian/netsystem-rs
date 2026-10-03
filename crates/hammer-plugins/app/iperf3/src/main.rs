@@ -183,6 +183,10 @@ static IPERF3_MAIN: OnceLock<Iperf3Main> = OnceLock::new();
 static IPERF3_CONFIG: OnceLock<Iperf3Config> = OnceLock::new();
 
 impl Iperf3Main {
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "each Data Worker exclusively owns its slot"
+    )]
     fn worker(&self, worker: DataWorkerId) -> Result<&mut Iperf3Worker, Iperf3Error> {
         let slot = self
             .workers

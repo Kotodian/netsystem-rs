@@ -1,12 +1,14 @@
 use rand::{SeedableRng, rngs::SmallRng};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMode};
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, DEFAULT_BUFFER_FRAME_POOL_SIZE, Frame, FrameBatchWidth, NodeErrorIndex,
+    BUFFER_CACHE_LINE_SIZE, DEFAULT_BUFFER_FRAME_POOL_SIZE, FrameBatchWidth, NodeErrorIndex,
     NodeId, NodeKind, NodeRegistration,
 };
 use hammer_core::error::DataPlaneError;
@@ -16,7 +18,7 @@ use hammer_infra::bitmap::Bitmap;
 use hammer_infra::timer_wheel::{TimerHandle, TimerStartError, TimerWheel1t3w1024slOv};
 use hammer_stats::DirectoryIndex;
 
-use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
+use crate::handoff::{DataWorkerId, HandoffQueueMain};
 use crate::node::{
     NodeEntry, NodeErrorCode, NodeErrorDescriptor, NodeFunctionRegistration, NodeMain, NodeRuntime,
 };
@@ -47,7 +49,9 @@ pub struct DataPlaneMain {
     /// nothing. Installed once at the freeze point, like VPP's per-thread
     /// `error_main.counters` refresh (`third_party/vpp/src/vlib/threads.c:766-778`).
     pub(crate) node_error_stats_entry_index: Cell<Option<DirectoryIndex>>,
-    handoff: Option<DataPlaneHandoffWorker>,
+    pub(crate) handoff_queue_mains: RefCell<Vec<Arc<HandoffQueueMain>>>,
+    pub(crate) handoff_queue_pending_bmp: Arc<AtomicU64>,
+    pub(crate) file_poll_no_sleep_epolls: u32,
     active_numa_node: u32,
     pub(crate) trace_main: TraceMain,
     pub(crate) handoff_trace_node: NodeId,
@@ -126,8 +130,8 @@ impl DataPlaneMain {
             .timing_wheel
             .first_expires_in_ticks()
             .expect("the DataPlane timing wheel has a fast-slot bitmap");
-        let elapsed_ticks = self.timing_wheel_last_advance.elapsed().as_micros()
-            / Self::TIMER_TICK.as_micros();
+        let elapsed_ticks =
+            self.timing_wheel_last_advance.elapsed().as_micros() / Self::TIMER_TICK.as_micros();
         Some(ticks.saturating_sub(elapsed_ticks.min(u128::from(u32::MAX)) as u32))
     }
 
@@ -139,8 +143,8 @@ impl DataPlaneMain {
             self.timing_wheel_last_advance = now;
             return;
         }
-        let ticks = (now - self.timing_wheel_last_advance).as_micros()
-            / Self::TIMER_TICK.as_micros();
+        let ticks =
+            (now - self.timing_wheel_last_advance).as_micros() / Self::TIMER_TICK.as_micros();
         let ticks = ticks.min(u128::from(u32::MAX)) as u32;
         if ticks == 0 {
             return;
@@ -198,7 +202,7 @@ impl fmt::Debug for DataPlaneMain {
             .field("thread_index", &self.thread_index)
             .field("nodes", &self.nodes)
             .field("current_node", &self.current_node.get())
-            .field("handoff", &self.handoff)
+            .field("handoff_queues", &self.handoff_queue_mains.borrow().len())
             .field("active_numa_node", &self.active_numa_node)
             .field("trace_main", &self.trace_main)
             .field("simd_bytes", &self.simd_bytes)

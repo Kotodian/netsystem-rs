@@ -5,10 +5,11 @@ use crate::error::{RuntimeError, RuntimeResult};
 use hammer_stats::StatsMain;
 
 use crate::thread_main::WorkerThreadCount;
-use crate::{DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, WorkerThread};
+use crate::{DataPlaneMain, GlobalMain, ThreadMain, WorkerThread};
 
 #[hammer_component_macros::main_loop_enter_function]
 fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    crate::handoff::init_buffer_functions();
     let threads = ThreadMain::global();
     let global = GlobalMain::global();
     let worker_count = threads.worker_count();
@@ -23,15 +24,9 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         .into_iter()
         .map(|index| global.worker_init_function_registrations[index])
         .collect();
-    let handoff = DataPlaneHandoff::with_node_capacity(
-        worker_count as usize,
-        crate::config::worker::handoff().queue_capacity,
-        main.nodes().node_count(),
-    );
-    // One counter row per thread, at the same frozen node capacity the handoff
-    // uses; thread zero's row goes into this graph and each Worker's row into
-    // that Worker's graph clone before launch.
-    let node_counter_rows = crate::node_stats::NodeCounterRows::install(worker_count + 1, main.nodes());
+    // One counter row per thread at the frozen graph capacity.
+    let node_counter_rows =
+        crate::node_stats::NodeCounterRows::install(worker_count + 1, main.nodes());
     main.nodes.install_node_counters(node_counter_rows, 0);
     crate::node_stats::publish_node_stats()?;
     // Every Worker runtime receives its per-thread error fact at this freeze
@@ -46,12 +41,11 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
-        let (mut nodes, _) = main.worker_parts();
+        let mut nodes = main.nodes.clone();
         nodes.install_node_counters(node_counter_rows, thread_index);
         let worker_main = DataPlaneMain::new_worker(
             main,
             nodes,
-            Some(handoff.worker(DataWorkerId::new(worker_slot))),
             thread_index,
             descriptor.numa_node().unwrap_or(0),
         )?;

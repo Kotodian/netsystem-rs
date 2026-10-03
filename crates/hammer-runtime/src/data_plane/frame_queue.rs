@@ -55,19 +55,6 @@ impl DataPlaneMain {
         Ok(true)
     }
 
-    /// VPP `vlib_node_set_interrupt_pending(target_vm, node)`.
-    ///
-    /// Atomically coalesces one exact node interrupt on the target Data
-    /// Worker and wakes that worker. It carries no payload and performs no
-    /// Session work. Invalid published worker/node identity is a Runtime
-    /// invariant violation, not a per-packet recoverable failure.
-    #[inline]
-    pub fn set_worker_node_interrupt_pending(&self, worker: DataWorkerId, node: NodeId) {
-        if let Some(handoff) = &self.handoff {
-            handoff.set_worker_node_interrupt_pending(worker, node);
-        }
-    }
-
     pub(crate) fn schedule_worker_node_interrupts(&self) -> RuntimeResult<usize> {
         let worker = match self.data_worker_id() {
             Ok(worker) => worker,
@@ -88,25 +75,6 @@ impl DataPlaneMain {
                 scheduled += usize::from(self.set_node_interrupt_pending(node)?);
             }
         }
-        Ok(scheduled)
-    }
-
-    pub(crate) fn attach_worker_interrupt_thread(&self) {
-        if let Some(handoff) = &self.handoff {
-            handoff.attach_current_thread();
-        }
-    }
-
-    pub(crate) fn schedule_remote_interrupts(&self) -> RuntimeResult<usize> {
-        let Some(handoff) = &self.handoff else {
-            return Ok(0);
-        };
-        let mut scheduled = 0;
-        handoff.drain_worker_interrupts(|node| {
-            self.schedule_empty_frame(node)
-                .expect("published worker interrupt node must schedule");
-            scheduled += 1;
-        });
         Ok(scheduled)
     }
 }

@@ -124,6 +124,19 @@ pub enum RuntimeError {
     ControlRequiresMainThread,
     #[error("control operation requires the worker barrier while Data Workers are running")]
     ControlRequiresWorkerBarrier,
+    #[error("handoff queue index {index} is invalid; {queue_count} queues are registered")]
+    HandoffQueueIndexInvalid { index: u32, queue_count: usize },
+    #[error("handoff queue size {size} must be a power of two and at least {minimum}")]
+    HandoffQueueSizeInvalid { size: u32, minimum: usize },
+    #[error(
+        "handoff queue {index} on thread {thread_index} has {pending} pending buffer indices; size {size} is too small"
+    )]
+    HandoffQueueCapacityInsufficient {
+        index: u32,
+        thread_index: u32,
+        pending: usize,
+        size: u32,
+    },
     #[error("worker configuration cannot change after runtime initialization")]
     WorkerConfigurationAlreadyInitialized,
     #[error("worker configuration field `{field}` is specified more than once via `{alias}`")]
@@ -225,11 +238,6 @@ pub enum RuntimeError {
         #[source]
         primary: Box<RuntimeError>,
         cleanup: Box<RuntimeError>,
-    },
-    #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]
-    HandoffWorkerMismatch {
-        worker: crate::DataWorkerId,
-        handoff_owner: crate::DataWorkerId,
     },
     #[error("Graph Node `{node}` initialization failed")]
     GraphNodeInitialization {

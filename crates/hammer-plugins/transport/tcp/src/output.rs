@@ -710,20 +710,38 @@ mod opaque_tests {
     // Derived from vnet/tcp/tcp_output.c: tcp_output_push_ip consumes the
     // transport producer's packet metadata to select the IP lookup arc.
     #[test]
-    fn segment_metadata_reaches_ip_output() -> RuntimeResult<()> {
-        hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)?;
+    fn segment_metadata_reaches_ip_output() {
+        const CASE: &str = "output::opaque_tests::segment_metadata_reaches_ip_output";
+        const PROCESS_CASE: &str = "HAMMER_TCP_OUTPUT_TEST_CASE";
+        if std::env::var(PROCESS_CASE).as_deref() != Ok(CASE) {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .env(PROCESS_CASE, CASE)
+                    .arg("--exact")
+                    .arg(CASE)
+                    .arg("--nocapture")
+                    .output()
+                    .expect("spawn TCP output test process");
+            assert!(
+                output.status.success(),
+                "TCP output test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        hammer_infra::mem::MainHeapConfig::default()
+            .initialize()
+            .expect("initialize process Main Heap before TCP Buffer test");
+        hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)
+            .expect("initialize TCP Buffer Main");
         let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig {
             buffer_slot_capacity: 2048,
             buffer_slots: 16,
             ..Default::default()
         });
         let mut index = 0;
-        if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
-            return Err(hammer_core::error::DataPlaneError::from(
-                hammer_core::error::BufferInvariant::PoolExhausted,
-            )
-            .into());
-        }
+        assert_eq!(runtime.buffer_alloc(core::slice::from_mut(&mut index)), 1);
         let local = "192.0.2.1:1234".parse().unwrap();
         let remote = "192.0.2.2:4321".parse().unwrap();
         {
@@ -759,11 +777,13 @@ mod opaque_tests {
                 None,
                 0,
             )
-            .write_to_buffer(buffer)?;
+            .write_to_buffer(buffer)
+            .expect("write TCP segment");
         }
         let mut error = None;
         assert!(matches!(
-            tcp_output_next_for_index::<1, true>(&mut runtime, index, &mut error)?,
+            tcp_output_next_for_index::<true>(&mut runtime, index, &mut error)
+                .expect("select TCP output next"),
             TcpOutputNext::Lookup
         ));
         assert_eq!(error, None);
@@ -776,6 +796,7 @@ mod opaque_tests {
             assert_eq!(network.packet_cursor().transport_header_offset(), 20);
         }
         runtime.buffer_free_one(index);
-        Ok(())
+        // The child must not drop test-harness allocations made before heap activation.
+        unsafe { libc::_exit(0) }
     }
 }

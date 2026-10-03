@@ -189,15 +189,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "bincode"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -821,6 +812,7 @@ dependencies = [
  "hammer-service",
  "humantime-serde",
  "ipnet",
+ "libc",
  "linkme",
  "prost",
  "rand 0.9.5",
@@ -921,6 +913,7 @@ dependencies = [
  "toml",
  "tracing",
  "wide",
+ "zerocopy",
 ]
 
 [[package]]
@@ -929,7 +922,6 @@ version = "0.1.0"
 dependencies = [
  "abi_stable",
  "async-trait",
- "bincode",
  "bitflags 2.11.1",
  "byte-unit",
  "bytes",
@@ -956,6 +948,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "wide",
  "zerocopy",
 ]
 
@@ -2393,8 +2386,6 @@ dependencies = [
 [[package]]
 name = "wide"
 version = "1.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
 dependencies = [
  "bytemuck",
  "safe_arch",

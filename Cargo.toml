@@ -20,6 +20,7 @@ exclude = [
     "netsystem-client",
     "third_party/allocator-api2",
     "third_party/io-uring",
+    "third_party/wide",
 ]
 
 [workspace.package]
@@ -42,7 +43,7 @@ lto = false
 
 [workspace.dependencies]
 abi_stable = "0.11.3"
-tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_path_to_error = "0.1"
 toml = "1.1"
@@ -89,3 +90,4 @@ zerocopy = { version = "0.8", features = ["derive"] }
 
 [patch.crates-io]
 io-uring = { path = "third_party/io-uring" }
+wide = { path = "third_party/wide" }

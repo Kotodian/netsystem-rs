@@ -4,10 +4,8 @@ use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, TcpState, tcp_header};
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeNext};
 use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion};
 use hammer_plugin_session::{IpSessionEndpoint, IpSessionMain, IpTransportConnectionId};
-use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
-};
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::RuntimeResult;
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::{SessionLookup, SessionLookupResult, SessionMain};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -390,8 +388,7 @@ pub(crate) fn tcp_input_process<const IS_IP4: bool, const NO_LOOKUP: bool>(
         worker.time_tstamp = ((now * 1_000.0) as u64) as u32;
     }
     let processed_vectors = frame.len();
-    let handoff_worker = runtime.data_worker_id().ok();
-    tcp_input_process_frame::<IS_IP4, NO_LOOKUP>(runtime, node_runtime, frame, handoff_worker);
+    tcp_input_process_frame::<IS_IP4, NO_LOOKUP>(runtime, node_runtime, frame);
     processed_vectors
 }
 
@@ -399,7 +396,6 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
-    handoff_worker: Option<DataWorkerId>,
 ) -> () {
     let mut output = Frame::<(), u32, ()>::new(0);
     let mut nexts = [0u16; hammer_core::graph::frame::FRAME_VECTOR_CAPACITY];
@@ -417,12 +413,8 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
 
         let index0 = indices[position];
         let mut error0 = None;
-        let next0 = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(
-            runtime,
-            index0,
-            handoff_worker,
-            &mut error0,
-        );
+        let next0 =
+            tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(runtime, index0, &mut error0);
         let slot0 = match next0 {
             Ok(slot) => slot,
             Err(_) => Some(TcpInputNext::Drop.slot() as u16),
@@ -442,12 +434,8 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
 
         let index1 = indices[position + 1];
         let mut error1 = None;
-        let next1 = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(
-            runtime,
-            index1,
-            handoff_worker,
-            &mut error1,
-        );
+        let next1 =
+            tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(runtime, index1, &mut error1);
         let slot1 = match next1 {
             Ok(slot) => slot,
             Err(_) => Some(TcpInputNext::Drop.slot() as u16),
@@ -473,12 +461,7 @@ fn tcp_input_process_frame<const IS_IP4: bool, const NO_LOOKUP: bool>(
         }
         let index = indices[position];
         let mut error = None;
-        let next = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(
-            runtime,
-            index,
-            handoff_worker,
-            &mut error,
-        );
+        let next = tcp_input_local_next_for_index::<IS_IP4, NO_LOOKUP>(runtime, index, &mut error);
         if let Some(error) = error {
             let code = error as usize;
             error_counts[code] += 1;
@@ -594,18 +577,11 @@ fn prefetch_tcp_input(runtime: &DataPlaneMain, index: u32) {
 fn tcp_input_local_next_for_index<const IS_IP4: bool, const NO_LOOKUP: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
-    handoff_worker: Option<DataWorkerId>,
     error: &mut Option<TcpError>,
 ) -> RuntimeResult<Option<u16>> {
     let buffer = runtime.buffer(index);
     let parsed = tcp_input_buffer(&buffer)?;
-    next_slot_for_index_with_runtime::<IS_IP4, NO_LOOKUP>(
-        runtime,
-        index,
-        parsed,
-        handoff_worker,
-        error,
-    )
+    next_slot_for_index_with_runtime::<IS_IP4, NO_LOOKUP>(runtime, index, parsed, error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,7 +598,6 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
     parsed: Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputError>,
-    handoff_worker: Option<DataWorkerId>,
     classified_error: &mut Option<TcpError>,
 ) -> RuntimeResult<Option<u16>> {
     let (_, _, local, remote, flags) = match parsed {
@@ -676,15 +651,17 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 classified_error,
             );
         };
-        let current_worker = handoff_worker.expect("TCP nolookup input runs on a Data Worker");
+        let current_worker = runtime
+            .data_worker_id()
+            .expect("TCP nolookup input runs on a Data Worker");
         if owner != current_worker {
-            hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
-                .set_handoff_source_worker(Some(current_worker.slot() as u16));
-            let node = runtime
-                .current_node()
-                .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-            runtime.handoff_index(owner, node, index)?;
-            return Ok(None);
+            return resolve_error_next_with_runtime(
+                runtime,
+                index,
+                TcpInputNext::Drop,
+                TcpError::WrongThread,
+                classified_error,
+            );
         }
         let state = {
             let worker = main.worker(runtime.thread_index())?;
@@ -749,20 +726,27 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
         .prefetch_tuple(local, remote);
     let exact_session = match ip_session.lookup_main().lookup_exact(&connection) {
         SessionLookupResult::Session(handle) => Some(handle),
-        SessionLookupResult::HalfOpen(_)
-        | SessionLookupResult::WrongThread
-        | SessionLookupResult::NotFound => None,
+        SessionLookupResult::WrongThread => {
+            return resolve_error_next_with_runtime(
+                runtime,
+                index,
+                TcpInputNext::Drop,
+                TcpError::WrongThread,
+                classified_error,
+            );
+        }
+        SessionLookupResult::HalfOpen(_) | SessionLookupResult::NotFound => None,
     };
-    if let (Some(session), Some(current_worker)) = (exact_session, handoff_worker)
-        && session.thread_index != current_worker.slot() as u32
+    if let Some(session) = exact_session
+        && session.thread_index != runtime.thread_index() - 1
     {
-        hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
-            .set_handoff_source_worker(Some(current_worker.slot() as u16));
-        let node = runtime
-            .current_node()
-            .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-        runtime.handoff_index(DataWorkerId::new(session.thread_index), node, index)?;
-        return Ok(None);
+        return resolve_error_next_with_runtime(
+            runtime,
+            index,
+            TcpInputNext::Drop,
+            TcpError::WrongThread,
+            classified_error,
+        );
     }
 
     let (session_route, listener_pending) = {
@@ -785,16 +769,14 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 classified_error,
             );
         }
-        if let Some(current_worker) = handoff_worker
-            && owner != current_worker
-        {
-            hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => NetworkOpaque)
-                .set_handoff_source_worker(Some(current_worker.slot() as u16));
-            let node = runtime
-                .current_node()
-                .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-            runtime.handoff_index(owner, node, index)?;
-            return Ok(None);
+        if owner.slot() as u32 != runtime.thread_index() - 1 {
+            return resolve_error_next_with_runtime(
+                runtime,
+                index,
+                TcpInputNext::Drop,
+                TcpError::WrongThread,
+                classified_error,
+            );
         }
         let connection_index = {
             // SAFETY: this input node executes on the Session worker's Data Worker.
@@ -900,7 +882,7 @@ fn next_slot_for_index_with_runtime<const IS_IP4: bool, const NO_LOOKUP: bool>(
                 origin: crate::TcpRouteOrigin::Listener as u8,
                 reserved: [0; 38],
             };
-        return Ok(Some(TcpInputNext::Listen.slot()));
+        return Ok(Some(TcpInputNext::Listen.slot() as u16));
     }
     let dispatch = TCP_INPUT_DISPATCH[state.index()][usize::from(flags.bits())];
     if let Some(error) = dispatch.error {

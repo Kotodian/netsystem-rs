@@ -113,9 +113,9 @@ impl NodeCounterRows {
         let node_capacity = nodes.node_count();
         let mut rows = Vec::with_capacity(thread_count as usize);
         for _ in 0..thread_count {
-            rows.push(
-                UnsafeCell::new((0..node_capacity).map(|_| NodeCounters::new()).collect()),
-            );
+            rows.push(UnsafeCell::new(
+                (0..node_capacity).map(|_| NodeCounters::new()).collect(),
+            ));
         }
         let names = (0..node_capacity)
             .map(|slot| {
@@ -315,11 +315,9 @@ pub(crate) fn publish_node_stats() -> RuntimeResult<()> {
             continue;
         }
         let links = current.1.iter().flatten().copied().collect::<Vec<_>>();
-        stats_main.segment.remove_name_symlinks(
-            node_stats.names.index,
-            slot as u32,
-            &links,
-        )?;
+        stats_main
+            .segment
+            .remove_name_symlinks(node_stats.names.index, slot as u32, &links)?;
         *current = (None, [None; 4]);
     }
     for (slot, current) in published.iter_mut().enumerate() {
@@ -327,10 +325,14 @@ pub(crate) fn publish_node_stats() -> RuntimeResult<()> {
         if current.0 == Some(name) {
             continue;
         }
-        let paths: [String; 4] =
-            std::array::from_fn(|index| format!("/nodes/{name}/{}", NodeCounter::ALL[index].name()));
+        let paths: [String; 4] = std::array::from_fn(|index| {
+            format!("/nodes/{name}/{}", NodeCounter::ALL[index].name())
+        });
         let links: [(&str, DirectoryIndex); 4] = std::array::from_fn(|index| {
-            (paths[index].as_str(), NodeCounter::ALL[index].entry_index(node_stats))
+            (
+                paths[index].as_str(),
+                NodeCounter::ALL[index].entry_index(node_stats),
+            )
         });
         let indices = stats_main.segment.add_name_symlinks(
             node_stats.names.index,

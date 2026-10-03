@@ -938,7 +938,7 @@ mod tests {
                 let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
                 *network = NetworkOpaque::default();
                 network.set_packet_cursor(
-                    BufferPacketCursor::new()
+                    hammer_core::data_plane::BufferPacketCursor::new()
                         .with_packet_len(packet_len)
                         .with_network_header(0, header_len)
                         .with_transport_header(header_len, 4)

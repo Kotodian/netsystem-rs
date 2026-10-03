@@ -41,7 +41,7 @@ _Avoid_: ThreadMain, DataPlaneMain, worker configuration
 The execution state owned by one runtime thread, corresponding to VPP's
 `vlib_main_t`, including its graph, trace, random stream, main-loop facts, and
 worker-init progress. A single `FileMode` enum selects file scheduling: index
-zero owns the existing `AsyncFileMain` through `Async`, and workers select
+zero uses the process-global `AsyncFileMain` through `Async`, and workers select
 `Sync` against the existing global FileMain. Subsequent Data Worker mains
 belong to their workers for the process lifetime.
 _Avoid_: GlobalMain, ThreadMain, WorkerThread, shared control registry

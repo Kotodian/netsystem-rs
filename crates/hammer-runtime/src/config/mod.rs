@@ -11,4 +11,4 @@ pub use stats::StatsConfig;
 pub use worker::CpuConfig;
 #[cfg(target_os = "linux")]
 pub use worker::WorkerNuma;
-pub use worker::{WorkerAppSession, WorkerBuffer, WorkerHandoff};
+pub use worker::{WorkerAppSession, WorkerBuffer};

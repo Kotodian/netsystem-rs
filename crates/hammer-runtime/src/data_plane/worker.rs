@@ -89,25 +89,15 @@ impl DataPlaneMain {
                 .expect("FileMain is initialized before data-plane use")
                 .poll_for_worker(thread_index, &mut self.nodes),
             #[cfg(target_os = "linux")]
-            FileMode::Async(_) => panic!("thread zero awaits AsyncFileMain readiness"),
+            FileMode::Async => panic!("thread zero awaits AsyncFileMain readiness"),
         }
     }
 
     pub async fn next_file_readiness(&mut self) -> RuntimeResult<usize> {
         match &self.file_main {
             #[cfg(target_os = "linux")]
-            FileMode::Async(file_main) => {
-                crate::file::AsyncFileMain::next_ready(file_main.clone()).await
-            }
+            FileMode::Async => crate::file::AsyncFileMain::global().next_ready().await,
             FileMode::Sync => panic!("Data Workers poll synchronous File readiness"),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn async_file_main(&self) -> std::rc::Rc<std::cell::RefCell<crate::file::AsyncFileMain>> {
-        match &self.file_main {
-            FileMode::Async(file_main) => file_main.clone(),
-            FileMode::Sync => panic!("only thread zero owns AsyncFileMain"),
         }
     }
 
@@ -130,14 +120,9 @@ impl DataPlaneMain {
 }
 
 impl DataPlaneMain {
-    pub(crate) fn worker_parts(&self) -> (NodeMain, Option<DataPlaneHandoffWorker>) {
-        (self.nodes.clone(), self.handoff.clone())
-    }
-
     pub(crate) fn new_worker(
         source: &Self,
         nodes: NodeMain,
-        handoff: Option<DataPlaneHandoffWorker>,
         thread_index: u32,
         numa_node: u32,
     ) -> RuntimeResult<Self> {
@@ -150,7 +135,13 @@ impl DataPlaneMain {
             source.simd_bytes,
         )?;
         runtime.nodes = nodes;
-        runtime.handoff = handoff;
+        runtime.handoff_queue_mains = RefCell::new(source.handoff_queue_mains.borrow().clone());
+        runtime.handoff_queue_pending_bmp = Arc::clone(
+            crate::ThreadMain::global()
+                .thread_by_index(thread_index)
+                .expect("configured worker descriptor exists")
+                .handoff_pending_bmp(),
+        );
         runtime.handoff_trace_node = source.handoff_trace_node;
         runtime.main_loop_start_ticks = source.main_loop_start_ticks;
         runtime.seconds_per_cpu_tick = source.seconds_per_cpu_tick;
@@ -160,13 +151,6 @@ impl DataPlaneMain {
     }
 
     pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> RuntimeResult<Self> {
-        let (nodes, handoff) = self.worker_parts();
-        Self::new_worker(self, nodes, handoff, thread_index, numa_node)
-    }
-
-    #[inline]
-    pub fn attach_handoff_worker(mut runtime: Self, handoff: DataPlaneHandoffWorker) -> Self {
-        runtime.handoff = Some(handoff);
-        runtime
+        Self::new_worker(self, self.nodes.clone(), thread_index, numa_node)
     }
 }

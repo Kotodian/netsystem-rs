@@ -27,7 +27,6 @@ crate::__declare_registration_image!(
     ];
     main_loop_enter_functions = [
         start_workers::__INIT_FN_START_WORKERS,
-        node_stats::__INIT_FN_INSTALL_NODE_STATS,
     ];
     main_loop_exit_functions = [
         unix_cli::__INIT_FN_UNIX_CLI_EXIT,
@@ -116,7 +115,7 @@ pub mod trace;
 pub mod unix_main;
 pub use data_plane::{DataPlaneBufferConfig, DataPlaneMain};
 pub use hammer_core::data_plane::FrameBatchWidth;
-pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
+pub use handoff::{DataWorkerId, HandoffAllocQueuesArgs};
 pub use main_loop::enqueue_main_thread_future;
 pub use node::{
     DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
@@ -158,3 +157,41 @@ macro_rules! worker_thread_barrier_sync {
 }
 #[cfg(test)]
 static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();
+
+#[cfg(test)]
+pub(crate) fn run_buffer_test_process(name: &'static str) -> bool {
+    const CASE: &str = "HAMMER_BUFFER_TEST_CASE";
+    let child = std::env::var(CASE).as_deref() == Ok(name);
+    if child {
+        hammer_infra::mem::MainHeapConfig {
+            size: byte_unit::Byte::from_u64(256 << 20),
+            page_size: hammer_infra::PageSize::Default,
+            default_hugepage_size: None,
+        }
+        .initialize()
+        .expect("initialize process Main Heap before Buffer tests");
+        return true;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .env(CASE, name)
+        .arg("--exact")
+        .arg(name)
+        .arg("--nocapture")
+        .output()
+        .expect("spawn Buffer test process");
+    assert!(
+        output.status.success(),
+        "Buffer test {name} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn finish_buffer_test_process() -> ! {
+    // The test harness allocated with System before the child selected the
+    // Main Heap. Do not run its destructors under the new allocator.
+    unsafe { libc::_exit(0) }
+}

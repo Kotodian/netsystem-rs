@@ -1,5 +1,6 @@
 //! Generic File record owned by the runtime's I/O subsystem.
 
+use std::cell::Cell;
 use std::fmt;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
@@ -12,25 +13,25 @@ pub enum FileReadinessMode {
 }
 
 /// Callback invoked for one ready file descriptor.
-pub type FileFunction<Context, Error> =
-    fn(&mut Context, &mut File<Context, Error>) -> Result<(), Error>;
+pub type FileFunction<Context, Error, Owner = ()> =
+    fn(&mut Context, &File<Context, Error, Owner>) -> Result<(), Error>;
 
 /// Read, write, and error callbacks associated with one [`File`].
-pub struct FileFunctions<Context, Error> {
-    pub read: Option<FileFunction<Context, Error>>,
-    pub write: Option<FileFunction<Context, Error>>,
-    pub error: Option<FileFunction<Context, Error>>,
+pub struct FileFunctions<Context, Error, Owner = ()> {
+    pub read: Option<FileFunction<Context, Error, Owner>>,
+    pub write: Option<FileFunction<Context, Error, Owner>>,
+    pub error: Option<FileFunction<Context, Error, Owner>>,
 }
 
-impl<Context, Error> Copy for FileFunctions<Context, Error> {}
+impl<Context, Error, Owner> Copy for FileFunctions<Context, Error, Owner> {}
 
-impl<Context, Error> Clone for FileFunctions<Context, Error> {
+impl<Context, Error, Owner> Clone for FileFunctions<Context, Error, Owner> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<Context, Error> Default for FileFunctions<Context, Error> {
+impl<Context, Error, Owner> Default for FileFunctions<Context, Error, Owner> {
     fn default() -> Self {
         Self {
             read: None,
@@ -40,7 +41,7 @@ impl<Context, Error> Default for FileFunctions<Context, Error> {
     }
 }
 
-impl<Context, Error> fmt::Debug for FileFunctions<Context, Error> {
+impl<Context, Error, Owner> fmt::Debug for FileFunctions<Context, Error, Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FileFunctions")
@@ -57,25 +58,25 @@ pub struct File<Context, Error, Owner = ()> {
     owner: Owner,
     description: String,
     private_data: u64,
-    functions: FileFunctions<Context, Error>,
+    functions: FileFunctions<Context, Error, Owner>,
     write_enabled: bool,
     readiness_mode: FileReadinessMode,
     polling_thread_index: u32,
-    read_events: u64,
+    read_events: Cell<u64>,
     write_events: u64,
-    error_events: u64,
+    error_events: Cell<u64>,
     active: bool,
 }
 
-impl<Context, Error> File<Context, Error> {
+impl<Context, Error, Owner: Default> File<Context, Error, Owner> {
     /// Creates a file record with write interest disabled.
     pub fn new(
         fd: OwnedFd,
         description: String,
         private_data: u64,
-        functions: FileFunctions<Context, Error>,
+        functions: FileFunctions<Context, Error, Owner>,
     ) -> Self {
-        Self::with_owner(fd, description, private_data, functions, ())
+        Self::with_owner(fd, description, private_data, functions, Owner::default())
     }
 }
 
@@ -84,7 +85,7 @@ impl<Context, Error, Owner> File<Context, Error, Owner> {
         fd: OwnedFd,
         description: String,
         private_data: u64,
-        functions: FileFunctions<Context, Error>,
+        functions: FileFunctions<Context, Error, Owner>,
         owner: Owner,
     ) -> Self {
         Self {
@@ -96,9 +97,9 @@ impl<Context, Error, Owner> File<Context, Error, Owner> {
             write_enabled: false,
             readiness_mode: FileReadinessMode::Level,
             polling_thread_index: 0,
-            read_events: 0,
+            read_events: Cell::new(0),
             write_events: 0,
-            error_events: 0,
+            error_events: Cell::new(0),
             active: true,
         }
     }
@@ -140,7 +141,7 @@ impl<Context, Error, Owner> File<Context, Error, Owner> {
 
     /// Returns the callbacks associated with this file.
     #[inline]
-    pub fn functions(&self) -> FileFunctions<Context, Error> {
+    pub fn functions(&self) -> FileFunctions<Context, Error, Owner> {
         self.functions
     }
 
@@ -194,8 +195,8 @@ impl<Context, Error, Owner> File<Context, Error, Owner> {
 
     /// Records one dispatched read callback.
     #[inline]
-    pub fn record_read_event(&mut self) {
-        self.read_events += 1;
+    pub fn record_read_event(&self) {
+        self.read_events.set(self.read_events.get() + 1);
     }
 
     /// Records one dispatched write callback.
@@ -206,14 +207,14 @@ impl<Context, Error, Owner> File<Context, Error, Owner> {
 
     /// Records one dispatched error callback.
     #[inline]
-    pub fn record_error_event(&mut self) {
-        self.error_events += 1;
+    pub fn record_error_event(&self) {
+        self.error_events.set(self.error_events.get() + 1);
     }
 
     /// Returns the number of dispatched read callbacks.
     #[inline]
     pub fn read_events(&self) -> u64 {
-        self.read_events
+        self.read_events.get()
     }
 
     /// Returns the number of dispatched write callbacks.
@@ -225,7 +226,7 @@ impl<Context, Error, Owner> File<Context, Error, Owner> {
     /// Returns the number of dispatched error callbacks.
     #[inline]
     pub fn error_events(&self) -> u64 {
-        self.error_events
+        self.error_events.get()
     }
 }
 

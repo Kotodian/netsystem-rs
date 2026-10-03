@@ -201,11 +201,21 @@ async fn run_main_thread(
     #[cfg(target_os = "linux")]
     {
         let cli = UnixCliMain::global();
-        cli.listen(&mut main.borrow_mut(), socket)?;
+        cli.listen(socket).await?;
         tracing::info!(socket = %socket.display(), "hammer CLI listening");
-        return tokio::select! {
+        let result = tokio::select! {
             signal = unix.wait_for_exit_signal() => signal,
             accepted = cli.accept(&main) => accepted.map(|()| 1),
+        };
+        let cleanup = cli.close_listener(hammer_runtime::AsyncFileMain::global()).await;
+        return match (result, cleanup) {
+            (Err(primary), Err(cleanup)) => {
+                tracing::error!(%cleanup, "CLI listener cleanup failed after main-thread error");
+                Err(primary)
+            }
+            (Err(primary), _) => Err(primary),
+            (_, Err(cleanup)) => Err(cleanup),
+            (Ok(status), Ok(())) => Ok(status),
         };
     }
     #[cfg(not(target_os = "linux"))]
