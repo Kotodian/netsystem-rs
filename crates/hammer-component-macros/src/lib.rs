@@ -2704,11 +2704,11 @@ fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStr
         };
         let invoke = if unit_output {
             quote! {
-                #function_name(runtime, args)?;
+                self::#function_name(runtime, args)?;
             }
         } else {
             quote! {
-                let output = #function_name(runtime, args)?;
+                let output = self::#function_name(runtime, args)?;
             }
         };
         let format_output = if unit_output {
@@ -2727,7 +2727,7 @@ fn expand_cli_command(args: CliCommandArgs, function: ItemFn) -> Result<TokenStr
         quote! {
             let args: #args_type = input.parse()?;
             Ok(::hammer_runtime::__private::spawn_local(async move {
-                let output = #function_name(args).await?;
+                let output = self::#function_name(args).await?;
                 Ok(format!("{output}"))
             }))
         }
