@@ -3518,6 +3518,10 @@ impl SessionMain {
     /// The runtime must be the sole executor of this worker slot until the
     /// returned borrow ends; callers must not create overlapping mutable
     /// borrows of the same slot. Main-thread access requires stopped workers.
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "the caller exclusively owns this worker slot"
+    )]
     pub unsafe fn worker_mut<'worker>(
         &'worker self,
         runtime: &DataPlaneMain,

@@ -42,8 +42,7 @@ fn configure_api_segment(config: ApiSegmentConfig) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "binary_api_init",
-    runs_after = ["vpe_api_init"],
-    runs_before = ["stats_main_init"]
+    runs_after = ["vpe_api_init"]
 )]
 fn init() -> RuntimeResult<()> {
     let segment = API_SEGMENT_CONFIG

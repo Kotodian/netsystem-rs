@@ -126,7 +126,7 @@ pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
 /// private_data; polling_thread_index selects the same Sync File poller.
 pub(crate) fn session_queue_timer_ready(
     graph: &mut NodeMain,
-    file: &mut File,
+    file: &File,
 ) -> RuntimeResult<()> {
     let thread_index = u32::try_from(file.private_data())
         .expect("Session worker thread index fits File private data");

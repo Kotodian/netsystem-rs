@@ -243,17 +243,13 @@ pub struct NetworkReassemblyOpaque {
 
 impl NetworkReassemblyOpaque {
     #[inline]
-    pub fn handoff_source_worker(&self) -> Option<u16> {
-        if self.owner_thread_index == 0 {
-            None
-        } else {
-            Some(self.owner_thread_index - 1)
-        }
+    pub fn owner_thread_index(&self) -> u16 {
+        self.owner_thread_index
     }
 
     #[inline]
-    pub fn set_handoff_source_worker(&mut self, worker: Option<u16>) {
-        self.owner_thread_index = worker.map_or(0, |value| value.saturating_add(1));
+    pub fn set_owner_thread_index(&mut self, thread_index: u16) {
+        self.owner_thread_index = thread_index;
     }
 
     #[inline]
@@ -404,16 +400,6 @@ impl NetworkOpaque {
                 .expect("transport payload offset exceeds u16"),
         );
     }
-
-    #[inline]
-    pub fn handoff_source_worker(&self) -> Option<u16> {
-        self.reassembly().handoff_source_worker()
-    }
-
-    #[inline]
-    pub fn set_handoff_source_worker(&mut self, worker: Option<u16>) {
-        self.reassembly_mut().set_handoff_source_worker(worker);
-    }
 }
 
 #[cfg(test)]
@@ -430,8 +416,8 @@ mod tests {
         assert_eq!(ip_address, std::ptr::from_ref(network.reassembly()).addr());
         network.ip_mut().set_packet_len(1500);
         assert_eq!(network.ip().packet_len(), 1500);
-        network.reassembly_mut().set_handoff_source_worker(Some(3));
-        assert_eq!(network.reassembly().handoff_source_worker(), Some(3));
+        network.reassembly_mut().set_owner_thread_index(3);
+        assert_eq!(network.reassembly().owner_thread_index(), 3);
         assert_eq!(network.sw_if_index, [17, 23]);
     }
 }

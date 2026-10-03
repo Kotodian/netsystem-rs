@@ -484,6 +484,10 @@ impl<'segment> AppWorker<'segment> {
     /// # Safety
     /// The caller must be the sole executor of the selected Session worker,
     /// or hold WorkerBarrier while that worker is stopped.
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "the caller exclusively owns this worker slot"
+    )]
     pub unsafe fn events(&self, worker: u32) -> Option<&mut Vec<SessionEvent>> {
         // SAFETY: the caller owns this worker's execution or holds the barrier.
         self.events_by_worker
