@@ -78,8 +78,8 @@ pub struct DataPlaneMain {
     loop_interval_end: Instant,
     /// Damped loops per second of the latest window (`loops_per_second`).
     loops_per_second: f64,
-    internal_node_vectors: u64,
-    internal_node_calls: u64,
+    pub(crate) internal_node_vectors: u64,
+    pub(crate) internal_node_calls: u64,
     internal_node_vectors_last_clear: u64,
     internal_node_calls_last_clear: u64,
     time_last_runtime_stats_clear: Instant,

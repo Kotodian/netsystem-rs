@@ -40,7 +40,7 @@ impl NodeMain {
                 };
                 let flags = graph.nodes[destination.slot() as usize]
                     .runtime_data
-                    .as_ref()
+                    .get()
                     .expect("published node runtime is available")
                     .flags
                     & 1;
