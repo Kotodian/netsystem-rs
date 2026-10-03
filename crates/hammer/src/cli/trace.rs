@@ -4,7 +4,6 @@
 use std::fmt::Write;
 use std::str::FromStr;
 
-use hammer_core::data_plane::NodeId;
 use hammer_runtime::cli::CliError;
 use hammer_runtime::trace::{TraceHeader, TraceTimestampFormat};
 use hammer_runtime::{DataPlaneMain, ThreadMain};
@@ -161,7 +160,10 @@ fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs) -> Result<(), CliErro
     }
 
     let threads = ThreadMain::global();
-    for owner in std::iter::once(&*main).chain(threads.data_workers().map(|worker| {
+    for owner in std::iter::once(&*main).chain((1..=threads.worker_count()).map(|thread_index| {
+        let worker = threads
+            .thread_by_index(thread_index)
+            .expect("Data Worker has a thread descriptor");
         // SAFETY: the non-MP-safe CLI holds WorkerBarrier, and the Worker
         // released its own main borrow before acknowledging the barrier.
         unsafe { threads.worker_main_at_barrier(worker) as &DataPlaneMain }
@@ -178,7 +180,10 @@ fn trace_add(main: &mut DataPlaneMain, args: TraceAddArgs) -> Result<(), CliErro
 
     main.trace_main_mut()
         .add_count(node, args.count, args.verbose);
-    for worker in threads.data_workers() {
+    for thread_index in 1..=threads.worker_count() {
+        let worker = threads
+            .thread_by_index(thread_index)
+            .expect("Data Worker has a thread descriptor");
         // SAFETY: the same barrier remains held through the complete update.
         unsafe { threads.worker_main_at_barrier(worker) }
             .trace_main_mut()
@@ -193,12 +198,17 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, C
     let mut output = String::new();
     let timestamp_format = main.trace_main().timestamp_format;
     let threads = ThreadMain::global();
-    let mains = std::iter::once((0, "main", &*main)).chain(threads.data_workers().map(|worker| {
-        // SAFETY: the non-MP-safe CLI holds WorkerBarrier until formatting ends.
-        (worker.thread_index(), worker.name(), unsafe {
-            threads.worker_main_at_barrier(worker) as &DataPlaneMain
-        })
-    }));
+    let mains = std::iter::once((0, "main", &*main)).chain((1..=threads.worker_count()).map(
+        |thread_index| {
+            let worker = threads
+                .thread_by_index(thread_index)
+                .expect("Data Worker has a thread descriptor");
+            // SAFETY: the non-MP-safe CLI holds WorkerBarrier until formatting ends.
+            (worker.thread_index(), worker.name(), unsafe {
+                threads.worker_main_at_barrier(worker) as &DataPlaneMain
+            })
+        },
+    ));
     for (thread_index, name, owner) in mains {
         writeln!(
             output,
@@ -240,14 +250,20 @@ fn show_trace(main: &mut DataPlaneMain, args: ShowTraceArgs) -> Result<String, C
 fn clear_trace(main: &mut DataPlaneMain, _: ClearTraceArgs) -> Result<(), CliError> {
     let threads = ThreadMain::global();
     main.trace_main_mut().trace_enable = false;
-    for worker in threads.data_workers() {
+    for thread_index in 1..=threads.worker_count() {
+        let worker = threads
+            .thread_by_index(thread_index)
+            .expect("Data Worker has a thread descriptor");
         // SAFETY: the non-MP-safe CLI holds WorkerBarrier for both passes.
         unsafe { threads.worker_main_at_barrier(worker) }
             .trace_main_mut()
             .trace_enable = false;
     }
     main.trace_main_mut().clear();
-    for worker in threads.data_workers() {
+    for thread_index in 1..=threads.worker_count() {
+        let worker = threads
+            .thread_by_index(thread_index)
+            .expect("Data Worker has a thread descriptor");
         unsafe { threads.worker_main_at_barrier(worker) }
             .trace_main_mut()
             .clear();

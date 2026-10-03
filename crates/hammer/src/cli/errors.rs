@@ -219,7 +219,10 @@ fn errors(main: &mut DataPlaneMain, args: ErrorsArgs) -> Result<ErrorsReport, Cl
 fn clear_errors(main: &mut DataPlaneMain, _: ClearErrorsArgs) -> Result<(), CliError> {
     let threads = ThreadMain::global();
     main.clear_node_error_counters();
-    for worker in threads.data_workers() {
+    for thread_index in 1..=threads.worker_count() {
+        let worker = threads
+            .thread_by_index(thread_index)
+            .expect("Data Worker has a thread descriptor");
         // SAFETY: this non-MP-safe CLI holds WorkerBarrier for the full pass.
         unsafe { threads.worker_main_at_barrier(worker) }.clear_node_error_counters();
     }

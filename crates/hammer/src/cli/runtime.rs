@@ -417,7 +417,10 @@ fn runtime(main: &mut DataPlaneMain, args: RuntimeArgs) -> Result<RuntimeReport,
 fn clear_runtime(main: &mut DataPlaneMain, _: ClearRuntimeArgs) -> Result<(), CliError> {
     let threads = ThreadMain::global();
     let timestamp = main.clear_runtime_stats();
-    for worker in threads.data_workers() {
+    for thread_index in 1..=threads.worker_count() {
+        let worker = threads
+            .thread_by_index(thread_index)
+            .expect("Data Worker has a thread descriptor");
         // SAFETY: the CLI directory holds WorkerBarrier until this handler
         // returns, so the worker cannot borrow its DataPlaneMain here.
         unsafe { threads.worker_main_at_barrier(worker) }.clear_runtime_stats();
