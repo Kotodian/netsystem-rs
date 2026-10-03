@@ -1353,7 +1353,10 @@ impl StatsSegment {
         Ok(())
     }
 
-    pub(crate) fn entry(&self, index: DirectoryIndex) -> StatsResult<&DirectoryEntry> {
+    /// Borrows a declared entry for the current collector operation.
+    /// Resolve it after structural updates and finish using it before another
+    /// operation can grow the directory, as in VPP's collector dispatch.
+    pub fn entry(&self, index: DirectoryIndex) -> StatsResult<&DirectoryEntry> {
         let directory = self.directory();
         directory
             .get(index.raw() as usize)
