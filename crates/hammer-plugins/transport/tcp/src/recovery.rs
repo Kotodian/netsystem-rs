@@ -156,6 +156,7 @@ pub struct TcpRecoveryState {
     snd_nxt: TcpSeq,
     tlp_timer_armed: bool,
     tlp_probe_end: Option<TcpSeq>,
+    tlp_probe_retransmitted: bool,
     tlp_rtt_fresh: bool,
     recovery_active: bool,
     no_sack_first_pending: bool,
@@ -192,6 +193,7 @@ impl TcpRecoveryState {
             snd_nxt: TcpSeq::from(0),
             tlp_timer_armed: false,
             tlp_probe_end: None,
+            tlp_probe_retransmitted: false,
             tlp_rtt_fresh: false,
             recovery_active: false,
             no_sack_first_pending: false,
@@ -338,6 +340,14 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
+        let tlp_recovered = self.tlp_probe_retransmitted
+            && self
+                .tlp_probe_end
+                .is_some_and(|end| ack.acknowledgment > end);
+        if tlp_recovered {
+            let max_datagram_size = congestion.max_datagram_size();
+            congestion.on_tail_loss_probe_ack(ack.now, self.bytes_in_flight, max_datagram_size);
+        }
         let (advanced, latest_rtt) = self.process_ack(ack, congestion);
         self.advance_scoreboard_for_ack(ack.acknowledgment, congestion.max_datagram_size());
         self.maybe_finish_recovery(ack.acknowledgment, congestion);
@@ -357,11 +367,12 @@ impl TcpRecoveryState {
         if latest_rtt.is_some() {
             self.tlp_rtt_fresh = true;
         }
-        if self
-            .tlp_probe_end
-            .is_some_and(|end| ack.acknowledgment >= end)
-        {
+        let tlp_cleared = self.tlp_probe_end.is_some_and(|end| {
+            ack.acknowledgment > end || (ack.acknowledgment >= end && !self.tlp_probe_retransmitted)
+        });
+        if tlp_cleared {
             self.tlp_probe_end = None;
+            self.tlp_probe_retransmitted = false;
         }
         self.tlp_timer_armed =
             self.has_unacked_data() && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
@@ -375,6 +386,14 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
+        let tlp_recovered = self.tlp_probe_retransmitted
+            && self
+                .tlp_probe_end
+                .is_some_and(|end| ack.acknowledgment > end);
+        if tlp_recovered {
+            let max_datagram_size = congestion.max_datagram_size();
+            congestion.on_tail_loss_probe_ack(ack.now, self.bytes_in_flight, max_datagram_size);
+        }
         let mut latest_rtt = None;
         let mut largest_acked = 0;
         let mut any_acked = false;
@@ -485,11 +504,12 @@ impl TcpRecoveryState {
         if latest_rtt.is_some() {
             self.tlp_rtt_fresh = true;
         }
-        if self
-            .tlp_probe_end
-            .is_some_and(|end| ack.acknowledgment >= end)
-        {
+        let tlp_cleared = self.tlp_probe_end.is_some_and(|end| {
+            ack.acknowledgment > end || (ack.acknowledgment >= end && !self.tlp_probe_retransmitted)
+        });
+        if tlp_cleared {
             self.tlp_probe_end = None;
+            self.tlp_probe_retransmitted = false;
         }
         self.tlp_timer_armed =
             self.has_unacked_data() && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
@@ -521,6 +541,8 @@ impl TcpRecoveryState {
                 LostPacket {
                     packet_number: sample.packet_number,
                     bytes: sample.bytes,
+                    bytes_in_flight: self.bytes_in_flight,
+                    lost: self.lost.saturating_add(u64::from(sample.bytes)),
                     sent_at: sample.sent_at,
                 },
                 false,
@@ -536,6 +558,7 @@ impl TcpRecoveryState {
             recovery_started |= !self.recovery_active;
         }
         if recovery_started {
+            congestion.on_recovery();
             self.recovery_active = true;
             self.scoreboard.high_rxt = self
                 .scoreboard
@@ -559,6 +582,7 @@ impl TcpRecoveryState {
         if lost_any {
             self.tlp_timer_armed = false;
             self.tlp_probe_end = None;
+            self.tlp_probe_retransmitted = false;
         }
     }
 
@@ -730,6 +754,7 @@ impl TcpRecoveryState {
             self.rack_rescan_earliest();
         }
         self.tlp_probe_end = Some(end);
+        self.tlp_probe_retransmitted = retransmitted.is_some();
         self.tlp_rtt_fresh = false;
         self.tlp_timer_armed = false;
     }
@@ -753,6 +778,8 @@ impl TcpRecoveryState {
             LostPacket {
                 packet_number: sample.packet_number,
                 bytes: sample.bytes,
+                bytes_in_flight: self.bytes_in_flight,
+                lost: self.lost.saturating_add(u64::from(sample.bytes)),
                 sent_at: sample.sent_at,
             },
             true,
@@ -767,6 +794,7 @@ impl TcpRecoveryState {
         current.lost = true;
         self.refresh_lost_bytes();
         if !self.recovery_active {
+            congestion.on_recovery();
             self.recovery_active = true;
             self.scoreboard.high_rxt = self
                 .scoreboard
@@ -790,6 +818,7 @@ impl TcpRecoveryState {
         self.no_sack_first_pending = true;
         self.tlp_timer_armed = false;
         self.tlp_probe_end = None;
+        self.tlp_probe_retransmitted = false;
         Some(sample)
     }
 
@@ -1464,6 +1493,7 @@ impl Clone for TcpRecoveryState {
             snd_nxt: self.snd_nxt,
             tlp_timer_armed: self.tlp_timer_armed,
             tlp_probe_end: self.tlp_probe_end,
+            tlp_probe_retransmitted: self.tlp_probe_retransmitted,
             tlp_rtt_fresh: self.tlp_rtt_fresh,
             recovery_active: self.recovery_active,
             no_sack_first_pending: self.no_sack_first_pending,

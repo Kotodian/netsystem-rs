@@ -28,6 +28,7 @@ const BBR_PROBE_WAIT_BASE: Duration = Duration::from_secs(2);
 const BBR_PROBE_WAIT_RANDOM: Duration = Duration::from_secs(1);
 const BBR_SEND_QUANTUM_INTERVAL: Duration = Duration::from_millis(1);
 const BBR_SEND_QUANTUM_MAX: u32 = 64 * 1024;
+const BBR_PACING_MARGIN_MILLI: u32 = 990;
 const BBR_OFFLOAD_BUDGET_INTERVAL: Duration = Duration::from_micros(130);
 const BBR_OFFLOAD_QUANTA_MIN: u32 = 3;
 const BBR_OFFLOAD_QUANTA_MAX: u32 = 16;
@@ -247,7 +248,7 @@ impl BbrController {
     }
 
     fn apply_ack_sample(&mut self, sample: AckSample, bytes_in_flight: u32, app_limited: bool) {
-        if sample.bytes_acked == 0 {
+        if sample.bytes_acked == 0 && sample.delivered == 0 {
             return;
         }
 
@@ -269,14 +270,10 @@ impl BbrController {
             self.next_round_delivered = self.delivered;
         }
 
-        if sample.rtt.is_zero() {
-            return;
-        }
-
-        self.maybe_enter_probe_rtt(sample.now);
-        self.update_min_rtt(sample);
-        self.update_bandwidth(sample, app_limited);
+        let probe_rtt_expired = self.update_min_rtt(sample);
+        let sample_bw = self.update_bandwidth(sample, app_limited);
         self.update_ack_aggregation(sample);
+        self.count_loss_event();
         self.update_loss_round(sample);
         if self.ack_phase == BbrAckPhase::ProbeStarting && self.round_start() {
             self.ack_phase = BbrAckPhase::ProbeFeedback;
@@ -285,22 +282,38 @@ impl BbrController {
 
         match self.mode {
             BbrMode::Startup => self.update_startup(sample, app_limited),
-            BbrMode::Drain => self.update_drain(bytes_in_flight),
+            BbrMode::Drain => self.update_drain(sample.now, bytes_in_flight),
             BbrMode::ProbeBw if !probe_transitioned => self.update_probe_bw(sample),
             BbrMode::ProbeRtt => self.update_probe_rtt(sample, bytes_in_flight),
             BbrMode::ProbeBw => {}
         }
 
+        if self.mode != BbrMode::ProbeRtt
+            && probe_rtt_expired
+            && !self.has_flag(BbrFlags::IDLE_RESTART)
+        {
+            self.start_probe_rtt(sample.now);
+            self.update_probe_rtt(sample, bytes_in_flight);
+        }
+
+        if self.has_flag(BbrFlags::LOSS_ROUND_START) {
+            self.bw_latest = sample_bw;
+            self.inflight_latest = sample.delivered.min(u64::from(u32::MAX)) as u32;
+            self.loss_events = 0;
+            self.clear_flag(BbrFlags::RECOVERY_IN_ROUND);
+        }
+
         self.update_pacing_rate();
+        self.set_congestion_window(sample.bytes_acked);
     }
 
-    fn update_min_rtt(&mut self, sample: AckSample) {
-        if sample.rtt.is_zero() {
-            return;
-        }
-        let probe_expired = self.probe_rtt_min_stamp.is_none_or(|stamp| {
+    fn update_min_rtt(&mut self, sample: AckSample) -> bool {
+        let probe_expired = self.probe_rtt_min_stamp.is_some_and(|stamp| {
             sample.now.saturating_duration_since(stamp) > BBR_MIN_RTT_PROBE_INTERVAL
         });
+        if sample.rtt.is_zero() {
+            return probe_expired;
+        }
         if self
             .probe_rtt_min_delay
             .is_none_or(|min_rtt| sample.rtt <= min_rtt)
@@ -318,24 +331,36 @@ impl BbrController {
             self.min_rtt = self.probe_rtt_min_delay;
             self.min_rtt_stamp = self.probe_rtt_min_stamp;
         }
+        probe_expired
     }
 
-    fn update_bandwidth(&mut self, sample: AckSample, app_limited: bool) {
+    fn update_bandwidth(&mut self, sample: AckSample, app_limited: bool) -> u64 {
         if sample.delivered == 0 || sample.interval.is_zero() {
-            return;
+            return 0;
         }
         let micros = sample.interval.as_micros().max(1);
         let sample_rate = ((u128::from(sample.delivered) * 1_000_000u128) / micros)
             .min(u128::from(u64::MAX)) as u64;
         let max_bw = self.max_bw();
         if app_limited && max_bw != 0 && sample_rate <= max_bw {
-            return;
+            return 0;
         }
         self.bw_hi[1] = self.bw_hi[1].max(sample_rate);
         self.bw_latest = self.bw_latest.max(sample_rate);
         self.inflight_latest = self
             .inflight_latest
             .max(sample.delivered.min(u64::from(u32::MAX)) as u32);
+        sample_rate
+    }
+
+    fn count_loss_event(&mut self) {
+        if self.has_flag(BbrFlags::LOSS_EVENT_PENDING)
+            && self.mode == BbrMode::Startup
+            && self.loss_events < BBR_STARTUP_FULL_LOSS_ROUNDS
+        {
+            self.loss_events = self.loss_events.saturating_add(1);
+        }
+        self.clear_flag(BbrFlags::LOSS_EVENT_PENDING);
     }
 
     fn update_ack_aggregation(&mut self, sample: AckSample) {
@@ -345,10 +370,12 @@ impl BbrController {
         let now = sample.now;
         let epoch = self.ack_epoch_stamp.get_or_insert(now);
         let elapsed = now.saturating_duration_since(*epoch);
-        let expected = u128::from(self.bw()).saturating_mul(elapsed.as_nanos()) / 1_000_000_000u128;
+        let mut expected =
+            u128::from(self.bw()).saturating_mul(elapsed.as_nanos()) / 1_000_000_000u128;
         if u128::from(self.ack_epoch_acked) <= expected {
             self.ack_epoch_acked = 0;
             *epoch = now;
+            expected = 0;
         }
         self.ack_epoch_acked = self
             .ack_epoch_acked
@@ -374,51 +401,42 @@ impl BbrController {
                 self.prior_cwnd = self.prior_cwnd.max(self.congestion_window);
             }
             self.last_loss_counted = total_loss;
-            self.set_flag(BbrFlags::LOSS_IN_ROUND | BbrFlags::LOSS_EVENT_PENDING);
-            if self.mode == BbrMode::Startup {
-                self.loss_events = self.loss_events.saturating_add(1);
-                if self.loss_events >= BBR_STARTUP_FULL_LOSS_ROUNDS {
-                    self.set_flag(BbrFlags::FULL_BW_REACHED);
-                    self.undo_state = BbrUndoState::Startup;
-                    self.inflight_hi = self.inflight_latest.max(self.congestion_window);
-                    self.mode = BbrMode::Drain;
-                }
-            }
-            if self.has_flag(BbrFlags::IS_BW_PROBE_SAMPLE)
-                && sample.tx_in_flight != 0
-                && sample.lost.saturating_mul(BBR_LOSS_THRESHOLD_DENOMINATOR)
-                    > sample
-                        .tx_in_flight
-                        .saturating_mul(BBR_LOSS_THRESHOLD_NUMERATOR)
-            {
-                self.set_flag(BbrFlags::PREV_PROBE_TOO_HIGH);
-                self.inflight_hi = self
-                    .inflight_hi
-                    .max(sample.tx_in_flight.min(u64::from(BBR_INFLIGHT_INFINITY)) as u32);
-            }
+            self.set_flag(BbrFlags::LOSS_IN_ROUND);
         }
         if self.has_flag(BbrFlags::LOSS_IN_ROUND)
             && sample.prior_delivered >= self.loss_round_delivered
         {
             self.set_flag(BbrFlags::LOSS_ROUND_START | BbrFlags::LOSS_ROUND_HAD_LOSS);
             self.loss_round_delivered = self.delivered;
-            if self.bw_lo == BBR_BW_INFINITY {
-                self.bw_lo = self.max_bw();
+            if !self.is_probing_bw() {
+                if self.bw_lo == BBR_BW_INFINITY {
+                    self.bw_lo = self.max_bw();
+                }
+                if self.inflight_lo == BBR_INFLIGHT_INFINITY {
+                    self.inflight_lo = self.congestion_window;
+                }
+                self.bw_lo = self
+                    .bw_latest
+                    .max(self.bw_lo.saturating_mul(BBR_BETA_NUMERATOR) / BBR_BETA_DENOMINATOR);
+                self.inflight_lo = self.inflight_latest.max(
+                    self.inflight_lo.saturating_mul(BBR_BETA_NUMERATOR as u32)
+                        / BBR_BETA_DENOMINATOR as u32,
+                );
+                self.bw_latest = 0;
+                self.inflight_latest = 0;
+                self.clear_flag(BbrFlags::LOSS_IN_ROUND);
             }
-            if self.inflight_lo == BBR_INFLIGHT_INFINITY {
-                self.inflight_lo = self.congestion_window;
-            }
-            self.bw_lo = self
-                .bw_latest
-                .max(self.bw_lo.saturating_mul(BBR_BETA_NUMERATOR) / BBR_BETA_DENOMINATOR);
-            self.inflight_lo = self.inflight_latest.max(
-                self.inflight_lo.saturating_mul(BBR_BETA_NUMERATOR as u32)
-                    / BBR_BETA_DENOMINATOR as u32,
-            );
-            self.bw_latest = 0;
-            self.inflight_latest = 0;
-            self.clear_flag(BbrFlags::LOSS_IN_ROUND);
         }
+    }
+
+    #[inline]
+    fn is_probing_bw(&self) -> bool {
+        self.mode == BbrMode::Startup
+            || (self.mode == BbrMode::ProbeBw
+                && matches!(
+                    self.probe_bw_phase,
+                    BbrProbeBwPhase::Refill | BbrProbeBwPhase::Up
+                ))
     }
 
     fn start_probe_bw_down(&mut self, now: Instant) {
@@ -499,12 +517,31 @@ impl BbrController {
                     .saturating_mul(BBR_LOSS_THRESHOLD_NUMERATOR)
     }
 
+    #[inline]
+    fn inflight_at_loss(tx_in_flight: u64, lost: u64, size: u32) -> u64 {
+        let size = u64::from(size);
+        if size > tx_in_flight || size > lost {
+            return u64::from(BBR_INFLIGHT_INFINITY);
+        }
+        let inflight_prev = tx_in_flight - size;
+        let lost_prev = lost - size;
+        let loss_budget = inflight_prev.saturating_mul(BBR_LOSS_THRESHOLD_NUMERATOR)
+            / BBR_LOSS_THRESHOLD_DENOMINATOR;
+        let lost_prefix = if lost_prev >= loss_budget {
+            0
+        } else {
+            (loss_budget - lost_prev).saturating_mul(BBR_LOSS_THRESHOLD_DENOMINATOR)
+                / (BBR_LOSS_THRESHOLD_DENOMINATOR - BBR_LOSS_THRESHOLD_NUMERATOR)
+        };
+        inflight_prev.saturating_add(lost_prefix)
+    }
+
     fn handle_inflight_too_high(&mut self, sample: AckSample, app_limited: bool) {
         self.set_flag(BbrFlags::PREV_PROBE_TOO_HIGH);
         self.clear_flag(BbrFlags::IS_BW_PROBE_SAMPLE);
         if !app_limited {
             let target = self
-                .target_congestion_window(BBR_CWND_GAIN_MILLI)
+                .target_inflight()
                 .saturating_mul(BBR_BETA_NUMERATOR as u32)
                 / BBR_BETA_DENOMINATOR as u32;
             self.inflight_hi = sample
@@ -541,7 +578,7 @@ impl BbrController {
             .cycle_stamp
             .zip(self.bw_probe_wait)
             .is_some_and(|(stamp, wait)| now.saturating_duration_since(stamp) >= wait);
-        let target = self.target_congestion_window(1000);
+        let target = self.target_inflight();
         let rounds = target.saturating_add(self.max_datagram_size.saturating_sub(1))
             / self.max_datagram_size.max(1);
         time_ready || self.rounds_since_probe_up >= rounds.min(63) as u8
@@ -556,6 +593,12 @@ impl BbrController {
             )
             .max(min_congestion_window(self.max_datagram_size));
         bytes_in_flight <= headroom && bytes_in_flight <= self.target_congestion_window(1000)
+    }
+
+    #[inline]
+    fn target_inflight(&self) -> u32 {
+        self.target_congestion_window(1000)
+            .min(self.congestion_window)
     }
 
     fn should_go_down(&mut self, sample: AckSample) -> bool {
@@ -600,21 +643,16 @@ impl BbrController {
             .min(u128::from(BBR_SEND_QUANTUM_MAX)) as u32;
         let quantum = quantum.max(self.max_datagram_size.saturating_mul(2));
         let pipeline = (u128::from(rate).saturating_mul(BBR_OFFLOAD_BUDGET_INTERVAL.as_nanos())
-            / 1_000_000_000u128) as u32;
+            / 1_000_000_000u128)
+            .min(u128::from(u32::MAX)) as u32;
         self.offload_budget = pipeline
             .max(quantum.saturating_mul(BBR_OFFLOAD_QUANTA_MIN))
             .min(quantum.saturating_mul(BBR_OFFLOAD_QUANTA_MAX));
         self.offload_mss = self.max_datagram_size.min(u32::from(u16::MAX)) as u16;
     }
 
-    fn maybe_enter_probe_rtt(&mut self, now: Instant) {
-        let Some(stamp) = self.min_rtt_stamp else {
-            return;
-        };
+    fn start_probe_rtt(&mut self, now: Instant) {
         if self.mode == BbrMode::ProbeRtt {
-            return;
-        }
-        if now.saturating_duration_since(stamp) <= BBR_MIN_RTT_FILTER {
             return;
         }
         self.mode = BbrMode::ProbeRtt;
@@ -622,23 +660,28 @@ impl BbrController {
         self.probe_rtt_done_stamp = None;
         self.clear_flag(BbrFlags::PROBE_RTT_ROUND_DONE);
         self.prior_cwnd = self.congestion_window;
-        self.congestion_window = self.probe_rtt_target();
+        self.next_round_delivered = self.delivered;
+        self.probe_rtt_min_stamp.get_or_insert(now);
     }
 
     fn update_startup(&mut self, sample: AckSample, app_limited: bool) {
-        let target = self.target_congestion_window(BBR_CWND_GAIN_MILLI);
-        if self.full_bw_reached() {
-            self.congestion_window = self
-                .congestion_window
-                .saturating_add(sample.bytes_acked)
-                .min(target);
-        } else if self.congestion_window < target || self.delivered < u64::from(self.initial_cwnd) {
-            self.congestion_window = self.congestion_window.saturating_add(sample.bytes_acked);
+        if self.has_flag(BbrFlags::LOSS_ROUND_START)
+            && self.has_flag(BbrFlags::LOSS_ROUND_HAD_LOSS)
+            && self.has_flag(BbrFlags::RECOVERY_IN_ROUND)
+            && self.loss_events >= BBR_STARTUP_FULL_LOSS_ROUNDS
+            && self.inflight_too_high(sample)
+        {
+            self.set_flag(BbrFlags::FULL_BW_REACHED);
+            self.undo_state = BbrUndoState::Startup;
+            self.inflight_hi = self
+                .target_congestion_window(1000)
+                .max(self.inflight_latest);
         }
-        self.congestion_window = self
-            .congestion_window
-            .max(min_congestion_window(self.max_datagram_size));
-
+        if self.full_bw_reached() {
+            self.mode = BbrMode::Drain;
+            self.drain_rounds = 0;
+            return;
+        }
         if !self.round_start() || app_limited {
             return;
         }
@@ -666,10 +709,9 @@ impl BbrController {
         }
     }
 
-    fn update_drain(&mut self, bytes_in_flight: u32) {
-        self.congestion_window = self.target_congestion_window(BBR_CWND_GAIN_MILLI);
+    fn update_drain(&mut self, now: Instant, bytes_in_flight: u32) {
         if bytes_in_flight <= self.target_congestion_window(1000) || self.drain_rounds > 3 {
-            self.start_probe_bw_down(Instant::now());
+            self.start_probe_bw_down(now);
         }
     }
 
@@ -715,22 +757,11 @@ impl BbrController {
                     .saturating_add(increments.saturating_mul(self.max_datagram_size));
             }
         }
-        let target_gain = if self.probe_bw_phase == BbrProbeBwPhase::Up {
-            BBR_PROBE_UP_CWND_GAIN_MILLI
-        } else {
-            BBR_CWND_GAIN_MILLI
-        };
-        let target = self.target_congestion_window(target_gain);
-        self.congestion_window = self
-            .congestion_window
-            .saturating_add(sample.bytes_acked)
-            .min(target)
-            .max(min_congestion_window(self.max_datagram_size));
     }
 
     fn update_probe_rtt(&mut self, sample: AckSample, bytes_in_flight: u32) {
         let probe_rtt_window = self.probe_rtt_target();
-        self.congestion_window = probe_rtt_window;
+        self.congestion_window = self.congestion_window.min(probe_rtt_window);
         if bytes_in_flight <= probe_rtt_window && self.probe_rtt_done_stamp.is_none() {
             self.probe_rtt_done_stamp = Some(
                 sample
@@ -742,23 +773,27 @@ impl BbrController {
         if self.round_start() {
             self.set_flag(BbrFlags::PROBE_RTT_ROUND_DONE);
         }
-        if self
-            .probe_rtt_done_stamp
-            .is_some_and(|done| sample.now >= done && self.has_flag(BbrFlags::PROBE_RTT_ROUND_DONE))
+        self.check_probe_rtt_done(sample.now);
+    }
+
+    fn check_probe_rtt_done(&mut self, now: Instant) {
+        if !self.probe_rtt_done_stamp.is_some_and(|done| now > done)
+            || !self.has_flag(BbrFlags::PROBE_RTT_ROUND_DONE)
         {
-            self.probe_rtt_min_stamp = Some(sample.now);
-            self.congestion_window = self.congestion_window.max(self.prior_cwnd);
-            self.mode = if self.full_bw_reached() {
-                self.start_probe_bw_down(sample.now);
-                BbrMode::ProbeBw
-            } else {
-                BbrMode::Startup
-            };
-            self.ack_phase = BbrAckPhase::Init;
-            self.probe_rtt_done_stamp = None;
-            self.clear_flag(BbrFlags::PROBE_RTT_ROUND_DONE);
-            self.congestion_window = self.target_congestion_window(BBR_CWND_GAIN_MILLI);
+            return;
         }
+        self.probe_rtt_min_stamp = Some(now);
+        self.congestion_window = self.congestion_window.max(self.prior_cwnd);
+        self.reset_short_term_model();
+        if self.full_bw_reached() {
+            self.start_probe_bw_down(now);
+            self.probe_bw_phase = BbrProbeBwPhase::Cruise;
+        } else {
+            self.mode = BbrMode::Startup;
+        }
+        self.ack_phase = BbrAckPhase::Init;
+        self.probe_rtt_done_stamp = None;
+        self.clear_flag(BbrFlags::PROBE_RTT_ROUND_DONE);
     }
 
     fn target_congestion_window(&self, gain_milli: u32) -> u32 {
@@ -773,25 +808,86 @@ impl BbrController {
             .saturating_mul(u128::from(gain_milli))
             / 1_000_000u128
             / 1000u128;
-        let mut target = bytes
+        let packets = bytes.saturating_add(u128::from(self.max_datagram_size.saturating_sub(1)))
+            / u128::from(self.max_datagram_size.max(1));
+        let target = packets
+            .saturating_mul(u128::from(self.max_datagram_size))
             .saturating_add(u128::from(self.extra_acked.value()))
-            .clamp(
-                u128::from(min_congestion_window(self.max_datagram_size)),
-                u128::from(u32::MAX),
-            ) as u32;
-        if self.inflight_lo != BBR_INFLIGHT_INFINITY {
-            target = target.min(self.inflight_lo);
+            .min(u128::from(BBR_INFLIGHT_INFINITY)) as u32;
+        self.quantization_budget(target)
+    }
+
+    fn quantization_budget(&self, inflight: u32) -> u32 {
+        let mut budget = u64::from(inflight)
+            .max(u64::from(self.offload_budget))
+            .max(u64::from(min_congestion_window(self.max_datagram_size)));
+        if self.mode == BbrMode::ProbeBw && self.probe_bw_phase == BbrProbeBwPhase::Up {
+            budget = budget.saturating_add(u64::from(self.max_datagram_size).saturating_mul(2));
         }
-        if self.inflight_hi != BBR_INFLIGHT_INFINITY {
-            target = target.min(self.inflight_hi);
+        budget.min(u64::from(BBR_INFLIGHT_INFINITY)) as u32
+    }
+
+    fn bound_congestion_window(&self, cwnd: u32) -> u32 {
+        let mut cap = BBR_INFLIGHT_INFINITY;
+        if self.mode == BbrMode::ProbeBw && self.probe_bw_phase != BbrProbeBwPhase::Cruise {
+            cap = self.inflight_hi;
+        } else if self.mode == BbrMode::ProbeRtt
+            || (self.mode == BbrMode::ProbeBw && self.probe_bw_phase == BbrProbeBwPhase::Cruise)
+        {
+            if self.inflight_hi != BBR_INFLIGHT_INFINITY {
+                let headroom = (u64::from(self.inflight_hi).saturating_mul(BBR_HEADROOM_NUMERATOR)
+                    / BBR_HEADROOM_DENOMINATOR)
+                    .max(u64::from(self.max_datagram_size)) as u32;
+                cap = self
+                    .inflight_hi
+                    .saturating_sub(headroom.min(self.inflight_hi))
+                    .max(min_congestion_window(self.max_datagram_size));
+            }
         }
-        target = target.max(self.offload_budget);
-        target.max(min_congestion_window(self.max_datagram_size))
+        cap = cap.min(self.inflight_lo);
+        cap = cap.max(min_congestion_window(self.max_datagram_size));
+        cwnd.min(cap)
+    }
+
+    fn set_congestion_window(&mut self, bytes_acked: u32) {
+        let gain = match self.mode {
+            BbrMode::ProbeRtt => BBR_PROBE_RTT_CWND_GAIN_MILLI,
+            BbrMode::ProbeBw if self.probe_bw_phase == BbrProbeBwPhase::Up => {
+                BBR_PROBE_UP_CWND_GAIN_MILLI
+            }
+            _ => BBR_CWND_GAIN_MILLI,
+        };
+        let target = self.target_congestion_window(gain);
+        if self.full_bw_reached() {
+            self.congestion_window = self
+                .congestion_window
+                .saturating_add(bytes_acked)
+                .min(target);
+        } else if self.congestion_window < target || self.delivered < u64::from(self.initial_cwnd) {
+            self.congestion_window = self
+                .congestion_window
+                .saturating_add(bytes_acked)
+                .min(BBR_INFLIGHT_INFINITY);
+        }
+        self.congestion_window = self
+            .congestion_window
+            .max(min_congestion_window(self.max_datagram_size));
+        if self.mode == BbrMode::ProbeRtt {
+            self.congestion_window = self.congestion_window.min(self.probe_rtt_target());
+        }
+        self.congestion_window = self.bound_congestion_window(self.congestion_window);
     }
 
     fn probe_rtt_target(&self) -> u32 {
-        self.target_congestion_window(BBR_PROBE_RTT_CWND_GAIN_MILLI)
-            .max(min_congestion_window(self.max_datagram_size))
+        let Some(min_rtt) = self.min_rtt else {
+            return min_congestion_window(self.max_datagram_size);
+        };
+        let bytes = u128::from(self.bw())
+            .saturating_mul(min_rtt.as_micros())
+            .saturating_mul(u128::from(BBR_PROBE_RTT_CWND_GAIN_MILLI))
+            / 1_000_000u128
+            / 1000u128;
+        (bytes.min(u128::from(u32::MAX)) as u32).max(min_congestion_window(self.max_datagram_size))
     }
 
     fn update_pacing_rate(&mut self) {
@@ -808,9 +904,13 @@ impl BbrController {
             },
             BbrMode::ProbeRtt => 1000,
         };
-        let pacing_rate = (u128::from(self.bw()) * u128::from(gain_milli) / 1000u128)
-            .clamp(1, u128::from(u64::MAX)) as u64;
-        self.pacing_rate = Some(pacing_rate);
+        let pacing_rate =
+            (u128::from(self.bw()) * u128::from(gain_milli) * u128::from(BBR_PACING_MARGIN_MILLI)
+                / 1_000_000u128)
+                .clamp(1, u128::from(u64::MAX)) as u64;
+        if self.full_bw_reached() || self.pacing_rate.is_none_or(|current| pacing_rate > current) {
+            self.pacing_rate = Some(pacing_rate);
+        }
         self.update_offload_budget();
     }
 }
@@ -818,6 +918,7 @@ impl BbrController {
 impl CongestionController for BbrController {
     fn new(max_datagram_size: u32) -> Self {
         let max_datagram_size = normalized_max_datagram_size(max_datagram_size);
+        let now = Instant::now();
         Self {
             max_datagram_size,
             mode: BbrMode::Startup,
@@ -839,9 +940,9 @@ impl CongestionController for BbrController {
             bw_latest: 0,
             undo_bw_lo: BBR_BW_INFINITY,
             min_rtt: None,
-            min_rtt_stamp: None,
+            min_rtt_stamp: Some(now),
             probe_rtt_min_delay: None,
-            probe_rtt_min_stamp: None,
+            probe_rtt_min_stamp: Some(now),
             delivered: 0,
             next_round_delivered: 0,
             loss_round_delivered: 0,
@@ -912,6 +1013,15 @@ impl CongestionController for BbrController {
 
     fn on_ack(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample, bytes_in_flight: u32) {
         let app_limited = acked.app_limited;
+        if self.pacing_rate.is_none() && !rtt.latest.is_zero() {
+            let rate = u128::from(self.initial_cwnd)
+                .saturating_mul(1_000_000_000u128)
+                .saturating_mul(u128::from(BBR_HIGH_GAIN_MILLI))
+                / rtt.latest.as_nanos().max(1)
+                / 1000u128;
+            self.pacing_rate = Some(rate.clamp(1, u128::from(u64::MAX)) as u64);
+            self.update_offload_budget();
+        }
         let sample = self.ack_sample(now, acked, rtt);
         self.apply_ack_sample(sample, bytes_in_flight, app_limited);
         if acked.delivered != 0 {
@@ -930,14 +1040,21 @@ impl CongestionController for BbrController {
             self.set_flag(BbrFlags::IDLE_RESTART);
             self.ack_epoch_stamp = Some(now);
             self.ack_epoch_acked = 0;
+            if self.mode == BbrMode::ProbeRtt {
+                self.check_probe_rtt_done(now);
+            }
             if self.mode == BbrMode::ProbeBw {
-                self.pacing_rate = Some(self.bw().max(1));
+                self.pacing_rate = Some(
+                    (self.bw().saturating_mul(u64::from(BBR_PACING_MARGIN_MILLI)) / 1000).max(1),
+                );
                 self.update_offload_budget();
+            } else if self.mode != BbrMode::ProbeRtt {
+                self.update_pacing_rate();
             }
         }
     }
 
-    fn on_loss(&mut self, now: Instant, lost: LostPacket, _: bool) {
+    fn on_loss(&mut self, now: Instant, lost: LostPacket, persistent_congestion: bool) {
         if lost.bytes == 0 {
             return;
         }
@@ -949,70 +1066,63 @@ impl CongestionController for BbrController {
             self.undo_inflight_hi = self.inflight_hi;
         }
         self.set_flag(BbrFlags::LOSS_IN_ROUND | BbrFlags::LOSS_EVENT_PENDING);
-        if self.mode == BbrMode::ProbeBw && self.probe_bw_phase == BbrProbeBwPhase::Up {
-            self.set_flag(BbrFlags::PREV_PROBE_TOO_HIGH);
-            self.undo_state = BbrUndoState::ProbeUp;
-            let target = self
-                .target_congestion_window(BBR_CWND_GAIN_MILLI)
-                .saturating_mul(BBR_BETA_NUMERATOR as u32)
-                / BBR_BETA_DENOMINATOR as u32;
-            self.inflight_hi = self
-                .inflight_hi
-                .min(target.max(min_congestion_window(self.max_datagram_size)));
-            let loss_flags = self.flags
-                & (BbrFlags::LOSS_IN_ROUND
-                    | BbrFlags::LOSS_EVENT_PENDING
-                    | BbrFlags::RECOVERY_IN_ROUND);
-            self.start_probe_bw_down(now);
-            self.set_flag(loss_flags);
+        self.congestion_window = lost.bytes_in_flight.saturating_add(self.max_datagram_size);
+        if persistent_congestion {
+            self.set_flag(BbrFlags::RECOVERY_IN_ROUND);
+        }
+        if self.has_flag(BbrFlags::IS_BW_PROBE_SAMPLE) {
+            let sample = AckSample {
+                bytes_acked: 0,
+                delivered: 0,
+                prior_delivered: self.delivered,
+                interval: Duration::ZERO,
+                tx_in_flight: Self::inflight_at_loss(
+                    u64::from(lost.bytes_in_flight),
+                    lost.lost,
+                    lost.bytes,
+                ),
+                tx_lost: lost.lost,
+                lost: lost.lost,
+                rtt: Duration::ZERO,
+                now,
+            };
+            if self.inflight_too_high(sample) {
+                self.handle_inflight_too_high(sample, false);
+            }
         }
         self.congestion_window = self
             .congestion_window
             .max(min_congestion_window(self.max_datagram_size));
     }
 
-    fn on_recovered(&mut self) {
-        self.congestion_window = self.congestion_window.max(self.prior_cwnd);
-        self.clear_flag(BbrFlags::LOSS_IN_ROUND | BbrFlags::RECOVERY_IN_ROUND);
-        self.full_bw = 0;
-        self.full_bw_count = 0;
-        self.bw_lo = self.bw_lo.max(self.undo_bw_lo);
-        self.inflight_lo = self.inflight_lo.max(self.undo_inflight_lo);
-        self.inflight_hi = self.inflight_hi.max(self.undo_inflight_hi);
-        match self.undo_state {
-            BbrUndoState::Startup if self.mode != BbrMode::Startup => {
-                self.clear_flag(BbrFlags::FULL_BW_REACHED);
-                if self.mode != BbrMode::ProbeRtt {
-                    self.mode = BbrMode::Startup;
-                }
-            }
-            BbrUndoState::ProbeUp
-                if self.mode != BbrMode::ProbeRtt
-                    && (self.mode != BbrMode::ProbeBw
-                        || self.probe_bw_phase != BbrProbeBwPhase::Up) =>
-            {
-                self.start_probe_bw_refill();
-            }
-            BbrUndoState::None | BbrUndoState::Startup | BbrUndoState::ProbeUp => {}
-        }
-        self.undo_state = BbrUndoState::None;
+    fn on_recovery(&mut self) {
+        self.set_flag(BbrFlags::RECOVERY_IN_ROUND);
     }
 
-    fn on_tail_loss_probe(&mut self, now: Instant, bytes_in_flight: u32) {
+    fn on_recovered(&mut self) {
+        self.congestion_window = self.congestion_window.max(self.prior_cwnd);
+    }
+
+    fn on_tail_loss_probe_ack(&mut self, now: Instant, _: u32, max_datagram_size: u32) {
+        self.congestion_window = self.congestion_window.max(self.prior_cwnd);
+        if !self.has_flag(BbrFlags::LOSS_IN_ROUND) {
+            self.loss_round_delivered = self.delivered;
+        }
         self.set_flag(BbrFlags::LOSS_IN_ROUND);
-        if self.mode == BbrMode::ProbeBw
-            && self.probe_bw_phase == BbrProbeBwPhase::Up
-            && self.inflight_hi != BBR_INFLIGHT_INFINITY
-            && bytes_in_flight >= self.inflight_hi
-        {
-            self.set_flag(BbrFlags::PREV_PROBE_TOO_HIGH);
-            self.undo_state = BbrUndoState::ProbeUp;
-            let loss_flags = self.flags
-                & (BbrFlags::LOSS_IN_ROUND
-                    | BbrFlags::LOSS_EVENT_PENDING
-                    | BbrFlags::RECOVERY_IN_ROUND);
-            self.start_probe_bw_down(now);
-            self.set_flag(loss_flags);
+        let sample = AckSample {
+            bytes_acked: 0,
+            delivered: 0,
+            prior_delivered: self.delivered,
+            interval: Duration::ZERO,
+            tx_in_flight: u64::from(self.inflight_latest)
+                .saturating_add(u64::from(max_datagram_size)),
+            tx_lost: u64::from(max_datagram_size),
+            lost: u64::from(max_datagram_size),
+            rtt: Duration::ZERO,
+            now,
+        };
+        if self.has_flag(BbrFlags::IS_BW_PROBE_SAMPLE) && self.inflight_too_high(sample) {
+            self.handle_inflight_too_high(sample, false);
         }
     }
 
@@ -1031,8 +1141,13 @@ impl CongestionController for BbrController {
         if rate == 0 || pending_bytes == 0 {
             return None;
         }
+        let quantum = (u128::from(rate).saturating_mul(BBR_SEND_QUANTUM_INTERVAL.as_nanos())
+            / 1_000_000_000u128)
+            .min(u128::from(BBR_SEND_QUANTUM_MAX)) as u32;
+        let quantum = quantum.max(self.max_datagram_size.saturating_mul(2));
+        let paced_bytes = pending_bytes.min(quantum);
         let nanos = div_ceil_u128(
-            u128::from(pending_bytes) * 1_000_000_000u128,
+            u128::from(paced_bytes) * 1_000_000_000u128,
             u128::from(rate),
         )
         .clamp(1, u128::from(u64::MAX)) as u64;

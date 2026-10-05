@@ -747,10 +747,6 @@ impl TcpWorker {
                 .connections
                 .get_mut(connection_index)
                 .expect("published TLP retains its TCP connection");
-            let bytes_in_flight = connection.recovery.bytes_in_flight();
-            connection
-                .congestion
-                .on_tail_loss_probe(Instant::now(), bytes_in_flight);
             let probe_end = connection.snd_nxt().into();
             connection
                 .recovery

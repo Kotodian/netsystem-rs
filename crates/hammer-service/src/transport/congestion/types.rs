@@ -28,6 +28,10 @@ pub struct AckedPacket {
 pub struct LostPacket {
     pub packet_number: PacketNumber,
     pub bytes: u32,
+    /// Bytes in flight at the loss callback, before retransmission output.
+    pub bytes_in_flight: u32,
+    /// Cumulative bytes marked lost through this loss sample.
+    pub lost: u64,
     pub sent_at: Instant,
 }
 

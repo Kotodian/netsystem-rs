@@ -977,6 +977,7 @@ impl TcpConnection {
             return Ok(None);
         }
         let advanced = acknowledgment > self.snd_una;
+        let was_in_recovery = self.recovery.in_recovery();
         let recovery_ack = self.recovery_ack(acknowledgment);
         let mut latest_rtt = if self.negotiated_options().sack {
             self.recovery
@@ -986,6 +987,10 @@ impl TcpConnection {
         } else {
             None
         };
+        self.update_tx_pacer();
+        if was_in_recovery && !self.recovery.in_recovery() && self.base.is_tx_paced() {
+            self.base.pacer.bucket = 0;
+        }
         if advanced && latest_rtt.is_none() {
             latest_rtt = self.timestamp_rtt_sample(packet, Instant::now());
         }
