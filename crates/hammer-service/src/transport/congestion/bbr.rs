@@ -29,8 +29,7 @@ pub struct BbrController {
     mode: BbrMode,
     congestion_window: u32,
     pacing_rate_bytes_per_second: Option<u64>,
-    bandwidth_window: [u64; 2],
-    max_bandwidth_bytes_per_second: u64,
+    bw_hi: [u64; 2],
     min_rtt: Option<Duration>,
     min_rtt_stamp: Option<Instant>,
     delivered: u64,
@@ -49,6 +48,11 @@ pub struct BbrController {
 impl BbrController {
     pub fn bbr_mode(&self) -> BbrMode {
         self.mode
+    }
+
+    #[inline]
+    fn max_bw(&self) -> u64 {
+        self.bw_hi[0].max(self.bw_hi[1])
     }
 
     fn ack_sample(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample) -> AckSample {
@@ -110,15 +114,11 @@ impl BbrController {
         let micros = sample.interval.as_micros().max(1);
         let sample_rate = ((u128::from(sample.delivered) * 1_000_000u128) / micros)
             .min(u128::from(u64::MAX)) as u64;
-        if app_limited
-            && self.max_bandwidth_bytes_per_second != 0
-            && sample_rate <= self.max_bandwidth_bytes_per_second
-        {
+        let max_bw = self.max_bw();
+        if app_limited && max_bw != 0 && sample_rate <= max_bw {
             return;
         }
-        self.bandwidth_window[1] = self.bandwidth_window[1].max(sample_rate);
-        self.max_bandwidth_bytes_per_second =
-            self.bandwidth_window.iter().copied().max().unwrap_or(0);
+        self.bw_hi[1] = self.bw_hi[1].max(sample_rate);
     }
 
     fn update_ecn_alpha(&mut self, sample: AckSample) {
@@ -170,7 +170,7 @@ impl BbrController {
         }
 
         if self.full_bandwidth_bytes_per_second == 0 {
-            self.full_bandwidth_bytes_per_second = self.max_bandwidth_bytes_per_second;
+            self.full_bandwidth_bytes_per_second = self.max_bw();
             self.full_bandwidth_rounds = 0;
             return;
         }
@@ -180,8 +180,8 @@ impl BbrController {
             + 999)
             / 1000)
             .min(u128::from(u64::MAX)) as u64;
-        if self.max_bandwidth_bytes_per_second >= growth_target {
-            self.full_bandwidth_bytes_per_second = self.max_bandwidth_bytes_per_second;
+        if self.max_bw() >= growth_target {
+            self.full_bandwidth_bytes_per_second = self.max_bw();
             self.full_bandwidth_rounds = 0;
         } else {
             self.full_bandwidth_rounds = self.full_bandwidth_rounds.saturating_add(1);
@@ -204,11 +204,9 @@ impl BbrController {
     fn update_probe_bw(&mut self, sample: AckSample) {
         if self.should_advance_probe_bw_cycle(sample.now) {
             self.cycle_index = (self.cycle_index + 1) % PROBE_BW_GAIN_CYCLE.len();
-            if self.cycle_index == 0 && self.bandwidth_window[1] != 0 {
-                self.bandwidth_window[0] = self.bandwidth_window[1];
-                self.bandwidth_window[1] = 0;
-                self.max_bandwidth_bytes_per_second =
-                    self.bandwidth_window.iter().copied().max().unwrap_or(0);
+            if self.cycle_index == 0 && self.bw_hi[1] != 0 {
+                self.bw_hi[0] = self.bw_hi[1];
+                self.bw_hi[1] = 0;
             }
             self.cycle_stamp = Some(sample.now);
         }
@@ -263,10 +261,10 @@ impl BbrController {
         let Some(min_rtt) = self.min_rtt else {
             return initial_congestion_window(self.max_datagram_size);
         };
-        if self.max_bandwidth_bytes_per_second == 0 {
+        if self.max_bw() == 0 {
             return initial_congestion_window(self.max_datagram_size);
         }
-        let bytes = u128::from(self.max_bandwidth_bytes_per_second)
+        let bytes = u128::from(self.max_bw())
             .saturating_mul(min_rtt.as_micros())
             .saturating_mul(u128::from(gain_milli))
             / 1_000_000u128
@@ -278,7 +276,7 @@ impl BbrController {
     }
 
     fn update_pacing_rate(&mut self) {
-        if self.max_bandwidth_bytes_per_second == 0 {
+        if self.max_bw() == 0 {
             return;
         }
         let gain_milli = match self.mode {
@@ -287,8 +285,7 @@ impl BbrController {
             BbrMode::ProbeBw => PROBE_BW_GAIN_CYCLE[self.cycle_index],
             BbrMode::ProbeRtt => 1000,
         };
-        let pacing_rate = (u128::from(self.max_bandwidth_bytes_per_second) * u128::from(gain_milli)
-            / 1000u128)
+        let pacing_rate = (u128::from(self.max_bw()) * u128::from(gain_milli) / 1000u128)
             .clamp(1, u128::from(u64::MAX)) as u64;
         self.pacing_rate_bytes_per_second = Some(pacing_rate);
     }
@@ -302,8 +299,7 @@ impl CongestionController for BbrController {
             mode: BbrMode::Startup,
             congestion_window: initial_congestion_window(max_datagram_size),
             pacing_rate_bytes_per_second: None,
-            bandwidth_window: [0; 2],
-            max_bandwidth_bytes_per_second: 0,
+            bw_hi: [0; 2],
             min_rtt: None,
             min_rtt_stamp: None,
             delivered: 0,
@@ -325,7 +321,7 @@ impl CongestionController for BbrController {
             congestion_window: self.congestion_window(),
             pacing_rate_bytes_per_second: self.pacing_rate_bytes_per_second,
             delivered: self.delivered,
-            max_bandwidth_bytes_per_second: self.max_bandwidth_bytes_per_second,
+            max_bandwidth_bytes_per_second: self.max_bw(),
             min_rtt: self.min_rtt,
         }
     }
@@ -352,7 +348,7 @@ impl CongestionController for BbrController {
     }
 
     fn max_bandwidth_bytes_per_second(&self) -> u64 {
-        self.max_bandwidth_bytes_per_second
+        self.max_bw()
     }
 
     fn on_packet_sent(&mut self, _: PacketNumber, _: u32, _: u32, _: Instant) {}
