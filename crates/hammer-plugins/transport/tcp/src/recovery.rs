@@ -21,6 +21,12 @@ pub(crate) struct TcpSentSample {
     pub(crate) retransmitted: bool,
     pub(crate) lost: bool,
     pub(crate) tx_lost: bool,
+    pub(crate) delivered: u64,
+    pub(crate) delivered_time: Option<Instant>,
+    pub(crate) first_tx_time: Instant,
+    pub(crate) app_limited: bool,
+    pub(crate) tx_in_flight: u64,
+    pub(crate) tx_lost_bytes: u64,
     pub(crate) rack_deadline: Option<Instant>,
     pub(crate) sent_at: Instant,
     pub(crate) prev: Option<u32>,
@@ -135,6 +141,10 @@ pub struct TcpRecoveryState {
     sample_head: Option<u32>,
     sample_tail: Option<u32>,
     bytes_in_flight: u32,
+    delivered: u64,
+    delivered_time: Option<Instant>,
+    first_tx_time: Option<Instant>,
+    lost: u64,
     ack_floor: TcpSeq,
     scoreboard: TcpScoreboard,
     rack_deadline: Option<Instant>,
@@ -167,6 +177,10 @@ impl TcpRecoveryState {
             sample_head: None,
             sample_tail: None,
             bytes_in_flight: 0,
+            delivered: 0,
+            delivered_time: None,
+            first_tx_time: None,
+            lost: 0,
             ack_floor: 0u32.into(),
             scoreboard: TcpScoreboard::new(),
             rack_deadline: None,
@@ -208,8 +222,18 @@ impl TcpRecoveryState {
         end_sequence: TcpSeq,
         bytes: u32,
         payload_len: u32,
+        bytes_in_flight: u32,
         sent_at: Instant,
+        app_limited: bool,
     ) {
+        if bytes == 0 {
+            return;
+        }
+        if bytes_in_flight == 0 {
+            self.delivered_time = Some(sent_at);
+            self.first_tx_time = Some(sent_at);
+        }
+        let first_tx_time = self.first_tx_time.unwrap_or(sent_at);
         let prev = self.sample_tail;
         let sample_index = self.sent_samples.insert(TcpSentSample {
             packet_number,
@@ -220,6 +244,12 @@ impl TcpRecoveryState {
             retransmitted: false,
             lost: false,
             tx_lost: false,
+            delivered: self.delivered,
+            delivered_time: self.delivered_time,
+            first_tx_time,
+            app_limited,
+            tx_in_flight: u64::from(bytes_in_flight).saturating_add(u64::from(bytes)),
+            tx_lost_bytes: self.lost,
             rack_deadline: None,
             sent_at,
             prev,
@@ -348,6 +378,8 @@ impl TcpRecoveryState {
         let mut latest_rtt = None;
         let mut largest_acked = 0;
         let mut any_acked = false;
+        let mut acked_bytes = 0u32;
+        let mut rate_sample = None;
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
             let Some(sample) = self.sent_sample(index) else {
@@ -368,7 +400,10 @@ impl TcpRecoveryState {
             };
             largest_acked = largest_acked.max(segment.packet_number);
             any_acked = true;
-            latest_rtt = self.deliver_sample(ack, segment, congestion).or(latest_rtt);
+            acked_bytes = acked_bytes.saturating_add(segment.bytes);
+            latest_rtt = self
+                .deliver_sample(ack, segment, &mut rate_sample)
+                .or(latest_rtt);
             if partial {
                 break;
             }
@@ -417,10 +452,14 @@ impl TcpRecoveryState {
                 };
                 largest_acked = largest_acked.max(segment.packet_number);
                 any_acked = true;
-                latest_rtt = self.deliver_sample(ack, segment, congestion).or(latest_rtt);
+                acked_bytes = acked_bytes.saturating_add(segment.bytes);
+                latest_rtt = self
+                    .deliver_sample(ack, segment, &mut rate_sample)
+                    .or(latest_rtt);
             }
         }
         if any_acked {
+            self.deliver_ack_batch(ack, acked_bytes, latest_rtt, rate_sample, congestion);
             congestion.on_end_acks(
                 ack.now,
                 self.bytes_in_flight(),
@@ -486,6 +525,7 @@ impl TcpRecoveryState {
                 },
                 false,
             );
+            self.lost = self.lost.saturating_add(u64::from(sample.bytes));
             let Some(current) = self.sent_sample_mut(sample_index) else {
                 break;
             };
@@ -717,6 +757,9 @@ impl TcpRecoveryState {
             },
             true,
         );
+        if !sample.tx_lost {
+            self.lost = self.lost.saturating_add(u64::from(sample.bytes));
+        }
         let current = self
             .sent_sample_mut(head)
             .expect("RTO retains the oldest outstanding sample");
@@ -805,7 +848,9 @@ impl TcpRecoveryState {
     ) -> (bool, Option<Duration>) {
         let mut largest_acked = 0;
         let mut any_acked = false;
+        let mut acked_bytes = 0u32;
         let mut latest_rtt = None;
+        let mut rate_sample = None;
         let mut cursor = self.sample_head;
         let mut done = false;
         while let Some(index) = cursor {
@@ -832,13 +877,17 @@ impl TcpRecoveryState {
             };
             largest_acked = largest_acked.max(segment.packet_number);
             any_acked = true;
-            latest_rtt = self.deliver_sample(ack, segment, congestion).or(latest_rtt);
+            acked_bytes = acked_bytes.saturating_add(segment.bytes);
+            latest_rtt = self
+                .deliver_sample(ack, segment, &mut rate_sample)
+                .or(latest_rtt);
             if done {
                 break;
             }
             cursor = next;
         }
         if any_acked {
+            self.deliver_ack_batch(ack, acked_bytes, latest_rtt, rate_sample, congestion);
             congestion.on_end_acks(
                 ack.now,
                 self.bytes_in_flight(),
@@ -849,14 +898,23 @@ impl TcpRecoveryState {
         (any_acked, latest_rtt)
     }
 
-    fn deliver_sample<C: CongestionController>(
+    fn deliver_sample(
         &mut self,
         ack: TcpRecoveryAck,
         segment: TcpSentSample,
-        congestion: &mut C,
+        rate_sample: &mut Option<TcpSentSample>,
     ) -> Option<Duration> {
         if self.recovery_active {
             self.recovery_delivered = self.recovery_delivered.saturating_add(segment.bytes);
+        }
+        self.delivered = self.delivered.saturating_add(u64::from(segment.bytes));
+        self.delivered_time = Some(ack.now);
+        if rate_sample.is_none_or(|current| {
+            segment.sent_at > current.sent_at
+                || (segment.sent_at == current.sent_at
+                    && segment.end_sequence > current.end_sequence)
+        }) {
+            *rate_sample = Some(segment);
         }
         if !segment.retransmitted {
             let rtt = ack.now.saturating_duration_since(segment.sent_at);
@@ -873,7 +931,46 @@ impl TcpRecoveryState {
                 }
             }
         }
-        deliver_acked_segment(self.bytes_in_flight(), ack, segment, congestion)
+        (!segment.retransmitted).then_some(ack.now.saturating_duration_since(segment.sent_at))
+    }
+
+    fn deliver_ack_batch<C: CongestionController>(
+        &self,
+        ack: TcpRecoveryAck,
+        acked_bytes: u32,
+        latest_rtt: Option<Duration>,
+        rate_sample: Option<TcpSentSample>,
+        congestion: &mut C,
+    ) {
+        let Some(segment) = rate_sample else {
+            return;
+        };
+        let prior_time = segment.delivered_time.unwrap_or(segment.first_tx_time);
+        let delivered_interval = ack.now.saturating_duration_since(prior_time);
+        let tx_interval = segment
+            .sent_at
+            .saturating_duration_since(segment.first_tx_time);
+        let interval = delivered_interval.max(tx_interval);
+        congestion.on_ack(
+            ack.now,
+            AckedPacket {
+                packet_number: segment.packet_number,
+                bytes: acked_bytes,
+                sent_at: segment.sent_at,
+                delivered: self.delivered.saturating_sub(segment.delivered),
+                prior_delivered: segment.delivered,
+                interval,
+                tx_in_flight: segment.tx_in_flight,
+                tx_lost: segment.tx_lost_bytes,
+                app_limited: segment.app_limited,
+                ecn_ce_count: ack.ecn_ce_count,
+            },
+            RttSample {
+                latest: latest_rtt.unwrap_or(Duration::ZERO),
+                min: latest_rtt.unwrap_or(Duration::ZERO),
+            },
+            self.bytes_in_flight(),
+        );
     }
 
     fn sent_sample(&self, index: u32) -> Option<TcpSentSample> {
@@ -1346,6 +1443,10 @@ impl Clone for TcpRecoveryState {
             sample_head: self.sample_head,
             sample_tail: self.sample_tail,
             bytes_in_flight: self.bytes_in_flight,
+            delivered: self.delivered,
+            delivered_time: self.delivered_time,
+            first_tx_time: self.first_tx_time,
+            lost: self.lost,
             ack_floor: self.ack_floor,
             scoreboard: self.scoreboard.clone(),
             rack_deadline: self.rack_deadline,
@@ -1375,36 +1476,6 @@ impl Default for TcpRecoveryState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn deliver_acked_segment<C: CongestionController>(
-    bytes_in_flight: u32,
-    ack: TcpRecoveryAck,
-    segment: TcpSentSample,
-    congestion: &mut C,
-) -> Option<Duration> {
-    let latest_rtt = ack.now.saturating_duration_since(segment.sent_at);
-    let rtt_sample = if segment.retransmitted {
-        Duration::ZERO
-    } else {
-        latest_rtt
-    };
-    congestion.on_ack(
-        ack.now,
-        AckedPacket {
-            packet_number: segment.packet_number,
-            bytes: segment.bytes,
-            sent_at: segment.sent_at,
-            app_limited: ack.app_limited,
-            ecn_ce_count: ack.ecn_ce_count,
-        },
-        RttSample {
-            latest: rtt_sample,
-            min: rtt_sample,
-        },
-        bytes_in_flight,
-    );
-    (!segment.retransmitted).then_some(latest_rtt)
 }
 
 #[inline]

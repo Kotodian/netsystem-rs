@@ -34,7 +34,6 @@ pub struct BbrController {
     min_rtt_stamp: Option<Instant>,
     delivered: u64,
     next_round_delivered: u64,
-    round_end_marker_active: bool,
     round_start: bool,
     full_bandwidth_bytes_per_second: u64,
     full_bandwidth_rounds: u8,
@@ -54,6 +53,9 @@ impl BbrController {
     fn ack_sample(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample) -> AckSample {
         AckSample {
             bytes_acked: acked.bytes,
+            delivered: acked.delivered,
+            prior_delivered: acked.prior_delivered,
+            interval: acked.interval,
             ecn_ce_count: acked.ecn_ce_count,
             rtt: rtt.latest,
             now,
@@ -65,15 +67,12 @@ impl BbrController {
             return;
         }
 
-        let prior_delivered = self.delivered;
+        self.round_start = sample.prior_delivered >= self.next_round_delivered;
         self.delivered = self.delivered.saturating_add(u64::from(sample.bytes_acked));
-        self.update_ecn_alpha(sample);
-        self.round_start = self.round_end_marker_active
-            && prior_delivered < self.next_round_delivered
-            && self.delivered >= self.next_round_delivered;
         if self.round_start {
-            self.round_end_marker_active = false;
+            self.next_round_delivered = self.delivered;
         }
+        self.update_ecn_alpha(sample);
 
         if sample.rtt.is_zero() {
             return;
@@ -93,10 +92,6 @@ impl BbrController {
         self.update_pacing_rate();
     }
 
-    fn is_app_limited_sample(&self, bytes_acked: u32, bytes_in_flight: u32) -> bool {
-        bytes_in_flight.saturating_add(bytes_acked) < self.congestion_window()
-    }
-
     fn update_min_rtt(&mut self, sample: AckSample) {
         let expired = self
             .min_rtt_stamp
@@ -108,8 +103,11 @@ impl BbrController {
     }
 
     fn update_bandwidth(&mut self, sample: AckSample, app_limited: bool) {
-        let micros = sample.rtt.as_micros().max(1);
-        let sample_rate = ((u128::from(sample.bytes_acked) * 1_000_000u128) / micros)
+        if sample.delivered == 0 || sample.interval.is_zero() {
+            return;
+        }
+        let micros = sample.interval.as_micros().max(1);
+        let sample_rate = ((u128::from(sample.delivered) * 1_000_000u128) / micros)
             .min(u128::from(u64::MAX)) as u64;
         if app_limited
             && self.max_bandwidth_bytes_per_second != 0
@@ -300,7 +298,6 @@ impl CongestionController for BbrController {
             min_rtt_stamp: None,
             delivered: 0,
             next_round_delivered: 0,
-            round_end_marker_active: false,
             round_start: false,
             full_bandwidth_bytes_per_second: 0,
             full_bandwidth_rounds: 0,
@@ -350,27 +347,15 @@ impl CongestionController for BbrController {
 
     fn on_packet_sent(
         &mut self,
-        _packet_number: PacketNumber,
-        bytes_sent: u32,
-        bytes_in_flight: u32,
-        _now: Instant,
+        _: PacketNumber,
+        _: u32,
+        _: u32,
+        _: Instant,
     ) {
-        if bytes_sent == 0 {
-            return;
-        }
-        if bytes_in_flight == 0 || self.round_start {
-            self.next_round_delivered = self
-                .delivered
-                .saturating_add(u64::from(bytes_in_flight))
-                .saturating_add(u64::from(bytes_sent));
-            self.round_end_marker_active = true;
-            self.round_start = false;
-        }
     }
 
     fn on_ack(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample, bytes_in_flight: u32) {
-        let app_limited =
-            acked.app_limited || self.is_app_limited_sample(acked.bytes, bytes_in_flight);
+        let app_limited = acked.app_limited;
         let sample = self.ack_sample(now, acked, rtt);
         self.apply_ack_sample(sample, bytes_in_flight, app_limited);
     }
@@ -424,6 +409,9 @@ impl Default for BbrController {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AckSample {
     bytes_acked: u32,
+    delivered: u64,
+    prior_delivered: u64,
+    interval: Duration,
     ecn_ce_count: u64,
     rtt: Duration,
     now: Instant,

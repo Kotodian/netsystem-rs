@@ -610,13 +610,20 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         let max_dequeue = outstanding
             .checked_add(available_bytes)
             .expect("TCP flight and Session FIFO bytes fit u32");
+        let app_limited = connection.app_limited_for_send(available_bytes);
         let segment =
             (*cached_segment).expect("send params prepares TCP options before pushing a burst");
         let options_len = segment.header_len() - core::mem::size_of::<TcpHeader>();
         for &index in buffers.iter() {
             let buffer = runtime.buffer_mut(index);
             connection
-                .push_one_header(buffer, &segment, &cached_opts[..options_len], now)
+                .push_one_header(
+                    buffer,
+                    &segment,
+                    &cached_opts[..options_len],
+                    now,
+                    app_limited,
+                )
                 .expect("Session Queue supplies a sendable TCP Buffer and headroom");
             let egress = hammer_core::buffer_opaque!(mut buffer => TcpSecondaryOpaque).egress_mut();
             egress.connection_index = connection_index;

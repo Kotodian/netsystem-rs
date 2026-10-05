@@ -1629,6 +1629,7 @@ impl TcpConnection {
         segment: &TcpSegment,
         options: &[u8],
         now: Instant,
+        app_limited: bool,
     ) -> RuntimeResult<()> {
         let payload_len = buffer.current_len() + buffer.total_len_not_including_first();
         let sequence = self.snd_nxt;
@@ -1639,7 +1640,7 @@ impl TcpConnection {
         if psh {
             self.psh_pending = false;
         }
-        self.commit_payload_tx(payload_len, now)
+        self.commit_payload_tx(payload_len, now, app_limited)
     }
 
     /// VPP tcp_cc.h:107-135. Keep this marker connection-local.
@@ -1659,6 +1660,13 @@ impl TcpConnection {
         {
             self.cwnd_limited_sequence = self.snd_nxt;
         }
+    }
+
+    #[inline]
+    pub(crate) fn app_limited_for_send(&self, available_bytes: u32) -> bool {
+        available_bytes < self.send_mss
+            && self.snd_una.distance_to(self.snd_nxt) < self.congestion.congestion_window()
+            && !self.recovery.in_recovery()
     }
 
     pub(crate) fn tx_segment(
@@ -1744,6 +1752,7 @@ impl TcpConnection {
         &mut self,
         payload_len: usize,
         now: Instant,
+        app_limited: bool,
     ) -> RuntimeResult<()> {
         if self.state == TcpState::SynSent {
             if self.tx_intent_sequence.is_some() {
@@ -1764,7 +1773,9 @@ impl TcpConnection {
                 TcpSeq::from(end_sequence),
                 payload_len,
                 payload_len,
+                bytes_in_flight,
                 now,
+                false,
             );
             self.refresh_bytes_in_flight_cached();
             self.congestion.on_packet_sent(
@@ -1807,7 +1818,9 @@ impl TcpConnection {
             TcpSeq::from(end_sequence),
             payload_len,
             payload_len,
+            bytes_in_flight,
             now,
+            app_limited,
         );
         self.recovery.on_new_data_sent(payload_len);
         self.refresh_bytes_in_flight_cached();

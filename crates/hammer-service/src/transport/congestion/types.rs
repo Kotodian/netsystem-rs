@@ -7,6 +7,17 @@ pub struct AckedPacket {
     pub packet_number: PacketNumber,
     pub bytes: u32,
     pub sent_at: Instant,
+    /// Bytes delivered since the send-time delivery marker used by the
+    /// delivery-rate sample.
+    pub delivered: u64,
+    /// Delivery counter captured when the selected send sample was created.
+    pub prior_delivered: u64,
+    /// VPP tcp_ack_ctx_t::interval_time for the selected send sample.
+    pub interval: Duration,
+    /// Bytes in flight immediately after the selected transmission.
+    pub tx_in_flight: u64,
+    /// Lifetime bytes marked lost when the selected transmission occurred.
+    pub tx_lost: u64,
     pub app_limited: bool,
     pub ecn_ce_count: u64,
 }

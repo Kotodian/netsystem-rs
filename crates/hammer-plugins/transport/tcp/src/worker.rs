@@ -384,6 +384,10 @@ impl TcpWorker {
             .connections
             .get_mut(connection_index)
             .expect("custom TX retains the TCP connection");
+        let app_limited = !retransmit
+            && connection.app_limited_for_send(
+                u32::try_from(available).expect("TCP available FIFO bytes fit u32"),
+            );
         if retransmit {
             connection.tx_intent_sequence =
                 Some(TcpSeq::from(connection.snd_una()).advance(offset));
@@ -402,7 +406,7 @@ impl TcpWorker {
         egress.worker_index = sessions.worker_index();
         egress.fib_index = connection.base.endpoint.fib_index();
         connection
-            .commit_payload_tx(copied, self.last_timer_update)
+            .commit_payload_tx(copied, self.last_timer_update, app_limited)
             .expect("custom TX commits its retained FIFO bytes once");
         sessions.add_pending_tx_buffer(runtime, first_index, next);
         copied
