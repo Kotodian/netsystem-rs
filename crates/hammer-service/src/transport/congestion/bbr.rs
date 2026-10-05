@@ -8,9 +8,11 @@ use super::types::{AckedPacket, CongestionMetrics, LostPacket, PacketNumber, Rtt
 pub const DEFAULT_BBR_MAX_DATAGRAM_SIZE: u32 = 1_460;
 const BBR_INITIAL_WINDOW_SEGMENTS: u32 = 10;
 const BBR_MIN_WINDOW_SEGMENTS: u32 = 4;
-const BBR_HIGH_GAIN_MILLI: u32 = 2885;
-const BBR_DRAIN_GAIN_MILLI: u32 = 347;
+const BBR_HIGH_GAIN_MILLI: u32 = 2770;
+const BBR_DRAIN_GAIN_MILLI: u32 = 500;
 const BBR_CWND_GAIN_MILLI: u32 = 2000;
+const BBR_PROBE_UP_CWND_GAIN_MILLI: u32 = 2250;
+const BBR_PROBE_RTT_CWND_GAIN_MILLI: u32 = 500;
 const BBR_PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
 const BBR_MIN_RTT_FILTER: Duration = Duration::from_secs(10);
 const BBR_FULL_BANDWIDTH_GAIN_MILLI: u32 = 1250;
@@ -66,7 +68,7 @@ enum BbrUndoState {
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct BbrFlags: u16 {
+    struct BbrFlags: u32 {
         const FULL_BW_REACHED = 1 << 0;
         const ROUND_START = 1 << 1;
         const LOSS_ROUND_START = 1 << 2;
@@ -151,7 +153,7 @@ pub struct BbrController {
     flags: BbrFlags,
     extra_acked: BbrMinmax,
     congestion_window: u32,
-    pacing_rate_bytes_per_second: Option<u64>,
+    pacing_rate: Option<u64>,
     bw_hi: [u64; 2],
     bw_lo: u64,
     bw_latest: u64,
@@ -257,7 +259,9 @@ impl BbrController {
                 self.drain_rounds = self.drain_rounds.saturating_add(1);
             }
         }
-        self.delivered = self.delivered.saturating_add(u64::from(sample.bytes_acked));
+        self.delivered = self
+            .delivered
+            .max(sample.prior_delivered.saturating_add(sample.delivered));
         if self.round_start() {
             self.next_round_delivered = self.delivered;
         }
@@ -271,6 +275,9 @@ impl BbrController {
         self.update_bandwidth(sample, app_limited);
         self.update_ack_aggregation(sample);
         self.update_loss_round(sample);
+        if self.ack_phase == BbrAckPhase::ProbeStarting && self.round_start() {
+            self.ack_phase = BbrAckPhase::ProbeFeedback;
+        }
 
         match self.mode {
             BbrMode::Startup => self.update_startup(sample, app_limited),
@@ -323,7 +330,7 @@ impl BbrController {
         self.bw_latest = self.bw_latest.max(sample_rate);
         self.inflight_latest = self
             .inflight_latest
-            .max(sample.tx_in_flight.min(u64::from(u32::MAX)) as u32);
+            .max(sample.delivered.min(u64::from(u32::MAX)) as u32);
     }
 
     fn update_ack_aggregation(&mut self, sample: AckSample) {
@@ -395,6 +402,8 @@ impl BbrController {
                 self.inflight_lo.saturating_mul(BBR_BETA_NUMERATOR as u32)
                     / BBR_BETA_DENOMINATOR as u32,
             );
+            self.bw_latest = 0;
+            self.inflight_latest = 0;
             self.clear_flag(BbrFlags::LOSS_IN_ROUND);
         }
     }
@@ -446,8 +455,7 @@ impl BbrController {
         let headroom = self
             .inflight_hi
             .saturating_sub(
-                (u64::from(self.inflight_hi) * BBR_HEADROOM_NUMERATOR
-                    / BBR_HEADROOM_DENOMINATOR)
+                (u64::from(self.inflight_hi) * BBR_HEADROOM_NUMERATOR / BBR_HEADROOM_DENOMINATOR)
                     .max(u64::from(self.max_datagram_size)) as u32,
             )
             .max(min_congestion_window(self.max_datagram_size));
@@ -488,7 +496,7 @@ impl BbrController {
     }
 
     fn update_offload_budget(&mut self) {
-        let Some(rate) = self.pacing_rate_bytes_per_second else {
+        let Some(rate) = self.pacing_rate else {
             return;
         };
         let quantum = (u128::from(rate).saturating_mul(BBR_SEND_QUANTUM_INTERVAL.as_nanos())
@@ -518,13 +526,21 @@ impl BbrController {
         self.probe_rtt_done_stamp = None;
         self.clear_flag(BbrFlags::PROBE_RTT_ROUND_DONE);
         self.prior_cwnd = self.congestion_window;
-        self.congestion_window = probe_rtt_window(self.max_datagram_size);
+        self.congestion_window = self.probe_rtt_target();
     }
 
     fn update_startup(&mut self, sample: AckSample, app_limited: bool) {
+        let target = self.target_congestion_window(BBR_CWND_GAIN_MILLI);
+        if self.full_bw_reached() {
+            self.congestion_window = self
+                .congestion_window
+                .saturating_add(sample.bytes_acked)
+                .min(target);
+        } else if self.congestion_window < target || self.delivered < u64::from(self.initial_cwnd) {
+            self.congestion_window = self.congestion_window.saturating_add(sample.bytes_acked);
+        }
         self.congestion_window = self
             .congestion_window
-            .saturating_add(sample.bytes_acked)
             .max(min_congestion_window(self.max_datagram_size));
 
         if !self.round_start() || app_limited {
@@ -575,7 +591,7 @@ impl BbrController {
                 }
                 BbrProbeBwPhase::Refill => {
                     self.probe_bw_phase = BbrProbeBwPhase::Up;
-                    self.ack_phase = BbrAckPhase::ProbeFeedback;
+                    self.ack_phase = BbrAckPhase::ProbeStarting;
                     self.set_flag(BbrFlags::IS_BW_PROBE_SAMPLE);
                     self.bw_probe_up_rounds = self.bw_probe_up_rounds.saturating_add(1).min(30);
                     self.probe_up_acked_per_inc = self
@@ -592,8 +608,23 @@ impl BbrController {
                 }
                 _ => {}
             }
+            if self.probe_bw_phase == BbrProbeBwPhase::Up
+                && self.probe_up_acked_per_inc != BBR_INFLIGHT_INFINITY
+            {
+                self.bw_probe_up_acked = self.bw_probe_up_acked.saturating_add(sample.bytes_acked);
+                let increments = self.bw_probe_up_acked / self.probe_up_acked_per_inc.max(1);
+                self.bw_probe_up_acked %= self.probe_up_acked_per_inc.max(1);
+                self.inflight_hi = self
+                    .inflight_hi
+                    .saturating_add(increments.saturating_mul(self.max_datagram_size));
+            }
         }
-        let target = self.target_congestion_window(BBR_CWND_GAIN_MILLI);
+        let target_gain = if self.probe_bw_phase == BbrProbeBwPhase::Up {
+            BBR_PROBE_UP_CWND_GAIN_MILLI
+        } else {
+            BBR_CWND_GAIN_MILLI
+        };
+        let target = self.target_congestion_window(target_gain);
         self.congestion_window = self
             .congestion_window
             .saturating_add(sample.bytes_acked)
@@ -602,7 +633,7 @@ impl BbrController {
     }
 
     fn update_probe_rtt(&mut self, sample: AckSample, bytes_in_flight: u32) {
-        let probe_rtt_window = probe_rtt_window(self.max_datagram_size);
+        let probe_rtt_window = self.probe_rtt_target();
         self.congestion_window = probe_rtt_window;
         if bytes_in_flight <= probe_rtt_window && self.probe_rtt_done_stamp.is_none() {
             self.probe_rtt_done_stamp = Some(
@@ -662,6 +693,11 @@ impl BbrController {
         target.max(min_congestion_window(self.max_datagram_size))
     }
 
+    fn probe_rtt_target(&self) -> u32 {
+        self.target_congestion_window(BBR_PROBE_RTT_CWND_GAIN_MILLI)
+            .max(min_congestion_window(self.max_datagram_size))
+    }
+
     fn update_pacing_rate(&mut self) {
         if self.bw() == 0 {
             return;
@@ -678,7 +714,7 @@ impl BbrController {
         };
         let pacing_rate = (u128::from(self.bw()) * u128::from(gain_milli) / 1000u128)
             .clamp(1, u128::from(u64::MAX)) as u64;
-        self.pacing_rate_bytes_per_second = Some(pacing_rate);
+        self.pacing_rate = Some(pacing_rate);
         self.update_offload_budget();
     }
 }
@@ -701,7 +737,7 @@ impl CongestionController for BbrController {
                 ],
             },
             congestion_window: initial_congestion_window(max_datagram_size),
-            pacing_rate_bytes_per_second: None,
+            pacing_rate: None,
             bw_hi: [0; 2],
             bw_lo: BBR_BW_INFINITY,
             bw_latest: 0,
@@ -744,7 +780,7 @@ impl CongestionController for BbrController {
     fn metrics(&self) -> CongestionMetrics {
         CongestionMetrics {
             congestion_window: self.congestion_window(),
-            pacing_rate_bytes_per_second: self.pacing_rate_bytes_per_second,
+            pacing_rate_bytes_per_second: self.pacing_rate,
             delivered: self.delivered,
             max_bandwidth_bytes_per_second: self.max_bw(),
             min_rtt: self.min_rtt,
@@ -761,7 +797,7 @@ impl CongestionController for BbrController {
     }
 
     fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
-        self.pacing_rate_bytes_per_second
+        self.pacing_rate
     }
 
     fn delivered(&self) -> u64 {
@@ -776,19 +812,7 @@ impl CongestionController for BbrController {
         self.max_bw()
     }
 
-    fn on_packet_sent(
-        &mut self,
-        _: PacketNumber,
-        bytes_sent: u32,
-        bytes_in_flight: u32,
-        _: Instant,
-    ) {
-        if self.mode == BbrMode::ProbeBw && self.probe_bw_phase == BbrProbeBwPhase::Up {
-            self.bw_probe_up_acked = self
-                .bw_probe_up_acked
-                .saturating_add(bytes_sent.min(bytes_in_flight));
-        }
-    }
+    fn on_packet_sent(&mut self, _: PacketNumber, _: u32, _: u32, _: Instant) {}
 
     fn on_ack(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample, bytes_in_flight: u32) {
         let app_limited = acked.app_limited;
@@ -811,7 +835,7 @@ impl CongestionController for BbrController {
             self.ack_epoch_stamp = Some(now);
             self.ack_epoch_acked = 0;
             if self.mode == BbrMode::ProbeBw {
-                self.pacing_rate_bytes_per_second = Some(self.bw().max(1));
+                self.pacing_rate = Some(self.bw().max(1));
                 self.update_offload_budget();
             }
         }
@@ -852,6 +876,46 @@ impl CongestionController for BbrController {
             .max(min_congestion_window(self.max_datagram_size));
     }
 
+    fn on_recovered(&mut self) {
+        self.congestion_window = self.congestion_window.max(self.prior_cwnd);
+        self.clear_flag(BbrFlags::LOSS_IN_ROUND | BbrFlags::RECOVERY_IN_ROUND);
+        self.full_bw = 0;
+        self.full_bw_count = 0;
+        self.bw_lo = self.bw_lo.max(self.undo_bw_lo);
+        self.inflight_lo = self.inflight_lo.max(self.undo_inflight_lo);
+        self.inflight_hi = self.inflight_hi.max(self.undo_inflight_hi);
+        match self.undo_state {
+            BbrUndoState::Startup if self.mode != BbrMode::Startup => {
+                self.clear_flag(BbrFlags::FULL_BW_REACHED);
+                if self.mode != BbrMode::ProbeRtt {
+                    self.mode = BbrMode::Startup;
+                }
+            }
+            BbrUndoState::ProbeUp
+                if self.mode != BbrMode::ProbeRtt
+                    && (self.mode != BbrMode::ProbeBw
+                        || self.probe_bw_phase != BbrProbeBwPhase::Up) =>
+            {
+                self.start_probe_bw_refill();
+            }
+            BbrUndoState::None | BbrUndoState::Startup | BbrUndoState::ProbeUp => {}
+        }
+        self.undo_state = BbrUndoState::None;
+    }
+
+    fn on_tail_loss_probe(&mut self, now: Instant, bytes_in_flight: u32) {
+        self.set_flag(BbrFlags::LOSS_IN_ROUND);
+        if self.mode == BbrMode::ProbeBw
+            && self.probe_bw_phase == BbrProbeBwPhase::Up
+            && self.inflight_hi != BBR_INFLIGHT_INFINITY
+            && bytes_in_flight >= self.inflight_hi
+        {
+            self.set_flag(BbrFlags::PREV_PROBE_TOO_HIGH);
+            self.undo_state = BbrUndoState::ProbeUp;
+            self.start_probe_bw_down(now);
+        }
+    }
+
     fn on_mtu_update(&mut self, max_datagram_size: u32) {
         let max_datagram_size = normalized_max_datagram_size(max_datagram_size);
         self.max_datagram_size = max_datagram_size;
@@ -863,7 +927,7 @@ impl CongestionController for BbrController {
     }
 
     fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
-        let rate = self.pacing_rate_bytes_per_second?;
+        let rate = self.pacing_rate?;
         if rate == 0 || pending_bytes == 0 {
             return None;
         }
@@ -911,11 +975,6 @@ fn initial_congestion_window(max_datagram_size: u32) -> u32 {
 #[inline]
 fn min_congestion_window(max_datagram_size: u32) -> u32 {
     normalized_max_datagram_size(max_datagram_size).saturating_mul(BBR_MIN_WINDOW_SEGMENTS)
-}
-
-#[inline]
-fn probe_rtt_window(max_datagram_size: u32) -> u32 {
-    min_congestion_window(max_datagram_size)
 }
 
 #[inline]

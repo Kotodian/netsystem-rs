@@ -34,6 +34,8 @@ pub trait CongestionController: Clone + core::fmt::Debug + Send + Sync + 'static
     );
 
     fn on_loss(&mut self, now: Instant, lost: LostPacket, persistent_congestion: bool);
+    fn on_recovered(&mut self) {}
+    fn on_tail_loss_probe(&mut self, _: Instant, _: u32) {}
     fn on_mtu_update(&mut self, max_datagram_size: u32);
     fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration>;
 }

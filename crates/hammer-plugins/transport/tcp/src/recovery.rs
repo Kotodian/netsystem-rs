@@ -340,7 +340,7 @@ impl TcpRecoveryState {
         self.ack_floor = ack.acknowledgment;
         let (advanced, latest_rtt) = self.process_ack(ack, congestion);
         self.advance_scoreboard_for_ack(ack.acknowledgment, congestion.max_datagram_size());
-        self.maybe_finish_recovery(ack.acknowledgment);
+        self.maybe_finish_recovery(ack.acknowledgment, congestion);
         if self.rack_enabled && self.scoreboard.high_sacked > ack.acknowledgment {
             self.mark_rack_candidates(
                 self.scoreboard.high_sacked,
@@ -472,7 +472,7 @@ impl TcpRecoveryState {
             highest_sacked_right,
             congestion.max_datagram_size(),
         );
-        self.maybe_finish_recovery(ack.acknowledgment);
+        self.maybe_finish_recovery(ack.acknowledgment, congestion);
         if self.rack_enabled && highest_sacked_right != ack.acknowledgment {
             self.mark_rack_candidates(
                 highest_sacked_right,
@@ -1008,7 +1008,11 @@ impl TcpRecoveryState {
             .map(|(_, index)| *index)
     }
 
-    fn maybe_finish_recovery(&mut self, acknowledgment: TcpSeq) {
+    fn maybe_finish_recovery<C: CongestionController>(
+        &mut self,
+        acknowledgment: TcpSeq,
+        congestion: &mut C,
+    ) {
         if !self.recovery_active {
             return;
         }
@@ -1022,6 +1026,7 @@ impl TcpRecoveryState {
             self.recovery_new_data = 0;
             self.recovery_end_sequence = TcpSeq::from(0);
             self.no_sack_first_pending = false;
+            congestion.on_recovered();
         }
     }
 
