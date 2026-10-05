@@ -281,9 +281,9 @@ impl BbrController {
         let probe_transitioned = self.adapt_long_term_model(sample, app_limited);
 
         match self.mode {
-            BbrMode::Startup => self.update_startup(sample, app_limited),
+            BbrMode::Startup => self.update_startup(sample, app_limited, sample_bw),
             BbrMode::Drain => self.update_drain(sample.now, bytes_in_flight),
-            BbrMode::ProbeBw if !probe_transitioned => self.update_probe_bw(sample),
+            BbrMode::ProbeBw if !probe_transitioned => self.update_probe_bw(sample, sample_bw),
             BbrMode::ProbeRtt => self.update_probe_rtt(sample, bytes_in_flight),
             BbrMode::ProbeBw => {}
         }
@@ -664,7 +664,7 @@ impl BbrController {
         self.probe_rtt_min_stamp.get_or_insert(now);
     }
 
-    fn update_startup(&mut self, sample: AckSample, app_limited: bool) {
+    fn update_startup(&mut self, sample: AckSample, app_limited: bool, sample_bw: u64) {
         if self.has_flag(BbrFlags::LOSS_ROUND_START)
             && self.has_flag(BbrFlags::LOSS_ROUND_HAD_LOSS)
             && self.has_flag(BbrFlags::RECOVERY_IN_ROUND)
@@ -687,7 +687,7 @@ impl BbrController {
         }
 
         if self.full_bw == 0 {
-            self.full_bw = self.max_bw();
+            self.full_bw = sample_bw;
             self.full_bw_count = 0;
             return;
         }
@@ -695,8 +695,8 @@ impl BbrController {
         let growth_target =
             ((u128::from(self.full_bw) * u128::from(BBR_FULL_BANDWIDTH_GAIN_MILLI) + 999) / 1000)
                 .min(u128::from(u64::MAX)) as u64;
-        if self.max_bw() >= growth_target {
-            self.full_bw = self.max_bw();
+        if sample_bw >= growth_target {
+            self.full_bw = sample_bw;
             self.full_bw_count = 0;
         } else {
             self.full_bw_count = self.full_bw_count.saturating_add(1);
@@ -715,7 +715,7 @@ impl BbrController {
         }
     }
 
-    fn update_probe_bw(&mut self, sample: AckSample) {
+    fn update_probe_bw(&mut self, sample: AckSample, sample_bw: u64) {
         if self.round_start() {
             match self.probe_bw_phase {
                 BbrProbeBwPhase::Down if self.should_probe_bw(sample.now) => {
@@ -737,7 +737,7 @@ impl BbrController {
                         .checked_div(1u32 << self.bw_probe_up_rounds.min(30))
                         .unwrap_or(0)
                         .max(self.max_datagram_size);
-                    self.full_bw = self.max_bw();
+                    self.full_bw = sample_bw;
                     self.full_bw_count = 0;
                     self.clear_flag(BbrFlags::PREV_PROBE_PRECAUTIONARY);
                 }
