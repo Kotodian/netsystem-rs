@@ -807,6 +807,7 @@ impl TcpConnection {
             if let Some(interval) = self.recovery.tlp_timeout(
                 self.retransmit_timeout().smoothed_rtt(),
                 self.retransmit_timeout().retransmit_timeout(),
+                self.congestion.max_datagram_size(),
             ) {
                 timers::update(timers, index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
             } else {
@@ -866,7 +867,7 @@ impl TcpConnection {
         }
     }
 
-    fn recovery_ack(&self, acknowledgment: TcpSeq) -> TcpRecoveryAck {
+    fn recovery_ack(&self, acknowledgment: TcpSeq, duplicate_ack: bool) -> TcpRecoveryAck {
         let reordering_window = self
             .congestion
             .min_rtt()
@@ -879,6 +880,7 @@ impl TcpConnection {
             app_limited: false,
             ecn_ce_count: self.ecn.pending_ce_feedback,
             reordering_window: reordering_window.max(Duration::from_millis(1)),
+            duplicate_ack,
         }
     }
 
@@ -976,13 +978,19 @@ impl TcpConnection {
         if !self.accepts_ack(acknowledgment) {
             return Ok(None);
         }
+        let snd_una_before = self.snd_una;
+        let snd_wnd_before = self.snd_wnd;
         let advanced = acknowledgment > self.snd_una;
         let was_in_recovery = self.recovery.in_recovery();
-        let recovery_ack = self.recovery_ack(acknowledgment);
+        let duplicate_ack = acknowledgment == snd_una_before
+            && packet.payload_len == 0
+            && self.snd_wnd == snd_wnd_before
+            && self.recovery.has_unacked_data();
+        let recovery_ack = self.recovery_ack(acknowledgment, duplicate_ack);
         let mut latest_rtt = if self.negotiated_options().sack {
             self.recovery
                 .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion)
-        } else if advanced {
+        } else if advanced || self.recovery.tlp_probe_pending() {
             self.recovery.on_ack(recovery_ack, &mut self.congestion)
         } else {
             None
@@ -1859,6 +1867,7 @@ impl TcpConnection {
         let tlp = self.recovery.tlp_timeout(
             self.retransmit_timeout().smoothed_rtt(),
             self.retransmit_timeout().retransmit_timeout(),
+            self.congestion.max_datagram_size(),
         );
         let persist = (self.snd_wnd == 0 && self.recovery.has_unacked_data())
             .then(|| self.persist_interval());
@@ -2600,6 +2609,7 @@ impl TcpConnection {
             .tlp_timeout(
                 self.retransmit_timeout().smoothed_rtt(),
                 self.retransmit_timeout().retransmit_timeout(),
+                self.congestion.max_datagram_size(),
             )
             .is_none()
         {

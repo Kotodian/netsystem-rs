@@ -9,6 +9,7 @@ use hammer_service::transport::congestion::{
 };
 
 const TCP_MIN_TLP_TIMEOUT: Duration = Duration::from_millis(10);
+const TCP_TLP_MAX_ACK_DELAY: Duration = Duration::from_millis(50);
 const TCP_DUPACK_THRESHOLD: u32 = 3;
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +77,7 @@ pub struct TcpRecoveryAck {
     pub app_limited: bool,
     pub ecn_ce_count: u64,
     pub reordering_window: Duration,
+    pub duplicate_ack: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,6 +172,48 @@ pub struct TcpRecoveryState {
 }
 
 impl TcpRecoveryState {
+    #[inline]
+    fn dsack_block(blocks: &[TcpSackBlock], acknowledgment: TcpSeq) -> Option<TcpSackBlock> {
+        let first = *blocks.first()?;
+        if first.left_edge >= first.right_edge {
+            return None;
+        }
+        if first.left_edge > acknowledgment {
+            let second = *blocks.get(1)?;
+            if second.right_edge < first.right_edge || second.left_edge > first.left_edge {
+                return None;
+            }
+        } else if first.right_edge > acknowledgment {
+            return None;
+        }
+        Some(first)
+    }
+
+    fn retransmitted_range_covered(&self, left: TcpSeq, right: TcpSeq) -> bool {
+        let mut cursor = left;
+        let mut sample_index = self.sample_head;
+        while let Some(index) = sample_index {
+            let Some(sample) = self.sent_sample(index) else {
+                break;
+            };
+            sample_index = sample.next;
+            if sample.end_sequence <= cursor {
+                continue;
+            }
+            if sample.sequence > cursor {
+                return false;
+            }
+            if !sample.retransmitted {
+                return false;
+            }
+            cursor = cursor.max(sample.end_sequence);
+            if cursor >= right {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn new() -> Self {
         Self {
             next_packet_number: 1,
@@ -317,7 +361,12 @@ impl TcpRecoveryState {
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    pub fn tlp_timeout(&self, srtt: Option<Duration>, rto: Duration) -> Option<Duration> {
+    pub fn tlp_timeout(
+        &self,
+        srtt: Option<Duration>,
+        rto: Duration,
+        max_datagram_size: u32,
+    ) -> Option<Duration> {
         // A SACK-confirmed gap has a concrete RACK deadline. TLP remains the
         // fallback only while there is no stronger loss signal to service.
         if !self.tlp_timer_armed
@@ -329,9 +378,19 @@ impl TcpRecoveryState {
         {
             return None;
         }
-        let srtt = srtt.unwrap_or(rto);
-        let timeout = srtt.checked_mul(2).unwrap_or(rto).max(TCP_MIN_TLP_TIMEOUT);
+        let mut timeout = srtt
+            .map(|value| value.checked_mul(2).unwrap_or(rto))
+            .unwrap_or(rto);
+        if self.bytes_in_flight <= max_datagram_size {
+            timeout = timeout.saturating_add(TCP_TLP_MAX_ACK_DELAY);
+        }
+        let timeout = timeout.max(TCP_MIN_TLP_TIMEOUT);
         Some(timeout.min(rto))
+    }
+
+    #[inline]
+    pub(crate) fn tlp_probe_pending(&self) -> bool {
+        self.tlp_probe_end.is_some()
     }
 
     pub fn on_ack<C: CongestionController>(
@@ -348,7 +407,15 @@ impl TcpRecoveryState {
             let max_datagram_size = congestion.max_datagram_size();
             congestion.on_tail_loss_probe_ack(ack.now, self.bytes_in_flight, max_datagram_size);
         }
+        let tlp_duplicate = self.tlp_probe_retransmitted
+            && self
+                .tlp_probe_end
+                .is_some_and(|end| ack.acknowledgment == end)
+            && ack.duplicate_ack;
         let (advanced, latest_rtt) = self.process_ack(ack, congestion);
+        if !advanced && ack.duplicate_ack {
+            self.notify_duplicate_ack(ack, congestion);
+        }
         self.advance_scoreboard_for_ack(ack.acknowledgment, congestion.max_datagram_size());
         self.maybe_finish_recovery(ack.acknowledgment, congestion);
         if self.rack_enabled && self.scoreboard.high_sacked > ack.acknowledgment {
@@ -374,6 +441,10 @@ impl TcpRecoveryState {
             self.tlp_probe_end = None;
             self.tlp_probe_retransmitted = false;
         }
+        if tlp_duplicate {
+            self.tlp_probe_end = None;
+            self.tlp_probe_retransmitted = false;
+        }
         self.tlp_timer_armed =
             self.has_unacked_data() && self.tlp_rtt_fresh && self.tlp_probe_end.is_none();
         latest_rtt
@@ -386,14 +457,34 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
+        let dsack = Self::dsack_block(blocks, ack.acknowledgment);
+        let tlp_dsack = self.tlp_probe_retransmitted
+            && self.tlp_probe_end.is_some_and(|end| {
+                dsack.is_some_and(|block| {
+                    block.right_edge == end
+                        && block.left_edge.distance_to(block.right_edge)
+                            <= congestion.max_datagram_size()
+                })
+            });
         let tlp_recovered = self.tlp_probe_retransmitted
             && self
                 .tlp_probe_end
-                .is_some_and(|end| ack.acknowledgment > end);
+                .is_some_and(|end| ack.acknowledgment > end)
+            && !tlp_dsack;
         if tlp_recovered {
             let max_datagram_size = congestion.max_datagram_size();
             congestion.on_tail_loss_probe_ack(ack.now, self.bytes_in_flight, max_datagram_size);
         }
+        let tlp_duplicate = self.tlp_probe_retransmitted
+            && self
+                .tlp_probe_end
+                .is_some_and(|end| ack.acknowledgment == end)
+            && ack.duplicate_ack
+            && blocks.is_empty();
+        let dsack_spurious = !tlp_dsack
+            && dsack.is_some_and(|block| {
+                self.retransmitted_range_covered(block.left_edge, block.right_edge)
+            });
         let mut latest_rtt = None;
         let mut largest_acked = 0;
         let mut any_acked = false;
@@ -428,7 +519,10 @@ impl TcpRecoveryState {
             }
         }
         let mut highest_sacked_right = self.scoreboard.high_sacked.max(ack.acknowledgment);
-        for block in blocks {
+        for (block_index, block) in blocks.iter().enumerate() {
+            if dsack.is_some_and(|dsack_block| block_index == 0 && *block == dsack_block) {
+                continue;
+            }
             // VPP tcp_sack.c:1137-1149 excludes invalid ordinary SACK blocks.
             if block.left_edge >= block.right_edge
                 || block.left_edge <= ack.acknowledgment
@@ -478,19 +572,37 @@ impl TcpRecoveryState {
             }
         }
         if any_acked {
+            let app_limited = rate_sample.is_some_and(|segment| segment.app_limited);
             self.deliver_ack_batch(ack, acked_bytes, latest_rtt, rate_sample, congestion);
             congestion.on_end_acks(
                 ack.now,
                 self.bytes_in_flight(),
-                ack.app_limited,
+                app_limited || ack.app_limited,
                 largest_acked,
             );
+        } else if ack.duplicate_ack {
+            self.notify_duplicate_ack(ack, congestion);
         }
         self.rebuild_scoreboard(
             ack.acknowledgment,
             highest_sacked_right,
             congestion.max_datagram_size(),
         );
+        if dsack_spurious {
+            let was_in_recovery = self.recovery_active;
+            self.recovery_active = false;
+            if was_in_recovery {
+                self.recovery_window = 0;
+                self.recovery_prev_window = 0;
+                self.recovery_delivered = 0;
+                self.recovery_prev_delivered = 0;
+                self.recovery_retransmitted = 0;
+                self.recovery_new_data = 0;
+                self.recovery_end_sequence = TcpSeq::from(0);
+                self.no_sack_first_pending = false;
+            }
+            congestion.on_undo_recovery();
+        }
         self.maybe_finish_recovery(ack.acknowledgment, congestion);
         if self.rack_enabled && highest_sacked_right != ack.acknowledgment {
             self.mark_rack_candidates(
@@ -508,6 +620,14 @@ impl TcpRecoveryState {
             ack.acknowledgment > end || (ack.acknowledgment >= end && !self.tlp_probe_retransmitted)
         });
         if tlp_cleared {
+            self.tlp_probe_end = None;
+            self.tlp_probe_retransmitted = false;
+        }
+        if tlp_dsack {
+            self.tlp_probe_end = None;
+            self.tlp_probe_retransmitted = false;
+        }
+        if tlp_duplicate {
             self.tlp_probe_end = None;
             self.tlp_probe_retransmitted = false;
         }
@@ -542,6 +662,8 @@ impl TcpRecoveryState {
                     packet_number: sample.packet_number,
                     bytes: sample.bytes,
                     bytes_in_flight: self.bytes_in_flight,
+                    tx_in_flight: sample.tx_in_flight,
+                    tx_lost: sample.tx_lost_bytes,
                     lost: self.lost.saturating_add(u64::from(sample.bytes)),
                     sent_at: sample.sent_at,
                 },
@@ -779,6 +901,8 @@ impl TcpRecoveryState {
                 packet_number: sample.packet_number,
                 bytes: sample.bytes,
                 bytes_in_flight: self.bytes_in_flight,
+                tx_in_flight: sample.tx_in_flight,
+                tx_lost: sample.tx_lost_bytes,
                 lost: self.lost.saturating_add(u64::from(sample.bytes)),
                 sent_at: sample.sent_at,
             },
@@ -916,11 +1040,12 @@ impl TcpRecoveryState {
             cursor = next;
         }
         if any_acked {
+            let app_limited = rate_sample.is_some_and(|segment| segment.app_limited);
             self.deliver_ack_batch(ack, acked_bytes, latest_rtt, rate_sample, congestion);
             congestion.on_end_acks(
                 ack.now,
                 self.bytes_in_flight(),
-                ack.app_limited,
+                app_limited || ack.app_limited,
                 largest_acked,
             );
         }
@@ -992,12 +1117,42 @@ impl TcpRecoveryState {
                 tx_in_flight: segment.tx_in_flight,
                 tx_lost: segment.tx_lost_bytes,
                 lost: self.lost.saturating_sub(segment.tx_lost_bytes),
+                retransmitted: segment.retransmitted,
                 app_limited: segment.app_limited,
                 ecn_ce_count: ack.ecn_ce_count,
             },
             RttSample {
                 latest: latest_rtt.unwrap_or(Duration::ZERO),
                 min: latest_rtt.unwrap_or(Duration::ZERO),
+            },
+            self.bytes_in_flight(),
+        );
+    }
+
+    fn notify_duplicate_ack<C: CongestionController>(
+        &self,
+        ack: TcpRecoveryAck,
+        congestion: &mut C,
+    ) {
+        congestion.on_ack(
+            ack.now,
+            AckedPacket {
+                packet_number: 0,
+                bytes: 0,
+                sent_at: ack.now,
+                delivered: 0,
+                prior_delivered: congestion.delivered(),
+                interval: Duration::ZERO,
+                tx_in_flight: u64::from(self.bytes_in_flight),
+                tx_lost: 0,
+                lost: self.lost,
+                retransmitted: true,
+                app_limited: ack.app_limited,
+                ecn_ce_count: ack.ecn_ce_count,
+            },
+            RttSample {
+                latest: Duration::ZERO,
+                min: Duration::ZERO,
             },
             self.bytes_in_flight(),
         );

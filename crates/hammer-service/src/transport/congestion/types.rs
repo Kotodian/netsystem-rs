@@ -20,6 +20,8 @@ pub struct AckedPacket {
     pub tx_lost: u64,
     /// Bytes marked lost since the selected transmission was sent.
     pub lost: u64,
+    /// The selected delivery sample came from a retransmitted transmission.
+    pub retransmitted: bool,
     pub app_limited: bool,
     pub ecn_ce_count: u64,
 }
@@ -30,6 +32,10 @@ pub struct LostPacket {
     pub bytes: u32,
     /// Bytes in flight at the loss callback, before retransmission output.
     pub bytes_in_flight: u32,
+    /// Bytes in flight when the selected transmission was sent.
+    pub tx_in_flight: u64,
+    /// Bytes already marked lost when the selected transmission was sent.
+    pub tx_lost: u64,
     /// Cumulative bytes marked lost through this loss sample.
     pub lost: u64,
     pub sent_at: Instant,
