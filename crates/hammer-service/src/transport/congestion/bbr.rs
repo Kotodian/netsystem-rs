@@ -29,6 +29,7 @@ pub struct BbrController {
     mode: BbrMode,
     congestion_window: u32,
     pacing_rate_bytes_per_second: Option<u64>,
+    bandwidth_window: [u64; 2],
     max_bandwidth_bytes_per_second: u64,
     min_rtt: Option<Duration>,
     min_rtt_stamp: Option<Instant>,
@@ -115,7 +116,9 @@ impl BbrController {
         {
             return;
         }
-        self.max_bandwidth_bytes_per_second = self.max_bandwidth_bytes_per_second.max(sample_rate);
+        self.bandwidth_window[1] = self.bandwidth_window[1].max(sample_rate);
+        self.max_bandwidth_bytes_per_second =
+            self.bandwidth_window.iter().copied().max().unwrap_or(0);
     }
 
     fn update_ecn_alpha(&mut self, sample: AckSample) {
@@ -201,6 +204,12 @@ impl BbrController {
     fn update_probe_bw(&mut self, sample: AckSample) {
         if self.should_advance_probe_bw_cycle(sample.now) {
             self.cycle_index = (self.cycle_index + 1) % PROBE_BW_GAIN_CYCLE.len();
+            if self.cycle_index == 0 && self.bandwidth_window[1] != 0 {
+                self.bandwidth_window[0] = self.bandwidth_window[1];
+                self.bandwidth_window[1] = 0;
+                self.max_bandwidth_bytes_per_second =
+                    self.bandwidth_window.iter().copied().max().unwrap_or(0);
+            }
             self.cycle_stamp = Some(sample.now);
         }
         let target = self.target_congestion_window(BBR_CWND_GAIN_MILLI);
@@ -293,6 +302,7 @@ impl CongestionController for BbrController {
             mode: BbrMode::Startup,
             congestion_window: initial_congestion_window(max_datagram_size),
             pacing_rate_bytes_per_second: None,
+            bandwidth_window: [0; 2],
             max_bandwidth_bytes_per_second: 0,
             min_rtt: None,
             min_rtt_stamp: None,
@@ -345,14 +355,7 @@ impl CongestionController for BbrController {
         self.max_bandwidth_bytes_per_second
     }
 
-    fn on_packet_sent(
-        &mut self,
-        _: PacketNumber,
-        _: u32,
-        _: u32,
-        _: Instant,
-    ) {
-    }
+    fn on_packet_sent(&mut self, _: PacketNumber, _: u32, _: u32, _: Instant) {}
 
     fn on_ack(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample, bytes_in_flight: u32) {
         let app_limited = acked.app_limited;
