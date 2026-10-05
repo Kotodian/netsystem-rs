@@ -1066,11 +1066,11 @@ impl CongestionController for BbrController {
             self.undo_inflight_hi = self.inflight_hi;
         }
         self.set_flag(BbrFlags::LOSS_IN_ROUND | BbrFlags::LOSS_EVENT_PENDING);
-        self.congestion_window = lost.bytes_in_flight.saturating_add(self.max_datagram_size);
         if persistent_congestion {
+            self.congestion_window = lost.bytes_in_flight.saturating_add(self.max_datagram_size);
             self.set_flag(BbrFlags::RECOVERY_IN_ROUND);
         }
-        if self.has_flag(BbrFlags::IS_BW_PROBE_SAMPLE) {
+        if !persistent_congestion && self.has_flag(BbrFlags::IS_BW_PROBE_SAMPLE) {
             let sample = AckSample {
                 bytes_acked: 0,
                 delivered: 0,
