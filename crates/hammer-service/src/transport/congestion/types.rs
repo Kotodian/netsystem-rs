@@ -18,6 +18,8 @@ pub struct AckedPacket {
     pub tx_in_flight: u64,
     /// Lifetime bytes marked lost when the selected transmission occurred.
     pub tx_lost: u64,
+    /// Bytes marked lost since the selected transmission was sent.
+    pub lost: u64,
     pub app_limited: bool,
     pub ecn_ce_count: u64,
 }

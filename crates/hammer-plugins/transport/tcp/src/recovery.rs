@@ -962,6 +962,7 @@ impl TcpRecoveryState {
                 interval,
                 tx_in_flight: segment.tx_in_flight,
                 tx_lost: segment.tx_lost_bytes,
+                lost: self.lost.saturating_sub(segment.tx_lost_bytes),
                 app_limited: segment.app_limited,
                 ecn_ce_count: ack.ecn_ce_count,
             },
